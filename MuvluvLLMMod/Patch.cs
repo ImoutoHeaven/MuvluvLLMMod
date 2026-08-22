@@ -12,16 +12,19 @@ public static class Patch
 {
     public static bool isPlayingScenario;
 
-    [ThreadStatic]
-    private static bool translatingTmp;
-
     private static readonly DebugTextLogPolicy debugTextLogPolicy = new();
     private static readonly TmpTranslationProvenance tmpProvenance = new();
+    private static readonly TmpPluginWriteOwnership tmpWriteOwnership =
+        new(tmpProvenance);
+    private static int runtimeActive;
     private static int refreshScanCount;
 
     public static void Initialize(Harmony harmony)
     {
+        // Clear the previous lifecycle before Harmony can publish any new setter hooks.
+        ResetRuntimeState();
         harmony.PatchAll(typeof(Patch));
+        Volatile.Write(ref runtimeActive, 1);
         VerifyPatches(harmony.Id);
     }
 
@@ -37,21 +40,17 @@ public static class Patch
     [HarmonyPatch(typeof(TMP_Text), "set_text")]
     public static void TranslateTmpSetter(TMP_Text __instance, ref string value)
     {
-        if (translatingTmp)
+        var instanceId = __instance.GetInstanceID();
+        if (tmpWriteOwnership.TryConsume(__instance, instanceId))
             return;
 
-        // An unguarded setter is an external assignment. Invalidate before looking at the
+        // Every non-token setter is an external assignment. Invalidate before looking at the
         // incoming value: equal content is not evidence that the pooled assignment is continuous.
-        var assignment = tmpProvenance.BeginExternalSetter(__instance, __instance.GetInstanceID());
-        translatingTmp = true;
-        try
-        {
-            ResolveTmpValue(ref value, assignment, TmpTextAssignmentOrigin.ExternalSetter);
-        }
-        finally
-        {
-            translatingTmp = false;
-        }
+        var assignment = tmpProvenance.BeginExternalSetter(__instance, instanceId);
+        if (!IsRuntimeActive(tmpProvenance.LifecycleEpoch))
+            return;
+
+        ResolveTmpValue(ref value, assignment, TmpTextAssignmentOrigin.ExternalSetter);
     }
 
     private static void ResolveTmpValue(
@@ -112,27 +111,33 @@ public static class Patch
     public static void RefreshAllTmpText()
     {
         var started = Stopwatch.GetTimestamp();
+        var scanEpoch = tmpProvenance.LifecycleEpoch;
+        if (!IsRuntimeActive(scanEpoch))
+            return;
+
         var texts = UnityEngine.Object.FindObjectsByType<TMP_Text>(
             FindObjectsInactive.Include,
             FindObjectsSortMode.None);
 
         foreach (var text in texts)
         {
-            if (text == null)
+            if (text == null || !IsRuntimeActive(scanEpoch))
                 continue;
 
+            var instanceId = text.GetInstanceID();
             var value = text.text ?? string.Empty;
-            translatingTmp = true;
-            try
+            var assignment = tmpProvenance.BeginPluginRefresh(text, instanceId);
+            ResolveTmpValue(ref value, assignment, TmpTextAssignmentOrigin.PluginRefresh);
+
+            if (!string.Equals(text.text, value, StringComparison.Ordinal)
+                && IsRuntimeActive(scanEpoch)
+                && tmpProvenance.IsCurrent(assignment))
             {
-                var assignment = tmpProvenance.BeginPluginRefresh(text, text.GetInstanceID());
-                ResolveTmpValue(ref value, assignment, TmpTextAssignmentOrigin.PluginRefresh);
-                if (!string.Equals(text.text, value, StringComparison.Ordinal))
+                // This scope covers only the exact property setter. Resolver, queue, reverse
+                // lookup, and logging callbacks run with no ownership guard, so nested setters
+                // are classified as external and invalidate their own provenance first.
+                using (tmpWriteOwnership.BeginPluginWrite(assignment))
                     text.text = value;
-            }
-            finally
-            {
-                translatingTmp = false;
             }
         }
 
@@ -179,6 +184,24 @@ public static class Patch
             + $"durablyPending={enqueueObservation.DurablyPending} "
             + $"acceptedByScheduler={enqueueObservation.AcceptedByScheduler}");
     }
+
+    internal static void Retire()
+    {
+        ResetRuntimeState();
+    }
+
+    private static void ResetRuntimeState()
+    {
+        Volatile.Write(ref runtimeActive, 0);
+        tmpWriteOwnership.ResetForLifecycle();
+        tmpProvenance.ResetForLifecycle();
+        isPlayingScenario = false;
+        Volatile.Write(ref refreshScanCount, 0);
+    }
+
+    private static bool IsRuntimeActive(long epoch) =>
+        Volatile.Read(ref runtimeActive) != 0
+        && tmpProvenance.LifecycleEpoch == epoch;
 
     private static void VerifyPatches(string harmonyId)
     {

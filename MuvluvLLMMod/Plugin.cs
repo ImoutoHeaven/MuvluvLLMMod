@@ -160,6 +160,7 @@ public sealed class Plugin : BasePlugin
                         + "dirty cache data may be unrecoverable");
                     throw new InvalidOperationException("terminal cache flush failed");
                 }),
+                new PluginCleanupStep("retire TMP translation state", Patch.Retire),
                 new PluginCleanupStep("unpatch Harmony", () =>
                 {
                     harmony?.UnpatchSelf();

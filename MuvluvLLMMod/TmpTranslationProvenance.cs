@@ -16,16 +16,22 @@ public enum TmpTextAssignmentOrigin
 /// </summary>
 public readonly struct TmpTextAssignment
 {
-    internal TmpTextAssignment(object instance, int instanceId, long generation)
+    internal TmpTextAssignment(
+        object instance,
+        int instanceId,
+        long generation,
+        long lifecycleEpoch)
     {
         Instance = instance;
         InstanceId = instanceId;
         Generation = generation;
+        LifecycleEpoch = lifecycleEpoch;
     }
 
     public object Instance { get; }
     public int InstanceId { get; }
     public long Generation { get; }
+    public long LifecycleEpoch { get; }
 }
 
 /// <summary>
@@ -36,16 +42,22 @@ public sealed class TmpTranslationProvenance
 {
     private sealed class Slot
     {
-        public Slot(object instance, int instanceId, long generation)
+        public Slot(
+            object instance,
+            int instanceId,
+            long generation,
+            long lifecycleEpoch)
         {
             Instance = instance;
             InstanceId = instanceId;
             Generation = generation;
+            LifecycleEpoch = lifecycleEpoch;
         }
 
         public object Instance { get; }
         public int InstanceId { get; set; }
         public long Generation { get; set; }
+        public long LifecycleEpoch { get; set; }
         public Entry? Entry { get; set; }
     }
 
@@ -79,6 +91,7 @@ public sealed class TmpTranslationProvenance
     private readonly LinkedList<Slot> lru = new();
     private int provenanceCount;
     private long nextGeneration;
+    private long lifecycleEpoch = 1;
 
     public TmpTranslationProvenance(int capacity = 2048)
     {
@@ -94,6 +107,31 @@ public sealed class TmpTranslationProvenance
         {
             lock (gate)
                 return provenanceCount;
+        }
+    }
+
+    public long LifecycleEpoch
+    {
+        get
+        {
+            lock (gate)
+                return lifecycleEpoch;
+        }
+    }
+
+    /// <summary>
+    /// Retires every identity and assignment generation from the current plugin lifecycle.
+    /// The epoch changes even if the same object and instance ID are used after a reload.
+    /// </summary>
+    public void ResetForLifecycle()
+    {
+        lock (gate)
+        {
+            lifecycleEpoch = lifecycleEpoch == long.MaxValue ? 1 : lifecycleEpoch + 1;
+            slots.Clear();
+            lru.Clear();
+            provenanceCount = 0;
+            nextGeneration = 0;
         }
     }
 
@@ -125,10 +163,11 @@ public sealed class TmpTranslationProvenance
         lock (gate)
         {
             var slot = GetOrCreateSlotUnsafe(instance, instanceId);
-            if (slot.InstanceId != instanceId)
+            if (slot.LifecycleEpoch != lifecycleEpoch || slot.InstanceId != instanceId)
             {
                 ClearEntryUnsafe(slot);
                 slot.InstanceId = instanceId;
+                slot.LifecycleEpoch = lifecycleEpoch;
                 slot.Generation = NextGenerationUnsafe();
             }
 
@@ -232,7 +271,11 @@ public sealed class TmpTranslationProvenance
             ClearEntryUnsafe(oldest.Value);
         }
 
-        var slot = new Slot(instance, instanceId, NextGenerationUnsafe());
+        var slot = new Slot(
+            instance,
+            instanceId,
+            NextGenerationUnsafe(),
+            lifecycleEpoch);
         slots[instance] = lru.AddLast(slot);
         return slot;
     }
@@ -245,7 +288,9 @@ public sealed class TmpTranslationProvenance
             && slots.TryGetValue(assignment.Instance, out var node)
             && ReferenceEquals(node.Value.Instance, assignment.Instance)
             && node.Value.InstanceId == assignment.InstanceId
-            && node.Value.Generation == assignment.Generation)
+            && node.Value.Generation == assignment.Generation
+            && node.Value.LifecycleEpoch == assignment.LifecycleEpoch
+            && node.Value.LifecycleEpoch == lifecycleEpoch)
         {
             slot = node.Value;
             return true;
@@ -255,8 +300,14 @@ public sealed class TmpTranslationProvenance
         return false;
     }
 
+    public bool IsCurrent(TmpTextAssignment assignment)
+    {
+        lock (gate)
+            return TryGetCurrentSlotUnsafe(assignment, out _);
+    }
+
     private TmpTextAssignment ToAssignment(Slot slot) =>
-        new(slot.Instance, slot.InstanceId, slot.Generation);
+        new(slot.Instance, slot.InstanceId, slot.Generation, slot.LifecycleEpoch);
 
     private long NextGenerationUnsafe() => ++nextGeneration;
 
