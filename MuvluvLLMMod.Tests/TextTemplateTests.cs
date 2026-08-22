@@ -171,4 +171,35 @@ public sealed class TextTemplateTests
     {
         Assert.Equal(expected, TextTemplate.IsTranslationCandidate(text));
     }
+
+    [Theory]
+    [InlineData(0x3040, false, "hiragana lower neighbour")]
+    [InlineData(0x3041, true, "hiragana lower endpoint")]
+    [InlineData(0x3096, true, "hiragana upper endpoint")]
+    [InlineData(0x3097, false, "hiragana upper neighbour")]
+    [InlineData(0x309c, false, "hiragana iteration lower neighbour")]
+    [InlineData(0x309d, true, "hiragana iteration lower endpoint")]
+    [InlineData(0x309f, true, "hiragana iteration upper endpoint")]
+    [InlineData(0x30a0, false, "hiragana iteration upper neighbour")]
+    [InlineData(0x30a0, false, "katakana lower neighbour")]
+    [InlineData(0x30a1, true, "katakana lower endpoint")]
+    [InlineData(0x30fa, true, "katakana upper endpoint")]
+    [InlineData(0x30fb, false, "katakana upper neighbour")]
+    [InlineData(0x30fc, false, "katakana iteration lower neighbour")]
+    [InlineData(0x30fd, true, "katakana iteration lower endpoint")]
+    [InlineData(0x30ff, true, "katakana iteration upper endpoint")]
+    [InlineData(0x3100, false, "katakana iteration upper neighbour")]
+    [InlineData(0xff65, false, "half-width katakana lower neighbour")]
+    [InlineData(0xff66, true, "half-width katakana lower endpoint")]
+    [InlineData(0xff9d, true, "half-width katakana upper endpoint")]
+    [InlineData(0xff9e, false, "half-width katakana upper neighbour")]
+    [InlineData(0x3099, false, "combining mark U+3099")]
+    [InlineData(0x309a, false, "combining mark U+309A")]
+    [InlineData(0x309b, false, "combining mark U+309B")]
+    [InlineData(0x309c, false, "combining mark U+309C")]
+    public void IsTranslationCandidate_pins_kana_boundaries(int codePoint, bool expected, string boundary)
+    {
+        _ = boundary;
+        Assert.Equal(expected, TextTemplate.IsTranslationCandidate(char.ConvertFromUtf32(codePoint)));
+    }
 }
