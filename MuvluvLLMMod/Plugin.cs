@@ -31,6 +31,7 @@ public sealed class Plugin : BasePlugin
     private static int cleanupStarted;
     private static int cleanupSucceeded;
     private static readonly Action ApplicationQuittingHandler = OnApplicationQuitting;
+    private static Il2CppSystem.Action? applicationQuittingHandler;
 
     [ThreadStatic]
     private static bool observingEnqueue;
@@ -84,7 +85,7 @@ public sealed class Plugin : BasePlugin
             harmony = new Harmony(PluginGuid);
             Patch.Initialize(harmony);
             Instance = AddComponent<Hotkey>();
-            Application.quitting = Application.quitting + ApplicationQuittingHandler;
+            RegisterApplicationQuittingHandler();
 
             persistenceCancellation = new CancellationTokenSource();
             persistenceTask = Cache.RunPersistenceLoopAsync(persistenceCancellation.Token);
@@ -115,7 +116,7 @@ public sealed class Plugin : BasePlugin
             return Volatile.Read(ref cleanupSucceeded) != 0;
 
         var succeeded = true;
-        Application.quitting = Application.quitting - ApplicationQuittingHandler;
+        CleanupStep("remove application-quit handler", RemoveApplicationQuittingHandler, ref succeeded);
 
         CleanupStep("disable Hotkey", () =>
         {
@@ -200,6 +201,26 @@ public sealed class Plugin : BasePlugin
             {
             }
         }
+    }
+
+    private static void RegisterApplicationQuittingHandler()
+    {
+        // Il2CppInterop creates a native delegate wrapper during this conversion. Retain
+        // that exact wrapper so removal does not perform a second, unequal conversion.
+        var handler = (Il2CppSystem.Action)ApplicationQuittingHandler;
+        applicationQuittingHandler = handler;
+        Application.add_quitting(handler);
+    }
+
+    private static void RemoveApplicationQuittingHandler()
+    {
+        var handler = Volatile.Read(ref applicationQuittingHandler);
+        if (handler == null)
+            return;
+
+        Application.remove_quitting(handler);
+        // The field is deliberately cleared only after remove_quitting returns successfully.
+        Interlocked.CompareExchange(ref applicationQuittingHandler, null, handler);
     }
 
     private static void OnApplicationQuitting() => Cleanup();
