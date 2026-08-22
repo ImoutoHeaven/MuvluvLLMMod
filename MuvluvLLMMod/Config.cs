@@ -7,7 +7,7 @@ public static class Config
     private static readonly object lifecycleGate = new();
     private static ConfigFile? config;
     private static PluginLifecycleGate.PluginGenerationLease? activeLease;
-    private static Action<PluginLifecycleGate.PluginGenerationLease>? reloadMachineTranslator;
+    private static EventHandler<SettingChangedEventArgs>? activeHandler;
 
     public static ConfigEntry<bool> Translation { get; private set; } = null!;
     public static ConfigEntry<bool> LlmEnable { get; private set; } = null!;
@@ -122,25 +122,38 @@ public static class Config
             if (config == null || !lease.IsActive || activeLease != null)
                 return false;
 
+            var handler = new EventHandler<SettingChangedEventArgs>(
+                (sender, args) => OnSettingChanged(lease, reload, sender, args));
             activeLease = lease;
-            reloadMachineTranslator = reload;
-            config.SettingChanged += OnSettingChanged;
-            return true;
+            activeHandler = handler;
+            try
+            {
+                config.SettingChanged += handler;
+                return true;
+            }
+            catch
+            {
+                activeHandler = null;
+                activeLease = null;
+                throw;
+            }
         }
     }
 
     public static void Shutdown()
     {
         ConfigFile? oldConfig;
+        EventHandler<SettingChangedEventArgs>? oldHandler;
         PluginLifecycleGate.PluginGenerationLease? oldLease;
         lock (lifecycleGate)
         {
             oldConfig = config;
+            oldHandler = activeHandler;
             oldLease = activeLease;
+            activeHandler = null;
             activeLease = null;
-            reloadMachineTranslator = null;
-            if (oldConfig != null)
-                oldConfig.SettingChanged -= OnSettingChanged;
+            if (oldConfig != null && oldHandler != null)
+                oldConfig.SettingChanged -= oldHandler;
             config = null;
         }
 
@@ -149,17 +162,13 @@ public static class Config
         oldLease?.Dispose();
     }
 
-    private static void OnSettingChanged(object? sender, SettingChangedEventArgs args)
+    private static void OnSettingChanged(
+        PluginLifecycleGate.PluginGenerationLease lease,
+        Action<PluginLifecycleGate.PluginGenerationLease> reload,
+        object? sender,
+        SettingChangedEventArgs args)
     {
-        PluginLifecycleGate.PluginGenerationLease? lease;
-        Action<PluginLifecycleGate.PluginGenerationLease>? reload;
-        lock (lifecycleGate)
-        {
-            lease = activeLease;
-            reload = reloadMachineTranslator;
-        }
-
-        if (lease == null || reload == null || !lease.TryEnter(out var callback))
+        if (!lease.TryEnter(out var callback))
             return;
 
         using (callback)

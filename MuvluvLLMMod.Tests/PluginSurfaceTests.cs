@@ -77,6 +77,16 @@ public sealed class PluginSurfaceTests
     }
 
     [Fact]
+    public void Config_handler_captures_the_generation_lease_and_redacts_api_keys()
+    {
+        var config = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "MuvluvLLMMod", "Config.cs"));
+        Assert.Contains("new EventHandler<SettingChangedEventArgs>", config, StringComparison.Ordinal);
+        Assert.Contains("OnSettingChanged(lease, reload", config, StringComparison.Ordinal);
+        Assert.Contains("ConfigChangePolicy.FormatLog", config, StringComparison.Ordinal);
+        Assert.DoesNotContain("lease = activeLease", config, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Reload_uses_the_lease_owner_not_a_replaceable_static_machine()
     {
         var plugin = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "MuvluvLLMMod", "Plugin.cs"));
