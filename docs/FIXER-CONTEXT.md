@@ -643,3 +643,95 @@ Docker validation used read-only source/game mounts and did not launch the game:
 PASS — `dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release`: 226 passed, 0 failed, 0 skipped.
 PASS — `dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game`: 0 warnings, 0 errors.
 ```
+
+## M-3 / M-4 / N-2 follow-up — DONE (commits `cc54749`, `b78ca4a`, `b459e9f`)
+
+This batch changes only the bounded-memory, terminal-persistence, and shutdown-timeout paths.
+The earlier TMP ownership/epoch, generation/quarantine, F2 display-only, and required-patch
+verification behavior remains in place.
+
+### Runtime budgets and fail-closed rules
+
+`TranslationBudget` is production code used by the render, cache, worker, and HTTP paths; these
+are not source-test-only limits:
+
+- Every source, normalized template, translation, reverse-index source/value, and provenance
+  source/value is limited to **4,096 UTF-16 code units and 16 KiB UTF-8**. Oversize input is
+  returned/left unchanged and is not queued or retained. Markup and placeholder checks still
+  run for every accepted generated/LLM value.
+- LLM response bodies are streamed with a **128 KiB** byte ceiling before JSON parsing; LLM retry
+  attempts are clamped to **1–8**. Oversize bodies and invalid formatting fail closed.
+- `generated` is an LRU with **4,096 entries / 4 MiB UTF-8 payload**. `pending` and
+  `runtimePromotedPending` are each bounded to **2,048 entries / 512 KiB**. `raw` is bounded to
+  **2,048 normalized samples / 512 KiB**. A full pending/priority budget leaves the incoming
+  display text unchanged; the next observation may reconsider it.
+- The reverse index (including known/ambiguous sets and provenance source mappings) is bounded to
+  **4,096 entries / 1 MiB**. `TmpTranslationProvenance` retains at most **2,048 wrappers/slots /
+  512 KiB of source+translation text** and reports its retained-byte metric.
+- Retry state is bounded to **4,096 templates / 1 MiB**; the work queue's scheduled, deferred,
+  completed, and cancellation maps are each bounded by the production limits (**4,096 work
+  items / 1 MiB**, **4,096 cancellation entries / 1 MiB**). Priority backlog is
+  **2,048 items / 512 KiB**. Failed-progress history is **2,048 templates / 512 KiB**.
+  Worker concurrency is clamped to **16**, and at most **16** lifecycle transitions are retained.
+  Historical retry/completed/cancellation/progress entries are evicted or rejected; active
+  queue cancellation state is admission-bounded rather than evicted, while bounded transition
+  cutoff history may expire old diagnostics safely.
+- Cache files and serialized snapshots are each capped at **8 MiB**. Reads use a bounded
+  `FileStream` path (not `File.ReadAllText`); oversize/malformed input is diagnosed and ignored
+  before it can be materialized into the runtime collections. Snapshot counts and payload bytes
+  are bounded before serialization. Budget diagnostics retain at most 32 fixed codes and are
+  rate-limited to one emission per code per second.
+
+`TranslationCache.RetainedSnapshot`, queue/backlog/retry/progress metrics, and provenance byte
+metrics are used by pressure tests. `TranslationBudgetTests` covers long text, an oversized
+simulated file, more than every relevant cap, and concurrent unique observations; normal retry,
+cancellation, priority, F2, and translation tests remain green.
+
+### Durable persistence and recovery protocol
+
+`cache.state.v1.json` is the single authoritative atomic state snapshot containing generated,
+pending, and raw state. It is written through `cache.state.v1.json.tmp` and replaced atomically;
+the previous valid state is retained as `.bak`. A failed state write keeps the temporary snapshot
+as a recoverable journal. The original `generated.zh_Hans.json`, `pending.zh_Hans.json`, and
+`dump/ui_raw.json` paths remain as bounded backward-compatible legacy mirrors and are read only
+when no state artifact exists. A valid state, temporary state, or backup is always preferred over
+legacy files, so a crash cannot load a generated/new-pending/raw mixed epoch. Missing-manifest,
+partial-write, backup recovery, coherent snapshot, transient writer failure, and persistent
+failure/quarantine tests are in `CachePersistenceProtocolTests`.
+
+Terminal flush obtains the same writer semaphore as normal persistence, waits for it only within
+its budget, and performs up to **five** paced attempts with 40 ms exponential backoff (capped at
+500 ms) inside the **five-second** terminal budget. Cleanup cancels the persistence loop, waits at
+most the same five-second bounded shutdown interval, and defers CTS disposal until a timed-out
+writer task eventually completes. A persistent failure logs a bounded-budget error, leaves the
+generation quarantined through the existing lifecycle gate, and does not claim durability on an
+unwritable medium.
+
+### Bounded shutdown semantics
+
+Production constructs `MachineTranslatorLifecycle` with a five-second shutdown timeout, injectable
+for tests and capped at 60 seconds. `MachineTranslator.StopAsync` cancels first and returns
+`false` on a non-cooperative worker/transition timeout; it retains the stopping queue and observes
+the eventual task before disposing its CTS. Cache mutation freeze already precedes machine stop,
+and the worker's cancellation/generation checks reject late publication. The lifecycle records
+`ShutdownTimedOut`, continues to the caller's later flush/unpatch steps, and its shared shutdown
+task/result is returned to concurrent cleanup callers. A timeout/failure faults cleanup, leaves
+the generation quarantined, and cannot be covered by a later load. Tests use never-completing
+translation delegates and assert fast timeout, late-publication rejection, later cleanup steps,
+and bounded reload-transition shutdown.
+
+### Docker validation for this batch
+
+All commands used `docker run --rm`; the repository was copied into the container writable layer,
+and the game directory was mounted read-only for the plugin build. No game process was launched and
+no host dependency was installed.
+
+```text
+M-3 checkpoint: dotnet test — 232 passed, 0 failed, 0 skipped.
+M-4 checkpoint: dotnet test — 238 passed, 0 failed, 0 skipped.
+N-2/final checkpoint: dotnet test — 241 passed, 0 failed, 0 skipped.
+N-2/final checkpoint: dotnet build — 0 warnings, 0 errors.
+```
+
+The remaining requested review ID is **M-5** only; it is intentionally deferred to the next
+integration/mutation-test batch.
