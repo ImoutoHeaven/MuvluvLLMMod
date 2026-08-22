@@ -28,7 +28,7 @@ public sealed class Plugin : BasePlugin
     private static Harmony? harmony;
     private static readonly PluginLifecycleGate lifecycleGate = new();
     private static readonly Action ApplicationQuittingHandler = OnApplicationQuitting;
-    private static Il2CppSystem.Action? applicationQuittingHandler;
+    private static readonly RetainedDelegate<Il2CppSystem.Action> applicationQuittingHandler = new();
 
     [ThreadStatic]
     private static bool observingEnqueue;
@@ -189,20 +189,18 @@ public sealed class Plugin : BasePlugin
     {
         // Il2CppInterop creates a native delegate wrapper during this conversion. Retain
         // that exact wrapper so removal does not perform a second, unequal conversion.
-        var handler = (Il2CppSystem.Action)ApplicationQuittingHandler;
-        applicationQuittingHandler = handler;
+        var handler = applicationQuittingHandler.GetOrCreate(
+            () => (Il2CppSystem.Action)ApplicationQuittingHandler);
         Application.add_quitting(handler);
     }
 
     private static void RemoveApplicationQuittingHandler()
     {
-        var handler = Volatile.Read(ref applicationQuittingHandler);
-        if (handler == null)
-            return;
-
-        Application.remove_quitting(handler);
-        // The field is deliberately cleared only after remove_quitting returns successfully.
-        Interlocked.CompareExchange(ref applicationQuittingHandler, null, handler);
+        applicationQuittingHandler.TryRemove(handler =>
+        {
+            Application.remove_quitting(handler);
+            return true;
+        });
     }
 
     private static void OnApplicationQuitting() => Cleanup();

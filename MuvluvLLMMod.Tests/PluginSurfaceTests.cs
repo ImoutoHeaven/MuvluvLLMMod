@@ -10,11 +10,15 @@ public sealed class PluginSurfaceTests
     {
         var plugin = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "MuvluvLLMMod", "Plugin.cs"));
 
-        Assert.Contains("private static Il2CppSystem.Action? applicationQuittingHandler", plugin, StringComparison.Ordinal);
-        Assert.Contains("var handler = (Il2CppSystem.Action)ApplicationQuittingHandler", plugin, StringComparison.Ordinal);
+        Assert.Contains(
+            "RetainedDelegate<Il2CppSystem.Action> applicationQuittingHandler",
+            plugin,
+            StringComparison.Ordinal);
+        Assert.Contains("GetOrCreate", plugin, StringComparison.Ordinal);
+        Assert.Contains("() => (Il2CppSystem.Action)ApplicationQuittingHandler", plugin, StringComparison.Ordinal);
         Assert.Contains("Application.add_quitting(handler)", plugin, StringComparison.Ordinal);
+        Assert.Contains("TryRemove(handler =>", plugin, StringComparison.Ordinal);
         Assert.Contains("Application.remove_quitting(handler)", plugin, StringComparison.Ordinal);
-        Assert.Contains("CompareExchange(ref applicationQuittingHandler, null, handler)", plugin, StringComparison.Ordinal);
         Assert.DoesNotContain("Application.quitting = Application.quitting +", plugin, StringComparison.Ordinal);
         Assert.DoesNotContain("Application.quitting = Application.quitting -", plugin, StringComparison.Ordinal);
     }
