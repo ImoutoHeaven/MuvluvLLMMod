@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Reflection;
 using Xunit;
 
 namespace MuvluvLLMMod.Tests;
@@ -20,7 +21,7 @@ public sealed class DebugTextLogPolicyTests
     }
 
     [Fact]
-    public void Deduper_retains_only_truncated_display_text_for_long_inputs()
+    public void Deduper_retains_only_fixed_size_keys_and_truncated_display_text_for_long_inputs()
     {
         var policy = new DebugTextLogPolicy(capacity: 4, linesPerSecond: 100_000, startTime: Start);
 
@@ -29,6 +30,14 @@ public sealed class DebugTextLogPolicyTests
 
         Assert.Equal(4, policy.SeenCount);
         Assert.Equal(80, policy.MaxSeenTextLength);
+
+        // A count cap alone is not a memory cap. The retained dictionary key must be the
+        // fixed-size hash, never one of the arbitrarily long source strings.
+        var seenField = typeof(DebugTextLogPolicy).GetField(
+            "seen",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(seenField);
+        Assert.Equal(typeof(ulong), seenField!.FieldType.GetGenericArguments()[0]);
     }
 
     [Fact]
@@ -91,23 +100,50 @@ public sealed class DebugTextLogPolicyTests
     }
 
     [Fact]
-    public void Deduplication_and_throttling_are_safe_under_concurrency()
+    public async Task Unique_concurrent_inputs_at_one_timestamp_use_only_the_available_tokens()
     {
-        var policy = new DebugTextLogPolicy(capacity: 64, linesPerSecond: 10_000, startTime: Start);
+        const int workerCount = 16;
+        const int inputsPerWorker = 1_000;
+        const int capacity = 64;
+        const int availableTokens = 37;
+        var policy = new DebugTextLogPolicy(
+            capacity,
+            linesPerSecond: availableTokens,
+            summaryInterval: TimeSpan.FromDays(1),
+            startTime: Start);
         var decisions = new ConcurrentBag<DebugTextLogDecision>();
+        using var barrier = new Barrier(workerCount);
 
-        Parallel.For(0, 5_000, index =>
+        var workers = Enumerable.Range(0, workerCount).Select(worker => Task.Run(() =>
         {
-            decisions.Add(policy.Observe(
-                "并发文本" + index,
-                containsKana: index % 2 == 0,
-                durablyPending: true,
-                acceptedByScheduler: true,
-                now: Start));
-        });
+            Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(5)));
+            for (var index = 0; index < inputsPerWorker; index++)
+            {
+                // Keep the distinguishing part inside the long input's hash domain. This
+                // proves that unique, long values do not collapse to their 80-char display.
+                var input = $"{worker:D2}:{index:D4}|" + new string('長', 5_000);
+                decisions.Add(policy.Observe(
+                    input,
+                    containsKana: true,
+                    durablyPending: true,
+                    acceptedByScheduler: true,
+                    now: Start));
+            }
+        })).ToArray();
 
-        Assert.Equal(5_000, decisions.Count);
-        Assert.InRange(policy.SeenCount, 0, 64);
-        Assert.InRange(decisions.Count(decision => decision.ShouldLog), 0, 5_000);
+        await Task.WhenAll(workers);
+
+        var normalLines = decisions.Count(decision => decision.ShouldLog);
+        var summaryLines = decisions.Count(decision => decision.SuppressedLines > 0);
+        Assert.Equal(workerCount * inputsPerWorker, decisions.Count);
+        Assert.Equal(availableTokens, normalLines + summaryLines);
+        Assert.Equal(capacity, policy.SeenCount);
+        Assert.Equal(DebugTextLogPolicy.DefaultTextLimit, policy.MaxSeenTextLength);
+
+        var seenField = typeof(DebugTextLogPolicy).GetField(
+            "seen",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(seenField);
+        Assert.Equal(typeof(ulong), seenField!.FieldType.GetGenericArguments()[0]);
     }
 }
