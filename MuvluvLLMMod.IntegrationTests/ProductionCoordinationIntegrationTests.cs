@@ -14,6 +14,12 @@ public sealed class ProductionCoordinationIntegrationTests
         Assert.Equal(1, Application.AddCalls);
         Assert.Equal(1, Application.CallbackCount);
 
+        // The fake event invokes the exact retained production handler, not a test cleanup
+        // shortcut; that handler must run the same idempotent cleanup path.
+        Application.InvokeQuitting();
+        Assert.Equal(0, Application.CallbackCount);
+        Assert.Null(Plugin.Instance);
+
         Assert.True(fixture.Plugin.Unload());
         Assert.Equal(1, Application.RemoveCalls);
         Assert.Equal(0, Application.CallbackCount);
