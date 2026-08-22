@@ -106,7 +106,7 @@ public sealed class PatchSurfaceTests
         var plugin = ReadProductionSource("Plugin.cs");
         Assert.Contains("tmpWriteOwnership.ResetForLifecycle()", patch, StringComparison.Ordinal);
         Assert.Contains("tmpProvenance.ResetForLifecycle()", patch, StringComparison.Ordinal);
-        Assert.Contains("new PluginCleanupStep(\"retire TMP translation state\", Patch.Retire)", plugin, StringComparison.Ordinal);
+        Assert.Contains("RunCleanupStep(\"retire TMP translation state\", Patch.Retire", plugin, StringComparison.Ordinal);
 
         var initialize = patch.IndexOf("public static void Initialize", StringComparison.Ordinal);
         var reset = patch.IndexOf("ResetRuntimeState();", initialize, StringComparison.Ordinal);
@@ -115,7 +115,7 @@ public sealed class PatchSurfaceTests
         Assert.True(patchAll > reset);
 
         var retire = plugin.IndexOf("Patch.Retire", StringComparison.Ordinal);
-        var unpatch = plugin.IndexOf("harmony?.UnpatchSelf()", StringComparison.Ordinal);
+        var unpatch = plugin.IndexOf("\"unpatch Harmony\"", StringComparison.Ordinal);
         Assert.True(retire >= 0);
         Assert.True(unpatch > retire);
     }

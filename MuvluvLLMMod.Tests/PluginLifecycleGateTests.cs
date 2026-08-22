@@ -33,7 +33,7 @@ public sealed class PluginLifecycleGateTests
                 "unpatch"
             },
             events);
-        Assert.True(gate.IsCleaningUp);
+        Assert.Equal(PluginLifecycleState.Stopped, gate.State);
     }
 
     [Fact]

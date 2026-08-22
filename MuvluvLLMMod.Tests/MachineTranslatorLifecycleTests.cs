@@ -26,7 +26,8 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
         var newPolicy = new TranslationRetryPolicy(1, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
         var lifecycle = new MachineTranslatorLifecycle(retryPolicy: oldPolicy);
 
-        lifecycle.Reload(false, 1, null, newPolicy);
+        Assert.True(lifecycle.Initialize(false, 1, null, oldPolicy));
+        Assert.True(lifecycle.Reload(false, 1, null, newPolicy));
 
         Assert.True(lifecycle.EnqueuePriority("設定を直す"));
         Assert.Equal(1, oldPolicy.BlockedCount);
@@ -133,48 +134,25 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
     }
 
     [Fact]
-    public async Task Stale_transition_cannot_stop_a_worker_installed_by_a_newer_generation()
+    public async Task Duplicate_initialize_is_rejected_and_first_worker_remains_owned_until_shutdown()
     {
         var cache = new TranslationCache(root);
         var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var oldStopRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var releaseOld = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var newStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var newStopRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var releaseNew = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstCanceled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var created = 0;
         var lifecycle = new MachineTranslatorLifecycle();
 
         MachineTranslator Factory(RequestRateLimiter _, TranslationPriorityBacklog backlog)
         {
-            var generation = Interlocked.Increment(ref created);
-            if (generation == 1)
-            {
-                return new MachineTranslator(
-                    cache,
-                    async (_, token) =>
-                    {
-                        using var registration = token.Register(() => oldStopRequested.TrySetResult());
-                        firstStarted.TrySetResult();
-                        return await releaseOld.Task;
-                    },
-                    1,
-                    TimeSpan.FromSeconds(1),
-                    backlog);
-            }
-
+            Interlocked.Increment(ref created);
             return new MachineTranslator(
                 cache,
-                async (template, token) =>
+                async (_, token) =>
                 {
-                    using var registration = token.Register(() =>
-                    {
-                        newStopRequested.TrySetResult();
-                        releaseNew.TrySetResult(null);
-                    });
-                    if (template == "新しい作業する")
-                        newStarted.TrySetResult();
-                    return await releaseNew.Task;
+                    using var registration = token.Register(() => firstCanceled.TrySetResult());
+                    firstStarted.TrySetResult();
+                    return await releaseFirst.Task;
                 },
                 1,
                 TimeSpan.FromSeconds(1),
@@ -183,30 +161,23 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
 
         try
         {
-            lifecycle.Initialize(true, 2, Factory);
-            Assert.True(lifecycle.EnqueuePriority("古い作業する"));
+            Assert.True(lifecycle.Initialize(true, 2, Factory));
+            Assert.True(lifecycle.EnqueuePriority("唯一的工作する"));
             await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
-            // Transition one owns the old worker and is held in StopAsync. Transition two is
-            // therefore stale-but-in-flight while a rapid replacement installs a new worker.
-            Assert.True(lifecycle.Reload(true, 2, Factory));
-            await oldStopRequested.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            Assert.True(lifecycle.Reload(true, 2, Factory));
-            lifecycle.Initialize(true, 2, Factory);
-            Assert.True(lifecycle.EnqueuePriority("新しい作業する"));
-            await newStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            // A second initialization cannot replace the only owned reference to worker A.
+            Assert.False(lifecycle.Initialize(true, 2, Factory));
+            Assert.Equal(1, created);
 
-            releaseOld.TrySetResult(null);
-            await lifecycle.TransitionTask.WaitAsync(TimeSpan.FromSeconds(2));
-
-            // The stale transition must check its generation before taking current. A failed
-            // check after StopAsync would cancel this newly initialized worker.
-            Assert.False(newStopRequested.Task.IsCompleted);
+            var shutdown = lifecycle.ShutdownAsync();
+            await firstCanceled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            releaseFirst.TrySetResult(null);
+            await shutdown.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.True(lifecycle.IsShutdown);
         }
         finally
         {
-            releaseOld.TrySetResult(null);
-            releaseNew.TrySetResult(null);
+            releaseFirst.TrySetResult(null);
             await lifecycle.ShutdownAsync().WaitAsync(TimeSpan.FromSeconds(2));
         }
     }
@@ -593,6 +564,19 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
         Assert.Equal(0, PrivateCollectionCount(workQueue, "normalQueue"));
         Assert.Empty(priorityBacklog.DrainWork());
         Assert.Equal(0, RetryStateCount(retryPolicy));
+    }
+
+    [Fact]
+    public async Task Terminal_shutdown_exposes_no_stopped_machine_progress_snapshot()
+    {
+        var lifecycle = new MachineTranslatorLifecycle();
+        Assert.Equal((0, 0, 0), lifecycle.ProgressSnapshot);
+
+        lifecycle.Shutdown();
+
+        Assert.Equal((0, 0, 0), lifecycle.ProgressSnapshot);
+        Assert.True(lifecycle.IsShutdown);
+        await lifecycle.TransitionTask;
     }
 
     [Fact]

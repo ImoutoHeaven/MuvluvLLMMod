@@ -16,24 +16,33 @@ public sealed class Plugin : BasePlugin
     public const string PluginVersion = "1.0.0";
 
     internal static new ManualLogSource Log = null!;
-    internal static TranslationCache Cache = null!;
-    internal static TranslationResolver Resolver = null!;
-    internal static MonoBehaviour? Instance { get; private set; }
+    internal static MonoBehaviour? Instance => RunningResources?.Hotkey;
 
     private static readonly HttpClient LlmHttpClient = OpenAiHttpClientFactory.CreateClient();
-    private static MachineTranslatorLifecycle machineLifecycle = CreateMachineLifecycle();
-    private static CancellationTokenSource? persistenceCancellation;
-    private static Task persistenceTask = Task.CompletedTask;
-    private static MachineTranslator? currentMachine;
-    private static Harmony? harmony;
     private static readonly PluginLifecycleGate lifecycleGate = new();
+    private static readonly NativeDelegateCoordinator<Il2CppSystem.Action>
+        applicationQuittingCoordinator = new();
     private static readonly Action ApplicationQuittingHandler = OnApplicationQuitting;
-    private static readonly RetainedDelegate<Il2CppSystem.Action> applicationQuittingHandler = new();
 
     [ThreadStatic]
     private static bool observingEnqueue;
     [ThreadStatic]
     private static bool enqueueAccepted;
+
+    private sealed class GenerationResources
+    {
+        public GenerationResources(long generationId) => GenerationId = generationId;
+
+        public long GenerationId { get; }
+        public TranslationCache? Cache { get; set; }
+        public TranslationResolver? Resolver { get; set; }
+        public MachineTranslatorLifecycle? MachineLifecycle { get; set; }
+        public Harmony? Harmony { get; set; }
+        public Hotkey? Hotkey { get; set; }
+        public CancellationTokenSource? PersistenceCancellation { get; set; }
+        public Task PersistenceTask { get; set; } = Task.CompletedTask;
+        public PluginLifecycleGate.PluginGenerationLease? ConfigLease { get; set; }
+    }
 
     private sealed record MachineSettings(
         bool Enabled,
@@ -46,58 +55,139 @@ public sealed class Plugin : BasePlugin
         int MaxInFlight,
         float TranslatePeriodSeconds);
 
+    private static GenerationResources? RunningResources =>
+        lifecycleGate.CurrentOwner<GenerationResources>();
+
+    internal static TranslationCache? CurrentCache => RunningResources?.Cache;
+    internal static TranslationResolver? CurrentResolver => RunningResources?.Resolver;
+
     internal static (int Completed, int InFlight, int Failed) ProgressSnapshot =>
-        Volatile.Read(ref currentMachine)?.ProgressSnapshot ?? (0, 0, 0);
+        RunningResources?.MachineLifecycle?.ProgressSnapshot ?? (0, 0, 0);
 
     internal static bool IsCleaningUp => lifecycleGate.IsCleaningUp;
 
     public override void Load()
     {
-        if (!lifecycleGate.TryBeginLoad())
+        if (!lifecycleGate.TryBeginLoad(out var generation))
         {
-            if (Log != null)
-                Logger.Warn("Load called more than once; keeping the existing Hotkey component");
+            SafeWarn("Load called while another generation is active or quarantined; refusing a duplicate load");
             return;
         }
-        Volatile.Write(ref machineLifecycle, CreateMachineLifecycle());
+
+        Log = base.Log;
+        var resources = new GenerationResources(generation.Id);
 
         try
         {
-            TrySetUtf8Console();
+            if (!generation.AttachOwner(resources))
+                throw new InvalidOperationException("plugin generation lost ownership before load started");
 
-            Log = base.Log;
-            Logger.Info($"Plugin {PluginGuid} is loading");
-            MuvluvLLMMod.Config.Initialize(base.Config);
+            using (RequireLoadStage(generation))
+            {
+                TrySetUtf8Console();
+                Logger.Info($"Plugin {PluginGuid} is loading (generation {generation.Id})");
+                MuvluvLLMMod.Config.Initialize(base.Config);
+                resources.MachineLifecycle = CreateMachineLifecycle();
+            }
 
-            Cache = new TranslationCache(
-                ResolvePluginPath(MuvluvLLMMod.Config.CacheDirectory.Value),
-                message => Logger.Warn("Translation cache " + message));
-            Cache.Load();
-            Resolver = new TranslationResolver(Cache, EnqueuePriority, EnqueueNormal, CancelTranslation);
+            using (RequireLoadStage(generation))
+            {
+                var cache = new TranslationCache(
+                    ResolvePluginPath(MuvluvLLMMod.Config.CacheDirectory.Value),
+                    message => SafeWarn("Translation cache " + message));
+                resources.Cache = cache;
+                cache.Load();
+                resources.Resolver = new TranslationResolver(
+                    cache,
+                    (template, pendingGeneration) => EnqueuePriority(
+                        generation,
+                        template,
+                        pendingGeneration),
+                    (template, pendingGeneration) => EnqueueNormal(
+                        generation,
+                        template,
+                        pendingGeneration),
+                    (template, pendingGeneration) => CancelTranslation(
+                        generation,
+                        template,
+                        pendingGeneration));
+            }
 
-            // Patch and inject the component before starting any background workers. If either
-            // stage fails, the catch below can use the single normal cleanup path.
-            harmony = new Harmony(PluginGuid);
-            Patch.Initialize(harmony);
-            Instance = AddComponent<Hotkey>();
-            RegisterApplicationQuittingHandler();
+            using (RequireLoadStage(generation))
+            {
+                resources.Harmony = new Harmony(PluginGuid);
+                Patch.Initialize(resources.Harmony);
+            }
 
-            persistenceCancellation = new CancellationTokenSource();
-            persistenceTask = Cache.RunPersistenceLoopAsync(persistenceCancellation.Token);
-            ObserveBackgroundTask(persistenceTask, "cache persistence");
+            using (RequireLoadStage(generation))
+            {
+                resources.Hotkey = AddComponent<Hotkey>();
+                if (resources.Hotkey == null)
+                    throw new InvalidOperationException("Hotkey component injection returned null");
+            }
 
-            var machineSettings = CaptureMachineSettings();
-            var retryPolicy = new TranslationRetryPolicy();
-            MachineLifecycle.Initialize(
-                machineSettings.Enabled,
-                machineSettings.RequestsPerSecond,
-                (limiter, backlog) => CreateMachineTranslator(machineSettings, limiter, backlog, retryPolicy),
-                retryPolicy);
+            using (RequireLoadStage(generation))
+                RegisterApplicationQuittingHandler(generation.Id);
 
-            Logger.Info($"Plugin {PluginGuid} loaded successfully");
+            using (RequireLoadStage(generation))
+            {
+                var cache = resources.Cache
+                    ?? throw new InvalidOperationException("cache was not initialized");
+                var cancellation = new CancellationTokenSource();
+                resources.PersistenceCancellation = cancellation;
+                resources.PersistenceTask = cache.RunPersistenceLoopAsync(cancellation.Token);
+                ObserveBackgroundTask(resources.PersistenceTask, "cache persistence");
+            }
+
+            using (RequireLoadStage(generation))
+            {
+                var settings = CaptureMachineSettings();
+                var retryPolicy = new TranslationRetryPolicy();
+                var machineLifecycle = resources.MachineLifecycle
+                    ?? throw new InvalidOperationException("machine lifecycle was not initialized");
+                if (!machineLifecycle.Initialize(
+                        settings.Enabled,
+                        settings.RequestsPerSecond,
+                        (limiter, backlog) => CreateMachineTranslator(
+                            resources,
+                            settings,
+                            limiter,
+                            backlog,
+                            retryPolicy),
+                        retryPolicy))
+                {
+                    throw new InvalidOperationException("machine lifecycle duplicate initialization");
+                }
+            }
+
+            if (!lifecycleGate.TryPublishRunning(generation))
+                throw new OperationCanceledException(
+                    "plugin load was canceled before the generation could become Running",
+                    generation.CancellationToken);
+
+            using (RequireRunningStage(generation))
+            {
+                Patch.Activate();
+                var lease = generation.TryAcquireRunningLease()
+                    ?? throw new OperationCanceledException(
+                        "plugin load was canceled during activation",
+                        generation.CancellationToken);
+                resources.ConfigLease = lease;
+                if (!MuvluvLLMMod.Config.Activate(lease, ReloadMachineTranslator))
+                    throw new InvalidOperationException("configuration activation was rejected");
+            }
+
+            if (!generation.IsRunning)
+                throw new OperationCanceledException(
+                    "plugin load was canceled after activation",
+                    generation.CancellationToken);
+
+            Logger.Info($"Plugin {PluginGuid} loaded successfully (generation {generation.Id})");
         }
         catch
         {
+            // If another caller already owns cleanup, this waits for the same generation result.
+            // A failed result quarantines the gate and prevents a new load over leaked resources.
             Cleanup();
             throw;
         }
@@ -105,122 +195,168 @@ public sealed class Plugin : BasePlugin
 
     public override bool Unload() => Cleanup();
 
-    internal static bool Cleanup()
+    internal static bool Cleanup() => lifecycleGate.Cleanup(
+        CleanupGeneration,
+        exception => SafeError("[LLM] generation cleanup failed: " + exception.GetType().Name));
+
+    private static bool CleanupGeneration(PluginLifecycleGate.PluginGeneration generation)
     {
-        var lifecycle = MachineLifecycle;
-        CancellationTokenSource? persistenceSource = null;
-        var succeeded = lifecycleGate.Cleanup(
-            new[]
+        var resources = generation.GetOwner<GenerationResources>();
+        var succeeded = true;
+
+        // Stop event producers first. Config.Shutdown revokes its generation lease and waits for
+        // a handler that was already inside the callback; removing the event delegate alone is
+        // not enough to prevent a stale reload.
+        RunCleanupStep("shutdown configuration", MuvluvLLMMod.Config.Shutdown, ref succeeded);
+        RunCleanupStep(
+            "remove application-quit handler",
+            () => RemoveApplicationQuittingHandler(generation.Id),
+            ref succeeded);
+        RunCleanupStep(
+            "disable Hotkey",
+            () =>
             {
-                new PluginCleanupStep("remove application-quit handler", RemoveApplicationQuittingHandler),
-                new PluginCleanupStep("shutdown configuration", MuvluvLLMMod.Config.Shutdown),
-                new PluginCleanupStep("disable Hotkey", () =>
-                {
-                    var instance = Instance;
-                    Instance = null;
-                    if (instance == null)
-                        return;
-
-                    instance.enabled = false;
-                    UnityEngine.Object.Destroy(instance);
-                }),
-
-                // Keep this order: freeze → stop workers → cancel persistence → flush → unpatch.
-                new PluginCleanupStep("freeze cache mutations", () =>
-                {
-                    if (Cache != null)
-                        Cache.FreezeMutations();
-                }),
-                new PluginCleanupStep("shutdown machine translator", lifecycle.Shutdown),
-                new PluginCleanupStep("cancel cache persistence", () =>
-                {
-                    persistenceSource = Interlocked.Exchange(ref persistenceCancellation, null);
-                    if (persistenceSource == null)
-                        return;
-
-                    persistenceSource.Cancel();
-                    var task = persistenceTask;
-                    _ = task.ContinueWith(
-                        completed =>
-                        {
-                            _ = completed.Exception;
-                            persistenceSource.Dispose();
-                        },
-                        CancellationToken.None,
-                        TaskContinuationOptions.ExecuteSynchronously,
-                        TaskScheduler.Default);
-                }),
-                new PluginCleanupStep("flush cache", () =>
-                {
-                    if (Cache == null || Cache.FlushTerminal())
-                        return;
-
-                    Logger.Error(
-                        $"[LLM] Terminal cache flush failed after {TranslationCache.TerminalFlushMaxAttempts} attempts; "
-                        + "dirty cache data may be unrecoverable");
-                    throw new InvalidOperationException("terminal cache flush failed");
-                }),
-                new PluginCleanupStep("retire TMP translation state", Patch.Retire),
-                new PluginCleanupStep("unpatch Harmony", () =>
-                {
-                    harmony?.UnpatchSelf();
-                    harmony = null;
-                })
+                if (resources == null)
+                    return;
+                var hotkey = resources.Hotkey;
+                resources.Hotkey = null;
+                if (hotkey == null)
+                    return;
+                hotkey.enabled = false;
+                UnityEngine.Object.Destroy(hotkey);
             },
-            (name, exception) =>
+            ref succeeded);
+        RunCleanupStep("retire TMP translation state", Patch.Retire, ref succeeded);
+
+        // Keep this semantic order: config stop -> patch/component retirement -> freeze ->
+        // machine stop -> persistence cancellation -> terminal flush -> unpatch.
+        RunCleanupStep(
+            "freeze cache mutations",
+            () => resources?.Cache?.FreezeMutations(),
+            ref succeeded);
+        RunCleanupStep(
+            "shutdown machine translator",
+            () => resources?.MachineLifecycle?.Shutdown(),
+            ref succeeded);
+        RunCleanupStep(
+            "cancel cache persistence",
+            () => StopPersistence(resources),
+            ref succeeded);
+        RunCleanupStep(
+            "flush cache",
+            () =>
             {
-                try
-                {
-                    Logger.Error($"[LLM] Cleanup step '{name}' failed: {exception.GetType().Name}");
-                }
-                catch
-                {
-                }
-            });
-        Volatile.Write(ref currentMachine, null);
+                if (resources?.Cache == null || resources.Cache.FlushTerminal())
+                    return;
+                SafeError(
+                    $"[LLM] Terminal cache flush failed after {TranslationCache.TerminalFlushMaxAttempts} attempts; "
+                    + "dirty cache data may be unrecoverable");
+                throw new InvalidOperationException("terminal cache flush failed");
+            },
+            ref succeeded);
+        RunCleanupStep(
+            "unpatch Harmony",
+            () =>
+            {
+                if (resources == null)
+                    return;
+                var harmony = resources.Harmony;
+                if (harmony == null)
+                    return;
+                harmony.UnpatchSelf();
+                resources.Harmony = null;
+            },
+            ref succeeded);
 
         if (succeeded)
-            Logger.Info($"Plugin {PluginGuid} unloaded");
+            SafeInfo($"Plugin {PluginGuid} unloaded (generation {generation.Id})");
         else
-            Logger.Error($"Plugin {PluginGuid} cleanup completed with errors");
+            SafeError($"Plugin {PluginGuid} generation {generation.Id} is quarantined after cleanup errors");
         return succeeded;
     }
 
-    private static void RegisterApplicationQuittingHandler()
+    private static void RunCleanupStep(string name, Action action, ref bool succeeded)
     {
-        // Il2CppInterop creates a native delegate wrapper during this conversion. Retain
-        // that exact wrapper so removal does not perform a second, unequal conversion.
-        var handler = applicationQuittingHandler.GetOrCreate(
-            () => (Il2CppSystem.Action)ApplicationQuittingHandler);
-        Application.add_quitting(handler);
+        try
+        {
+            action();
+        }
+        catch (Exception exception)
+        {
+            succeeded = false;
+            SafeError($"[LLM] Cleanup step '{name}' failed: {exception.GetType().Name}");
+        }
     }
 
-    private static void RemoveApplicationQuittingHandler()
+    private static void StopPersistence(GenerationResources? resources)
     {
-        applicationQuittingHandler.TryRemove(handler =>
+        if (resources?.PersistenceCancellation == null)
+            return;
+
+        var cancellation = resources.PersistenceCancellation;
+        resources.PersistenceCancellation = null;
+        try
         {
-            Application.remove_quitting(handler);
-            return true;
-        });
+            cancellation.Cancel();
+            resources.PersistenceTask.GetAwaiter().GetResult();
+        }
+        finally
+        {
+            cancellation.Dispose();
+        }
+    }
+
+    private static void RegisterApplicationQuittingHandler(long generation)
+    {
+        if (!applicationQuittingCoordinator.TryRegister(
+                generation,
+                () => (Il2CppSystem.Action)ApplicationQuittingHandler,
+                handler => Application.add_quitting(handler)))
+        {
+            throw new InvalidOperationException(
+                $"application-quit delegate registration is unavailable ({applicationQuittingCoordinator.State})");
+        }
+    }
+
+    private static void RemoveApplicationQuittingHandler(long generation)
+    {
+        if (!applicationQuittingCoordinator.TryRemove(
+                generation,
+                handler =>
+                {
+                    Application.remove_quitting(handler);
+                    return true;
+                }))
+        {
+            throw new InvalidOperationException(
+                $"application-quit delegate removal failed ({applicationQuittingCoordinator.State})");
+        }
     }
 
     private static void OnApplicationQuitting() => Cleanup();
 
-    internal static void ReloadMachineTranslator()
+    internal static void ReloadMachineTranslator(PluginLifecycleGate.PluginGenerationLease lease)
     {
-        if (IsCleaningUp || Cache == null)
+        if (!lease.IsActive)
             return;
 
-        var lifecycle = MachineLifecycle;
-        if (lifecycle.IsShutdown)
+        var resources = lease.GetOwner<GenerationResources>();
+        var machineLifecycle = resources?.MachineLifecycle;
+        var cache = resources?.Cache;
+        if (resources == null || machineLifecycle == null || cache == null || !lease.IsActive)
             return;
 
         var settings = CaptureMachineSettings();
         var retryPolicy = new TranslationRetryPolicy();
-        lifecycle.Reload(
+        _ = machineLifecycle.Reload(
             settings.Enabled,
             settings.RequestsPerSecond,
-            (limiter, backlog) => CreateMachineTranslator(settings, limiter, backlog, retryPolicy),
+            (limiter, backlog) => CreateMachineTranslator(
+                resources,
+                settings,
+                limiter,
+                backlog,
+                retryPolicy),
             retryPolicy);
     }
 
@@ -239,11 +375,14 @@ public sealed class Plugin : BasePlugin
     }
 
     private static MachineTranslator CreateMachineTranslator(
+        GenerationResources resources,
         MachineSettings machineSettings,
         RequestRateLimiter limiter,
         TranslationPriorityBacklog priorityBacklog,
         TranslationRetryPolicy retryPolicy)
     {
+        var cache = resources.Cache
+            ?? throw new InvalidOperationException("machine translator cache owner is missing");
         var settings = new OpenAiChatSettings(
             machineSettings.Endpoint,
             machineSettings.Model,
@@ -254,41 +393,53 @@ public sealed class Plugin : BasePlugin
             LlmHttpClient,
             settings,
             limiter,
-            message => Logger.Warn("[LLM] " + message));
-        var machine = new MachineTranslator(
-            Cache,
+            message => SafeWarn("[LLM] " + message));
+        return new MachineTranslator(
+            cache,
             client.TranslateAsync,
             machineSettings.MaxInFlight,
             TimeSpan.FromSeconds(machineSettings.TranslatePeriodSeconds),
             priorityBacklog,
-            message => Logger.Info("[LLM] " + message),
+            message => SafeInfo("[LLM] " + message),
             retryPolicy: retryPolicy);
-        Volatile.Write(ref currentMachine, machine);
-        return machine;
     }
 
-    private static void EnqueuePriority(string template, long pendingGeneration)
+    private static void EnqueuePriority(
+        PluginLifecycleGate.PluginGeneration generation,
+        string template,
+        long pendingGeneration)
     {
-        var accepted = MachineLifecycle.EnqueuePriority(template, pendingGeneration);
+        var resources = GetRunningResources(generation);
+        var accepted = resources?.MachineLifecycle?.EnqueuePriority(template, pendingGeneration) == true;
         if (observingEnqueue && accepted)
             enqueueAccepted = true;
     }
 
-    private static void EnqueueNormal(string template, long pendingGeneration)
+    private static void EnqueueNormal(
+        PluginLifecycleGate.PluginGeneration generation,
+        string template,
+        long pendingGeneration)
     {
-        var accepted = MachineLifecycle.EnqueueNormal(template, pendingGeneration);
+        var resources = GetRunningResources(generation);
+        var accepted = resources?.MachineLifecycle?.EnqueueNormal(template, pendingGeneration) == true;
         if (observingEnqueue && accepted)
             enqueueAccepted = true;
     }
 
-    private static void CancelTranslation(string template, long pendingGeneration) =>
-        MachineLifecycle.Cancel(template, pendingGeneration);
+    private static void CancelTranslation(
+        PluginLifecycleGate.PluginGeneration generation,
+        string template,
+        long pendingGeneration)
+    {
+        GetRunningResources(generation)?.MachineLifecycle?.Cancel(template, pendingGeneration);
+    }
 
-    private static MachineTranslatorLifecycle MachineLifecycle =>
-        Volatile.Read(ref machineLifecycle);
+    private static GenerationResources? GetRunningResources(
+        PluginLifecycleGate.PluginGeneration generation) =>
+        generation.IsRunning ? generation.GetOwner<GenerationResources>() : null;
 
     private static MachineTranslatorLifecycle CreateMachineLifecycle() => new(
-        exception => Logger.Error("[LLM] Lifecycle failure: " + exception.GetType().Name));
+        exception => SafeError("[LLM] Lifecycle failure: " + exception.GetType().Name));
 
     private static MachineSettings CaptureMachineSettings() => new(
         MuvluvLLMMod.Config.LlmEnable.Value,
@@ -307,11 +458,26 @@ public sealed class Plugin : BasePlugin
     private static void ObserveBackgroundTask(Task task, string name)
     {
         _ = task.ContinueWith(
-            completed => Logger.Error(name + " failed: " + completed.Exception?.GetBaseException().GetType().Name),
+            completed => SafeError(
+                name + " failed: " + completed.Exception?.GetBaseException().GetType().Name),
             CancellationToken.None,
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
     }
+
+    private static PluginLifecycleGate.PluginStage RequireLoadStage(
+        PluginLifecycleGate.PluginGeneration generation) =>
+        generation.TryEnterStage()
+        ?? throw new OperationCanceledException(
+            "plugin generation is no longer Loading",
+            generation.CancellationToken);
+
+    private static PluginLifecycleGate.PluginStage RequireRunningStage(
+        PluginLifecycleGate.PluginGeneration generation) =>
+        generation.TryEnterRunningStage()
+        ?? throw new OperationCanceledException(
+            "plugin generation is no longer Running",
+            generation.CancellationToken);
 
     private static void TrySetUtf8Console()
     {
@@ -323,15 +489,51 @@ public sealed class Plugin : BasePlugin
         {
         }
     }
+
+    private static void SafeInfo(string message)
+    {
+        try
+        {
+            if (Log != null)
+                Logger.Info(message);
+        }
+        catch
+        {
+        }
+    }
+
+    private static void SafeWarn(string message)
+    {
+        try
+        {
+            if (Log != null)
+                Logger.Warn(message);
+        }
+        catch
+        {
+        }
+    }
+
+    private static void SafeError(string message)
+    {
+        try
+        {
+            if (Log != null)
+                Logger.Error(message);
+        }
+        catch
+        {
+        }
+    }
 }
 
 public static class Core
 {
-    internal static ManualLogSource Log => Plugin.Log;
-    internal static TranslationCache Cache => Plugin.Cache;
-    internal static TranslationResolver Resolver => Plugin.Resolver;
+    internal static TranslationCache Cache =>
+        Plugin.CurrentCache ?? throw new InvalidOperationException("plugin cache is not Running");
 
-    internal static void ReloadMachineTranslator() => Plugin.ReloadMachineTranslator();
+    internal static TranslationResolver Resolver =>
+        Plugin.CurrentResolver ?? throw new InvalidOperationException("plugin resolver is not Running");
 
     internal static void BeginEnqueueObservation() => Plugin.BeginEnqueueObservation();
 

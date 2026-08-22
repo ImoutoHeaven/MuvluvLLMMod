@@ -24,8 +24,14 @@ public static class Patch
         // Clear the previous lifecycle before Harmony can publish any new setter hooks.
         ResetRuntimeState();
         harmony.PatchAll(typeof(Patch));
-        Volatile.Write(ref runtimeActive, 1);
+        // Hooks may be installed while the generation is still Loading. Keep their runtime
+        // body inert until Plugin publishes Running and activates the complete owner.
         VerifyPatches(harmony.Id);
+    }
+
+    public static void Activate()
+    {
+        Volatile.Write(ref runtimeActive, 1);
     }
 
     [HarmonyPrefix]
@@ -99,7 +105,7 @@ public static class Patch
         new[] { typeof(SkillMaster), typeof(int), typeof(bool) })]
     public static void TranslateSkillDescription(ref string __result)
     {
-        if (string.IsNullOrEmpty(__result))
+        if (!IsRuntimeActive(tmpProvenance.LifecycleEpoch) || string.IsNullOrEmpty(__result))
             return;
 
         if (Config.Translation.Value)
@@ -201,6 +207,7 @@ public static class Patch
 
     private static bool IsRuntimeActive(long epoch) =>
         Volatile.Read(ref runtimeActive) != 0
+        && !Plugin.IsCleaningUp
         && tmpProvenance.LifecycleEpoch == epoch;
 
     private static void VerifyPatches(string harmonyId)

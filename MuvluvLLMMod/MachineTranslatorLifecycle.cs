@@ -14,6 +14,7 @@ public sealed class MachineTranslatorLifecycle
     private Task? shutdownTask;
     private int transitionsInFlight;
     private int version;
+    private bool initialized;
     private bool shutdown;
 
     public MachineTranslatorLifecycle(
@@ -34,7 +35,21 @@ public sealed class MachineTranslatorLifecycle
         get { lock (gate) return shutdown; }
     }
 
-    public void Initialize(
+    public (int Completed, int InFlight, int Failed) ProgressSnapshot
+    {
+        get
+        {
+            lock (gate)
+                return current?.ProgressSnapshot ?? (0, 0, 0);
+        }
+    }
+
+    /// <summary>
+    /// Initializes exactly once for this lifecycle object. A second initialize is rejected rather
+    /// than replacing a worker or a transition-installed machine. Replacement belongs to Reload,
+    /// whose serialized transition owns both sides of the handoff.
+    /// </summary>
+    public bool Initialize(
         bool enabled,
         int requestsPerSecond,
         Func<RequestRateLimiter, TranslationPriorityBacklog, MachineTranslator>? factory,
@@ -42,19 +57,35 @@ public sealed class MachineTranslatorLifecycle
     {
         lock (gate)
         {
-            if (shutdown)
-                return;
+            if (shutdown || initialized || current != null || stopping != null || transitionsInFlight != 0)
+                return false;
 
-            var generation = ++version;
+            initialized = true;
+            ++version;
             if (nextRetryPolicy != null)
                 retryPolicy = nextRetryPolicy;
             if (!enabled || factory == null)
-                return;
+                return true;
 
-            limiter = new RequestRateLimiter(Math.Max(1, requestsPerSecond));
-            current = factory(limiter, priorityBacklog);
-            if (!shutdown && generation == version)
-                current.Start();
+            MachineTranslator? next = null;
+            try
+            {
+                limiter = new RequestRateLimiter(Math.Max(1, requestsPerSecond));
+                next = factory(limiter, priorityBacklog)
+                    ?? throw new InvalidOperationException("machine translator factory returned null");
+                current = next;
+                next.Start();
+                return true;
+            }
+            catch
+            {
+                current = null;
+                limiter = null;
+                initialized = false;
+                if (next != null)
+                    _ = StopSafelyAsync(next);
+                throw;
+            }
         }
     }
 
@@ -66,7 +97,7 @@ public sealed class MachineTranslatorLifecycle
     {
         lock (gate)
         {
-            if (shutdown)
+            if (shutdown || !initialized)
                 return false;
 
             if (nextRetryPolicy != null)
@@ -181,18 +212,24 @@ public sealed class MachineTranslatorLifecycle
         MachineTranslator? stoppingMachine,
         Task pendingTransition)
     {
+        Exception? failure = null;
         try
         {
             await pendingTransition.ConfigureAwait(false);
         }
         catch (Exception exception)
         {
+            failure ??= exception;
             Diagnose(exception);
         }
 
-        await StopSafelyAsync(active).ConfigureAwait(false);
+        var activeFailure = await StopSafelyAsync(active).ConfigureAwait(false);
+        failure ??= activeFailure;
         if (stoppingMachine != null && !ReferenceEquals(stoppingMachine, active))
-            await StopSafelyAsync(stoppingMachine).ConfigureAwait(false);
+        {
+            var stoppingFailure = await StopSafelyAsync(stoppingMachine).ConfigureAwait(false);
+            failure ??= stoppingFailure;
+        }
 
         lock (gate)
         {
@@ -201,6 +238,9 @@ public sealed class MachineTranslatorLifecycle
             limiter = null;
             transitionCancellationCutoffs.Clear();
         }
+
+        if (failure != null)
+            throw new InvalidOperationException("machine translator shutdown failed", failure);
     }
 
     private async Task RunTransitionAsync(
@@ -277,18 +317,20 @@ public sealed class MachineTranslatorLifecycle
         }
     }
 
-    private async Task StopSafelyAsync(MachineTranslator? machine)
+    private async Task<Exception?> StopSafelyAsync(MachineTranslator? machine)
     {
         if (machine == null)
-            return;
+            return null;
 
         try
         {
             await machine.StopAsync().ConfigureAwait(false);
+            return null;
         }
         catch (Exception exception)
         {
             Diagnose(exception);
+            return exception;
         }
     }
 
