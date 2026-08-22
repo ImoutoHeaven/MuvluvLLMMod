@@ -241,20 +241,24 @@ both immediately-excluded neighbours for every range:
 Plus all four combining marks U+3099–U+309C must be excluded. This predicate is the single gate of
 the whole system; an off-by-one silently breaks everything.
 
-## ITEM 11 — `TODO` — MINOR: make the new integration testable, and test it
+## ITEM 11 — `DONE` (commits `2ec56d4`, `43bdfad`, `39deec9`, `a13bbd9`) — MINOR: make the new integration testable, and test it
 
-`MuvluvLLMMod.Tests.csproj` compiles only the loader-agnostic core, so `Plugin`/`Config`/`Patch`/
-`Translation`/`Hotkey` are untested and `PatchSurfaceTests` only does shallow source-substring
-checks. Extract the loader-independent policies from items 1, 2, 5, 6, 8 (provenance/restore
-decision, log retention+throttle, config-change routing, retry reset, terminal-flush retry) into
-pure classes, link them into the test project, and unit-test them. Highest-value cases:
+Completed the deliverable (steps 1–4) without changing loader runtime semantics:
 
-- two simulated TMP instances holding the same Chinese value → only the one we actually translated
-  may be restored
-- F2-off leaves unresolved text untouched, production continues, no worker reload occurs
-- deduper/throttle respect fixed memory and rate ceilings under many unique concurrent strings
-- material config change resets blocked templates; F2/debug/refresh changes do not
-- terminal flush recovers from one transient write failure
+- `2ec56d4`: linked `TmpTranslationProvenance` and added collision, external-overwrite,
+  unresolvable-source, bounded-eviction, and concurrent-access tests. Test count: 150 passed.
+- `43bdfad`: linked `DebugTextLogPolicy` and added fixed-memory, token-bucket,
+  suppression-summary, 80-character truncation, flag-propagation, and concurrent-access tests.
+  Test count: 155 passed.
+- `39deec9`: extracted `ConfigReloadPolicy`, routed `Config` through it, and tested every
+  machine-affecting setting plus F2/debug/refresh/cache/unknown exclusions. Test count: 172 passed.
+- `a13bbd9`: linked `Translation` and `EnqueueObservation` with loader-free test doubles and
+  tested display-off observation/enqueue, durable-pending versus live-worker acceptance,
+  generated lookup, and scenario priority routing. Test count: 176 passed.
+
+Final Docker test suite: **176 passed / 0 failed** (145-test baseline; +31). Bonus step 5
+(`Plugin` lifecycle state machine and remaining `Patch` restore decision) was not attempted;
+the requested steps 1–4 deliverable is complete and those pieces remain loader-coupled.
 
 ## ITEM 12 — `DONE` (commit `ae3ee97`) — MINOR: verify all four patch targets
 
