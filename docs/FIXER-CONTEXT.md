@@ -1153,7 +1153,7 @@ Docker validation for the implementation commits used `mcr.microsoft.com/dotnet/
 and the mutation gate was **27 passed with 18/18 compile-valid mutants killed**. The game was never
 launched or written. FR2-2 remains open for the next batch.
 
-## FR2-2 follow-up — DONE (production `2d7c49e`, tests `19cd2cb`)
+## FR2-2 follow-up — DONE (production `2d7c49e`, `c4d9d3f`; tests `19cd2cb`, `84e08fa`)
 
 `docs/FINAL-REVIEW-2.md` and all other historical review files were intentionally left unchanged.
 This batch closes the late-publication defect without adding an upstream dependency or patch target.
@@ -1170,7 +1170,9 @@ After the bounded quiescence deadline, the generation remains `Failed`/quarantin
 reservation is retained until the late stage returns. A late completion drains its rollback, while
 repeated cleanup retries only failed retained rollback callbacks and never re-runs the teardown graph.
 Harmony also retires static patch state before and after unpatching, and activation rollback revokes
-configuration itself so no late event handler or static runtime state survives.
+configuration itself so no late event handler or static runtime state survives. Configuration
+shutdown is deferred only for its dependent activation boundary, not for unrelated pending Harmony,
+component, native, persistence, or machine boundaries.
 
 ### Exact-source coverage and mutation gate
 
