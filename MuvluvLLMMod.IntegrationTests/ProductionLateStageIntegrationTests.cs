@@ -95,6 +95,11 @@ public sealed class ZzzProductionLateStageIntegrationTests
             await WaitUntilAsync(() => Plugin.IsCleaningUp);
             Assert.False(await unload.WaitAsync(TimeSpan.FromSeconds(8)));
             Assert.Empty(Harmony.SnapshotApplications());
+            var configField = typeof(Config).GetField(
+                "config",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            Assert.NotNull(configField);
+            Assert.Null(configField!.GetValue(null));
             var unpatchCallsBeforeLateCompletion = Harmony.UnpatchSelfCalls;
             Assert.Equal(1, unpatchCallsBeforeLateCompletion);
             // Repeated cleanup retries only retained reservations and does not repeat the
