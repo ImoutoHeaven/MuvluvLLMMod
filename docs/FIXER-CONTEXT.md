@@ -338,7 +338,7 @@ Required:
 - Extract the restore decision so it is testable without Unity, and test same-instance/same-value
   reuse plus external-setter-vs-refresh origin.
 
-## FIX-2 — `TODO` — MAJOR: debug deduper has a count cap, not a memory cap
+## FIX-2 — `DONE` (commit `7feac9c`) — MAJOR: debug deduper has a count cap, not a memory cap
 
 `DebugTextLogPolicy.cs:22-23, 75, 93, 147-156`. The dictionary and linked list retain the **complete**
 input string; truncation happens only when building the log decision. 2,048 arbitrarily long strings
@@ -355,7 +355,7 @@ yet priority work returns `true` after being retained in `priorityBacklog`. Retu
 (`LiveWorker` / `Backlog` / `Rejected`) or rename to `AcceptedByScheduler`. Durable-pending state is
 already reported correctly and separately.
 
-## FIX-3 — `TODO` — MAJOR: the IL2CPP quit handler cannot be removed
+## FIX-3 — `DONE` (commit `d7dfe4d`) — MAJOR: the IL2CPP quit handler cannot be removed
 
 `Plugin.cs:33, 87, 118`. The game's `Application.quitting` is an `Il2CppSystem.Action`;
 `ApplicationQuittingHandler` is a `System.Action`, and both registration and removal implicitly
@@ -373,7 +373,7 @@ successful removal.
 (Verified read-only against the game's interop assemblies: `Application.quitting` and
 `Internal_ApplicationQuit` genuinely exist — the defect is removal identity, not hook selection.)
 
-## FIX-4 — `TODO` — MAJOR: lifecycle shutdown is not terminal or quiescent
+## FIX-4 — `DONE` (commit `06584c2`) — MAJOR: lifecycle shutdown is not terminal or quiescent
 
 `Plugin.cs:137, 174-177, 207-218`, `MachineTranslatorLifecycle.cs:47-60, 117-171`. Two races:
 - Configuration stays **subscribed** until after machine shutdown. A machine-setting change between
