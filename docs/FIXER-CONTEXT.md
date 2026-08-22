@@ -112,7 +112,7 @@ Was: `TryGetSourceForTranslatedValue` keyed on the translated string alone, so F
 replace another plugin's curated Chinese with our unrelated Japanese source (short strings like
 确定/取消 collide readily). Fixed with per-TMP-instance provenance.
 
-## ITEM 2 — `WIP` — BLOCKER: debug logging unbounded, unthrottled, default ON
+## ITEM 2 — `DONE` (commit `cbe5bde`) — BLOCKER: debug logging unbounded, unthrottled, default ON
 
 `Patch.cs` ~18-20 / ~116-135, `Config.cs` ~89-93. `debugSeenText` was a process-lifetime
 `HashSet<string>` of every distinct observed string, never capped. Dedupe is not rate limiting:
@@ -132,7 +132,7 @@ Required:
   pending state but `MachineLifecycle.EnqueueNormal` returns false, so the log printed
   `enqueued=false`. Distinguish "durably pending" from "accepted by a live worker".
 
-## ITEM 3 — `TODO` — BLOCKER: make shutdown a real, idempotent lifecycle
+## ITEM 3 — `DONE` (commit `6d49ebb`) — BLOCKER: make shutdown a real, idempotent lifecycle
 
 `Plugin.cs` ~78 / ~83-115, `Hotkey.cs` ~9-31. Three defects:
 (a) `Instance = null` leaves the injected `Hotkey` alive on BepInEx's manager object, so it keeps
@@ -153,7 +153,7 @@ Required:
 - Guard against duplicate components if `Load()` runs twice (two `Hotkey`s would double-toggle F2
   and double-scan).
 
-## ITEM 4 — `TODO` — MAJOR: `RefreshAllTmpText` double-processes every changed object
+## ITEM 4 — `DONE` (commit `ba18552`) — MAJOR: `RefreshAllTmpText` double-processes every changed object
 
 `Patch.cs` ~90-115. It calls `TranslateTmpSetter(text, ref value)` as a plain method; that method
 sets and then **clears** `translatingTmp` in its own `finally`; the following `text.text = value`
