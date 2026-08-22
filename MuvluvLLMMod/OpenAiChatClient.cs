@@ -29,6 +29,10 @@ public static class EndpointPolicy
 
 public sealed class OpenAiChatClient
 {
+    private sealed class ResponseTooLargeException : InvalidOperationException
+    {
+    }
+
     private const string SystemPrompt = "Translate Japanese game text into Simplified Chinese. Return only the translation. Tokens such as __MLM_FMT_0__ are protected formatting. Preserve every protected token exactly once and in its original order. Do not translate, remove, duplicate, or move these tokens.";
     private readonly HttpClient client;
     private readonly OpenAiChatSettings settings;
@@ -85,6 +89,12 @@ public sealed class OpenAiChatClient
             {
                 throw;
             }
+            catch (ResponseTooLargeException)
+            {
+                budgetDiagnostic.Report(
+                    "llm-response-budget",
+                    "LLM response body exceeded the bounded response budget; the response was discarded.");
+            }
             catch (Exception exception) when (exception is HttpRequestException
                 or OperationCanceledException
                 or JsonException
@@ -104,7 +114,7 @@ public sealed class OpenAiChatClient
     private async Task<string> ReadContentBoundedAsync(HttpContent content, CancellationToken token)
     {
         if (content.Headers.ContentLength is > TranslationBudget.MaxResponseBodyBytes)
-            throw new InvalidOperationException("LLM response body exceeded the bounded response budget.");
+            throw new ResponseTooLargeException();
 
         await using var stream = await content.ReadAsStreamAsync(token).ConfigureAwait(false);
         var buffer = ArrayPool<byte>.Shared.Rent(Math.Min(8192, TranslationBudget.MaxResponseBodyBytes));
@@ -119,7 +129,7 @@ public sealed class OpenAiChatClient
                 if (read == 0)
                     break;
                 if (result.Length + read > TranslationBudget.MaxResponseBodyBytes)
-                    throw new InvalidOperationException("LLM response body exceeded the bounded response budget.");
+                    throw new ResponseTooLargeException();
                 result.Write(buffer, 0, read);
             }
 
