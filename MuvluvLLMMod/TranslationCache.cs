@@ -24,6 +24,7 @@ public sealed class TranslationCache
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly JsonSerializerOptions IntegrityJsonOptions = new();
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+    private static readonly SnapshotLayout DurableSnapshotLayout = CreateSnapshotLayout();
     private readonly object gate = new();
     private readonly SemaphoreSlim writerGate = new(1, 1);
     private readonly SemaphoreSlim dirtySignal = new(0);
@@ -36,14 +37,20 @@ public sealed class TranslationCache
     private readonly LinkedList<string> generatedLru = new();
     private readonly Dictionary<string, LinkedListNode<string>> generatedNodes = new(StringComparer.Ordinal);
     private long generatedUtf8Bytes;
+    // These counters are the exact UTF-8 sizes of the JSON-encoded collection items.  The
+    // additive layout below also reserves the indented separators and the complete state
+    // envelope/checksum metadata, so durable admission is independent of raw UTF-8 payload size.
+    private long generatedSnapshotJsonUtf8Bytes;
 
     private readonly List<string> pending = new();
     private readonly HashSet<string> pendingSet = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> pendingGenerations = new(StringComparer.Ordinal);
     private long pendingUtf8Bytes;
+    private long pendingSnapshotJsonUtf8Bytes;
 
     private readonly HashSet<string> raw = new(StringComparer.Ordinal);
     private long rawUtf8Bytes;
+    private long rawSnapshotJsonUtf8Bytes;
 
     private readonly Dictionary<string, string> sourceByTranslatedValue = new(StringComparer.Ordinal);
     private readonly HashSet<string> knownTranslatedValues = new(StringComparer.Ordinal);
@@ -82,6 +89,15 @@ public sealed class TranslationCache
         public string[] Pending { get; set; } = Array.Empty<string>();
         public string[] Raw { get; set; } = Array.Empty<string>();
     }
+
+    private readonly record struct SnapshotLayout(
+        long EmptyBytes,
+        long GeneratedFirstItemOverhead,
+        long GeneratedAdditionalItemOverhead,
+        long PendingFirstItemOverhead,
+        long PendingAdditionalItemOverhead,
+        long RawFirstItemOverhead,
+        long RawAdditionalItemOverhead);
 
     private sealed record LoadedSnapshot(
         Dictionary<string, string> Generated,
@@ -370,17 +386,32 @@ public sealed class TranslationCache
             generatedLru.Clear();
             generatedNodes.Clear();
             generatedUtf8Bytes = 0;
+            generatedSnapshotJsonUtf8Bytes = 0;
+            pending.Clear();
+            pendingSet.Clear();
+            pendingGenerations.Clear();
+            pendingUtf8Bytes = 0;
+            pendingSnapshotJsonUtf8Bytes = 0;
+            nextPendingGeneration = 0;
+            raw.Clear();
+            rawUtf8Bytes = 0;
+            rawSnapshotJsonUtf8Bytes = 0;
+            sourceByTranslatedValue.Clear();
+            knownTranslatedValues.Clear();
+            ambiguousTranslatedValues.Clear();
+            reverseIndexNodes.Clear();
+            reverseIndexEntryBytes.Clear();
+            reverseIndexLru.Clear();
+            reverseIndexUtf8Bytes = 0;
+            runtimePromotedPending.Clear();
+            runtimePromotedPendingUtf8Bytes = 0;
+
             foreach (var entry in loadedGenerated)
             {
                 if (!TryStoreGeneratedUnsafe(entry.Key, entry.Value))
                     cleaned = true;
             }
 
-            pending.Clear();
-            pendingSet.Clear();
-            pendingGenerations.Clear();
-            pendingUtf8Bytes = 0;
-            nextPendingGeneration = 0;
             foreach (var template in loadedPending)
             {
                 if (!TextTemplate.IsTranslationCandidate(template)
@@ -393,8 +424,6 @@ public sealed class TranslationCache
                 pendingGenerations[template] = ++nextPendingGeneration;
             }
 
-            raw.Clear();
-            rawUtf8Bytes = 0;
             foreach (var value in loadedRaw)
             {
                 if (!TextTemplate.IsTranslationCandidate(value))
@@ -408,15 +437,6 @@ public sealed class TranslationCache
                     cleaned = true;
             }
 
-            sourceByTranslatedValue.Clear();
-            knownTranslatedValues.Clear();
-            ambiguousTranslatedValues.Clear();
-            reverseIndexNodes.Clear();
-            reverseIndexEntryBytes.Clear();
-            reverseIndexLru.Clear();
-            reverseIndexUtf8Bytes = 0;
-            runtimePromotedPending.Clear();
-            runtimePromotedPendingUtf8Bytes = 0;
             foreach (var entry in generated)
                 RememberResolutionUnsafe(entry.Key, entry.Value);
             if (cleaned) MarkDirtyUnsafe();
@@ -577,27 +597,62 @@ public sealed class TranslationCache
                 return default;
 
             var rawSample = TextTemplate.Normalize(original).Template;
-            var changed = TryAddRawUnsafe(rawSample);
-            if (generated.ContainsKey(normalizedTemplate))
+            var rawAdded = CanAddRawUnsafe(rawSample, out var rawBytes, out var rawJsonBytes);
+            var generatedAlreadyKnown = generated.ContainsKey(normalizedTemplate);
+            var pendingAlreadyKnown = pendingSet.Contains(normalizedTemplate);
+            var pendingAdded = !generatedAlreadyKnown && !pendingAlreadyKnown;
+            var pendingBytes = pendingAdded ? Utf8Bytes(normalizedTemplate) : 0;
+            var pendingJsonBytes = pendingAdded
+                ? JsonStringUtf8Bytes(normalizedTemplate)
+                : 0;
+
+            if (pendingAdded && !CanAddPendingCapacityUnsafe(pendingBytes))
             {
-                if (changed) MarkDirtyUnsafe();
+                ReportBudgetUnsafe(
+                    "cache-pending",
+                    "translation pending backlog reached its bounded budget; text was left unchanged.");
                 return default;
             }
 
-            var addedPending = false;
-            if (!pendingSet.Contains(normalizedTemplate))
+            var candidateRawCount = raw.Count + (rawAdded ? 1 : 0);
+            var candidateRawBytes = rawUtf8Bytes + (rawAdded ? rawBytes : 0);
+            var candidateRawJsonBytes = rawSnapshotJsonUtf8Bytes + (rawAdded ? rawJsonBytes : 0);
+            var candidatePendingCount = pending.Count + (pendingAdded ? 1 : 0);
+            var candidatePendingJsonBytes = pendingSnapshotJsonUtf8Bytes + pendingJsonBytes;
+            if (!IsDurableStateWithinBudgetUnsafe(
+                    generated.Count,
+                    generatedSnapshotJsonUtf8Bytes,
+                    candidatePendingCount,
+                    candidatePendingJsonBytes,
+                    candidateRawCount,
+                    candidateRawJsonBytes))
             {
-                if (!TryAddPendingUnsafe(normalizedTemplate))
-                {
-                    ReportBudgetUnsafe(
-                        "cache-pending",
-                        "translation pending backlog reached its bounded budget; text was left unchanged.");
-                    if (changed) MarkDirtyUnsafe();
-                    return default;
-                }
+                ReportBudgetUnsafe(
+                    "cache-snapshot-admission",
+                    "the complete authoritative cache snapshot would exceed its bounded serialized budget; observation was rejected.");
+                return default;
+            }
+
+            var changed = false;
+            if (rawAdded)
+            {
+                AddRawUnsafe(rawSample, rawBytes, rawJsonBytes);
+                changed = true;
+            }
+
+            var addedPending = false;
+            if (pendingAdded)
+            {
+                AddPendingUnsafe(normalizedTemplate, pendingBytes, pendingJsonBytes);
                 pendingGenerations[normalizedTemplate] = ++nextPendingGeneration;
                 changed = true;
                 addedPending = true;
+            }
+
+            if (generatedAlreadyKnown)
+            {
+                if (changed) MarkDirtyUnsafe();
+                return default;
             }
 
             var promote = false;
@@ -769,6 +824,7 @@ public sealed class TranslationCache
     private bool TryStoreGeneratedUnsafe(string normalizedTemplate, string translatedTemplate)
     {
         var entryBytes = Utf8Bytes(normalizedTemplate) + Utf8Bytes(translatedTemplate);
+        var entryJsonBytes = JsonStringUtf8Bytes(normalizedTemplate) + JsonStringUtf8Bytes(translatedTemplate);
         if (entryBytes > TranslationBudget.MaxGeneratedUtf8Bytes)
         {
             ReportBudgetUnsafe(
@@ -777,19 +833,62 @@ public sealed class TranslationCache
             return false;
         }
 
-        RemoveGeneratedUnsafe(normalizedTemplate);
-        while (generated.Count >= TranslationBudget.MaxGeneratedEntries
-            || generatedUtf8Bytes + entryBytes > TranslationBudget.MaxGeneratedUtf8Bytes)
+        var replacing = generated.TryGetValue(normalizedTemplate, out var previousTranslation);
+        var previousEntryBytes = replacing
+            ? Utf8Bytes(normalizedTemplate) + Utf8Bytes(previousTranslation!)
+            : 0;
+        var previousEntryJsonBytes = replacing
+            ? JsonStringUtf8Bytes(normalizedTemplate) + JsonStringUtf8Bytes(previousTranslation!)
+            : 0;
+        var candidateCount = generated.Count - (replacing ? 1 : 0) + 1;
+        var candidateEntryBytes = generatedUtf8Bytes - previousEntryBytes + entryBytes;
+        var candidateEntryJsonBytes = generatedSnapshotJsonUtf8Bytes - previousEntryJsonBytes + entryJsonBytes;
+        var evictions = new List<string>();
+        var node = generatedLru.First;
+        while (candidateCount > TranslationBudget.MaxGeneratedEntries
+            || candidateEntryBytes > TranslationBudget.MaxGeneratedUtf8Bytes)
         {
-            if (generatedLru.First == null)
+            if (node == null)
                 return false;
-            RemoveGeneratedUnsafe(generatedLru.First.Value);
+            var candidate = node.Value;
+            node = node.Next;
+            if (replacing && string.Equals(candidate, normalizedTemplate, StringComparison.Ordinal))
+                continue;
+
+            evictions.Add(candidate);
+            candidateCount--;
+            candidateEntryBytes -= Utf8Bytes(candidate) + Utf8Bytes(generated[candidate]);
+            candidateEntryJsonBytes -= JsonStringUtf8Bytes(candidate) + JsonStringUtf8Bytes(generated[candidate]);
         }
 
+        var pendingRemoval = pendingSet.Contains(normalizedTemplate);
+        var candidatePendingCount = pending.Count - (pendingRemoval ? 1 : 0);
+        var candidatePendingJsonBytes = pendingSnapshotJsonUtf8Bytes
+            - (pendingRemoval ? JsonStringUtf8Bytes(normalizedTemplate) : 0);
+        if (!IsDurableStateWithinBudgetUnsafe(
+                candidateCount,
+                candidateEntryJsonBytes,
+                candidatePendingCount,
+                candidatePendingJsonBytes,
+                raw.Count,
+                rawSnapshotJsonUtf8Bytes))
+        {
+            ReportBudgetUnsafe(
+                "cache-snapshot-admission",
+                "the complete authoritative cache snapshot would exceed its bounded serialized budget; generated translation was rejected.");
+            return false;
+        }
+
+        if (replacing)
+            RemoveGeneratedUnsafe(normalizedTemplate);
+        foreach (var evicted in evictions)
+            RemoveGeneratedUnsafe(evicted);
+
         generated[normalizedTemplate] = translatedTemplate;
-        var node = generatedLru.AddLast(normalizedTemplate);
-        generatedNodes[normalizedTemplate] = node;
+        var generatedNode = generatedLru.AddLast(normalizedTemplate);
+        generatedNodes[normalizedTemplate] = generatedNode;
         generatedUtf8Bytes += entryBytes;
+        generatedSnapshotJsonUtf8Bytes += entryJsonBytes;
         RememberResolutionUnsafe(normalizedTemplate, translatedTemplate);
         return true;
     }
@@ -801,6 +900,9 @@ public sealed class TranslationCache
         if (generatedNodes.Remove(normalizedTemplate, out var node))
             generatedLru.Remove(node);
         generatedUtf8Bytes -= Utf8Bytes(normalizedTemplate) + Utf8Bytes(translated);
+        generatedSnapshotJsonUtf8Bytes -= JsonStringUtf8Bytes(normalizedTemplate) + JsonStringUtf8Bytes(translated);
+        if (generatedUtf8Bytes < 0) generatedUtf8Bytes = 0;
+        if (generatedSnapshotJsonUtf8Bytes < 0) generatedSnapshotJsonUtf8Bytes = 0;
         return true;
     }
 
@@ -815,13 +917,30 @@ public sealed class TranslationCache
     private bool TryAddPendingUnsafe(string template)
     {
         var bytes = Utf8Bytes(template);
-        if (pending.Count >= TranslationBudget.MaxPendingEntries
-            || pendingUtf8Bytes + bytes > TranslationBudget.MaxPendingUtf8Bytes)
+        var jsonBytes = JsonStringUtf8Bytes(template);
+        if (!CanAddPendingCapacityUnsafe(bytes)
+            || !IsDurableStateWithinBudgetUnsafe(
+                generated.Count,
+                generatedSnapshotJsonUtf8Bytes,
+                pending.Count + 1,
+                pendingSnapshotJsonUtf8Bytes + jsonBytes,
+                raw.Count,
+                rawSnapshotJsonUtf8Bytes))
             return false;
+        AddPendingUnsafe(template, bytes, jsonBytes);
+        return true;
+    }
+
+    private bool CanAddPendingCapacityUnsafe(int bytes) =>
+        pending.Count < TranslationBudget.MaxPendingEntries
+        && pendingUtf8Bytes + bytes <= TranslationBudget.MaxPendingUtf8Bytes;
+
+    private void AddPendingUnsafe(string template, int bytes, int jsonBytes)
+    {
         pendingSet.Add(template);
         pending.Add(template);
         pendingUtf8Bytes += bytes;
-        return true;
+        pendingSnapshotJsonUtf8Bytes += jsonBytes;
     }
 
     private void RemovePendingUnsafe(string template)
@@ -831,22 +950,43 @@ public sealed class TranslationCache
         pendingGenerations.Remove(template);
         pending.RemoveAll(value => string.Equals(value, template, StringComparison.Ordinal));
         pendingUtf8Bytes -= Utf8Bytes(template);
+        pendingSnapshotJsonUtf8Bytes -= JsonStringUtf8Bytes(template);
         if (pendingUtf8Bytes < 0) pendingUtf8Bytes = 0;
+        if (pendingSnapshotJsonUtf8Bytes < 0) pendingSnapshotJsonUtf8Bytes = 0;
         if (runtimePromotedPending.Remove(template))
             runtimePromotedPendingUtf8Bytes -= Utf8Bytes(template);
     }
 
     private bool TryAddRawUnsafe(string value)
     {
-        if (raw.Contains(value))
+        var canAdd = CanAddRawUnsafe(value, out var bytes, out var jsonBytes);
+        if (!canAdd
+            || !IsDurableStateWithinBudgetUnsafe(
+                generated.Count,
+                generatedSnapshotJsonUtf8Bytes,
+                pending.Count,
+                pendingSnapshotJsonUtf8Bytes,
+                raw.Count + 1,
+                rawSnapshotJsonUtf8Bytes + jsonBytes))
             return false;
-        var bytes = Utf8Bytes(value);
-        if (raw.Count >= TranslationBudget.MaxRawEntries
-            || rawUtf8Bytes + bytes > TranslationBudget.MaxRawUtf8Bytes)
-            return false;
+        AddRawUnsafe(value, bytes, jsonBytes);
+        return true;
+    }
+
+    private bool CanAddRawUnsafe(string value, out int bytes, out int jsonBytes)
+    {
+        bytes = Utf8Bytes(value);
+        jsonBytes = JsonStringUtf8Bytes(value);
+        return !raw.Contains(value)
+            && raw.Count < TranslationBudget.MaxRawEntries
+            && rawUtf8Bytes + bytes <= TranslationBudget.MaxRawUtf8Bytes;
+    }
+
+    private void AddRawUnsafe(string value, int bytes, int jsonBytes)
+    {
         raw.Add(value);
         rawUtf8Bytes += bytes;
-        return true;
+        rawSnapshotJsonUtf8Bytes += jsonBytes;
     }
 
     private bool TryAddPromotedPendingUnsafe(string template)
@@ -859,6 +999,160 @@ public sealed class TranslationCache
         runtimePromotedPendingUtf8Bytes += bytes;
         return true;
     }
+
+    private bool IsDurableStateWithinBudgetUnsafe(
+        int generatedCount,
+        long generatedJsonBytes,
+        int pendingCount,
+        long pendingJsonBytes,
+        int rawCount,
+        long rawJsonBytes)
+    {
+        try
+        {
+            return EstimateDurableSnapshotUtf8Bytes(
+                generatedCount,
+                generatedJsonBytes,
+                pendingCount,
+                pendingJsonBytes,
+                rawCount,
+                rawJsonBytes) <= TranslationBudget.MaxCacheSnapshotBytes;
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+    }
+
+    private static long EstimateDurableSnapshotUtf8Bytes(
+        int generatedCount,
+        long generatedJsonBytes,
+        int pendingCount,
+        long pendingJsonBytes,
+        int rawCount,
+        long rawJsonBytes)
+    {
+        if (generatedCount < 0 || pendingCount < 0 || rawCount < 0
+            || generatedJsonBytes < 0 || pendingJsonBytes < 0 || rawJsonBytes < 0)
+            return long.MaxValue;
+
+        var total = DurableSnapshotLayout.EmptyBytes;
+        total = AddCollectionBytes(
+            total,
+            generatedCount,
+            generatedJsonBytes,
+            DurableSnapshotLayout.GeneratedFirstItemOverhead,
+            DurableSnapshotLayout.GeneratedAdditionalItemOverhead);
+        total = AddCollectionBytes(
+            total,
+            pendingCount,
+            pendingJsonBytes,
+            DurableSnapshotLayout.PendingFirstItemOverhead,
+            DurableSnapshotLayout.PendingAdditionalItemOverhead);
+        return AddCollectionBytes(
+            total,
+            rawCount,
+            rawJsonBytes,
+            DurableSnapshotLayout.RawFirstItemOverhead,
+            DurableSnapshotLayout.RawAdditionalItemOverhead);
+    }
+
+    private static long AddCollectionBytes(
+        long total,
+        int count,
+        long itemBytes,
+        long firstItemOverhead,
+        long additionalItemOverhead)
+    {
+        if (count == 0) return total;
+        return checked(total
+            + itemBytes
+            + firstItemOverhead
+            + checked((long)(count - 1) * additionalItemOverhead));
+    }
+
+    private static SnapshotLayout CreateSnapshotLayout()
+    {
+        var empty = CreateAdmissionSnapshot(
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            Array.Empty<string>(),
+            Array.Empty<string>());
+        var oneGenerated = CreateAdmissionSnapshot(
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["generated-key"] = "generated-value"
+            },
+            Array.Empty<string>(),
+            Array.Empty<string>());
+        var twoGenerated = CreateAdmissionSnapshot(
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["generated-key"] = "generated-value",
+                ["generated-key-2"] = "generated-value-2"
+            },
+            Array.Empty<string>(),
+            Array.Empty<string>());
+        var onePending = CreateAdmissionSnapshot(
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            new[] { "pending-value" },
+            Array.Empty<string>());
+        var twoPending = CreateAdmissionSnapshot(
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            new[] { "pending-value", "pending-value-2" },
+            Array.Empty<string>());
+        var oneRaw = CreateAdmissionSnapshot(
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            Array.Empty<string>(),
+            new[] { "raw-value" });
+        var twoRaw = CreateAdmissionSnapshot(
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            Array.Empty<string>(),
+            new[] { "raw-value", "raw-value-2" });
+
+        var emptyBytes = SerializedSnapshotUtf8Bytes(empty);
+        return new SnapshotLayout(
+            emptyBytes,
+            checked(SerializedSnapshotUtf8Bytes(oneGenerated)
+                - emptyBytes
+                - JsonStringUtf8Bytes("generated-key")
+                - JsonStringUtf8Bytes("generated-value")),
+            checked(SerializedSnapshotUtf8Bytes(twoGenerated)
+                - SerializedSnapshotUtf8Bytes(oneGenerated)
+                - JsonStringUtf8Bytes("generated-key-2")
+                - JsonStringUtf8Bytes("generated-value-2")),
+            checked(SerializedSnapshotUtf8Bytes(onePending)
+                - emptyBytes
+                - JsonStringUtf8Bytes("pending-value")),
+            checked(SerializedSnapshotUtf8Bytes(twoPending)
+                - SerializedSnapshotUtf8Bytes(onePending)
+                - JsonStringUtf8Bytes("pending-value-2")),
+            checked(SerializedSnapshotUtf8Bytes(oneRaw)
+                - emptyBytes
+                - JsonStringUtf8Bytes("raw-value")),
+            checked(SerializedSnapshotUtf8Bytes(twoRaw)
+                - SerializedSnapshotUtf8Bytes(oneRaw)
+                - JsonStringUtf8Bytes("raw-value-2")));
+    }
+
+    private static DurableSnapshot CreateAdmissionSnapshot(
+        Dictionary<string, string> generated,
+        string[] pending,
+        string[] raw) => new()
+        {
+            Version = 1,
+            Epoch = long.MaxValue,
+            TransactionId = new string('t', 32),
+            Checksum = new string('0', 64),
+            Generated = generated,
+            Pending = pending,
+            Raw = raw
+        };
+
+    private static long SerializedSnapshotUtf8Bytes(DurableSnapshot snapshot) =>
+        StrictUtf8.GetByteCount(JsonSerializer.Serialize(snapshot, JsonOptions));
+
+    private static int JsonStringUtf8Bytes(string value) =>
+        StrictUtf8.GetByteCount(JsonSerializer.Serialize(value, JsonOptions));
 
     private LoadedSnapshot? LoadDurableSnapshot(out bool hasStateArtifacts)
     {
