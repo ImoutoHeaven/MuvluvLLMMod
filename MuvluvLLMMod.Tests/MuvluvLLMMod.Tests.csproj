@@ -33,6 +33,7 @@
     <Compile Include="..\MuvluvLLMMod\DebugTextLogPolicy.cs" Link="Source\DebugTextLogPolicy.cs" />
     <Compile Include="..\MuvluvLLMMod\ConfigReloadPolicy.cs" Link="Source\ConfigReloadPolicy.cs" />
     <Compile Include="..\MuvluvLLMMod\ConfigChangePolicy.cs" Link="Source\ConfigChangePolicy.cs" />
+    <Compile Include="..\MuvluvLLMMod\PatchVerificationPolicy.cs" Link="Source\PatchVerificationPolicy.cs" />
     <Compile Include="..\MuvluvLLMMod\Translation.cs" Link="Source\Translation.cs" />
     <Compile Include="..\MuvluvLLMMod\EnqueueObservation.cs" Link="Source\EnqueueObservation.cs" />
   </ItemGroup>

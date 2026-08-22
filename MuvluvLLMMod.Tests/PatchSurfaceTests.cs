@@ -16,6 +16,8 @@ public sealed class PatchSurfaceTests
         Assert.Contains("FindObjectsByType<TMP_Text>", patch, StringComparison.Ordinal);
         Assert.Contains("HARD RULE", patch, StringComparison.Ordinal);
         Assert.Contains("DebugLogSeenText", patch, StringComparison.Ordinal);
+        Assert.Contains("HarmonyPatchVerificationPolicy.Verify", patch, StringComparison.Ordinal);
+        Assert.Contains("HarmonyPatchVerificationException", patch, StringComparison.Ordinal);
         Assert.Contains(
             "[HarmonyPrefix]\n    [HarmonyPatch(typeof(TMP_Text), \"set_text\")]",
             patch,
@@ -119,6 +121,31 @@ public sealed class PatchSurfaceTests
         var unpatch = plugin.IndexOf("\"unpatch Harmony\"", StringComparison.Ordinal);
         Assert.True(retire >= 0);
         Assert.True(unpatch > retire);
+    }
+
+    [Fact]
+    public void Required_patch_verification_is_before_runtime_component_creation()
+    {
+        var patch = ReadProductionSource("Patch.cs");
+        var initialize = patch.IndexOf("public static void Initialize", StringComparison.Ordinal);
+        var verification = patch.IndexOf("var verification = VerifyPatches(harmony.Id)", initialize, StringComparison.Ordinal);
+        var failure = patch.IndexOf("if (!verification.Succeeded)", verification, StringComparison.Ordinal);
+        var throwFailure = patch.IndexOf("throw new HarmonyPatchVerificationException(verification)", failure, StringComparison.Ordinal);
+
+        var plugin = ReadProductionSource("Plugin.cs");
+        var patchCall = plugin.IndexOf("Patch.Initialize(resources.Harmony)", StringComparison.Ordinal);
+        var hotkey = plugin.IndexOf("resources.Hotkey = AddComponent<Hotkey>()", patchCall, StringComparison.Ordinal);
+        var persistence = plugin.IndexOf("RunPersistenceLoopAsync", patchCall, StringComparison.Ordinal);
+        var machine = plugin.IndexOf("machineLifecycle.Initialize", patchCall, StringComparison.Ordinal);
+
+        Assert.True(initialize >= 0);
+        Assert.True(verification > initialize);
+        Assert.True(failure > verification);
+        Assert.True(throwFailure > failure);
+        Assert.True(patchCall >= 0);
+        Assert.True(hotkey > patchCall);
+        Assert.True(persistence > patchCall);
+        Assert.True(machine > patchCall);
     }
 
     [Fact]

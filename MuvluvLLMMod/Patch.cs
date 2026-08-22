@@ -25,7 +25,9 @@ public static class Patch
         harmony.PatchAll(typeof(Patch));
         // Hooks may be installed while the generation is still Loading. Keep their runtime
         // body inert until Plugin publishes Running and activates the complete owner.
-        VerifyPatches(harmony.Id);
+        var verification = VerifyPatches(harmony.Id);
+        if (!verification.Succeeded)
+            throw new HarmonyPatchVerificationException(verification);
     }
 
     public static void Activate()
@@ -193,7 +195,7 @@ public static class Patch
         && !Plugin.IsCleaningUp
         && tmpProvenance.LifecycleEpoch == epoch;
 
-    private static void VerifyPatches(string harmonyId)
+    private static HarmonyPatchVerificationResult VerifyPatches(string harmonyId)
     {
         var targets = new[]
         {
@@ -208,17 +210,29 @@ public static class Patch
                     new Type[] { })),
             (
                 Label: "Assets.GameUi.Scenario.ScenarioController.Leave",
-                Method: AccessTools.Method(typeof(ScenarioController), nameof(ScenarioController.Leave))),
+                Method: AccessTools.Method(typeof(ScenarioController), nameof(ScenarioController.Leave)))
         };
-        var missing = targets
-            .Where(target => target.Method == null
-                || Harmony.GetPatchInfo(target.Method)?.Owners.Contains(harmonyId) != true)
-            .Select(target => target.Label)
-            .ToArray();
-        var targetList = string.Join(", ", targets.Select(target => target.Label));
-        if (missing.Length == 0)
+        var result = HarmonyPatchVerificationPolicy.Verify(
+            targets.Select(target => new HarmonyPatchTargetStatus(
+                target.Label,
+                target.Method != null,
+                target.Method != null
+                    && Harmony.GetPatchInfo(target.Method)?.Owners.Contains(harmonyId) == true)));
+        var targetList = string.Join(", ", result.Targets.Select(target => target.Label));
+        if (result.Succeeded)
+        {
             Logger.Info($"Harmony patches verified: owner={harmonyId}, targets=[{targetList}]");
+        }
         else
-            Logger.Error($"Harmony patch verification failed: owner={harmonyId}, missing={string.Join(", ", missing)}");
+        {
+            var missing = string.Join(
+                ", ",
+                result.MissingRequiredTargets.Select(target => target.Label));
+            Logger.Error(
+                $"Harmony patch verification failed: owner={harmonyId}, missing=[{missing}], "
+                + $"targets=[{targetList}]");
+        }
+
+        return result;
     }
 }
