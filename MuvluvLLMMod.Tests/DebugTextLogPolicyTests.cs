@@ -114,22 +114,23 @@ public sealed class DebugTextLogPolicyTests
         var decisions = new ConcurrentBag<DebugTextLogDecision>();
         using var barrier = new Barrier(workerCount);
 
-        var workers = Enumerable.Range(0, workerCount).Select(worker => Task.Run(() =>
-        {
-            Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(5)));
-            for (var index = 0; index < inputsPerWorker; index++)
+        var workers = Enumerable.Range(0, workerCount).Select(worker =>
+            Task.Factory.StartNew(() =>
             {
-                // Keep the distinguishing part inside the long input's hash domain. This
-                // proves that unique, long values do not collapse to their 80-char display.
-                var input = $"{worker:D2}:{index:D4}|" + new string('長', 5_000);
-                decisions.Add(policy.Observe(
-                    input,
-                    containsKana: true,
-                    durablyPending: true,
-                    acceptedByScheduler: true,
-                    now: Start));
-            }
-        })).ToArray();
+                Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(5)));
+                for (var index = 0; index < inputsPerWorker; index++)
+                {
+                    // Keep the distinguishing part inside the long input's hash domain. This
+                    // proves that unique, long values do not collapse to their 80-char display.
+                    var input = $"{worker:D2}:{index:D4}|" + new string('長', 5_000);
+                    decisions.Add(policy.Observe(
+                        input,
+                        containsKana: true,
+                        durablyPending: true,
+                        acceptedByScheduler: true,
+                        now: Start));
+                }
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
 
         await Task.WhenAll(workers);
 
