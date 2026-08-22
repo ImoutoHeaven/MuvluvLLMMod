@@ -139,6 +139,7 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
         var releaseOld = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var newStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var newStopRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseNew = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var created = 0;
         var lifecycle = new MachineTranslatorLifecycle();
 
@@ -162,12 +163,16 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
 
             return new MachineTranslator(
                 cache,
-                (template, token) =>
+                async (template, token) =>
                 {
-                    using var registration = token.Register(() => newStopRequested.TrySetResult());
+                    using var registration = token.Register(() =>
+                    {
+                        newStopRequested.TrySetResult();
+                        releaseNew.TrySetResult(null);
+                    });
                     if (template == "新しい作業する")
                         newStarted.TrySetResult();
-                    return Task.FromResult<string?>("新翻译");
+                    return await releaseNew.Task;
                 },
                 1,
                 TimeSpan.FromSeconds(1),
@@ -199,6 +204,7 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
         finally
         {
             releaseOld.TrySetResult(null);
+            releaseNew.TrySetResult(null);
             await lifecycle.ShutdownAsync().WaitAsync(TimeSpan.FromSeconds(2));
         }
     }
