@@ -6,13 +6,14 @@ namespace MuvluvLLMMod;
 public static class Translation
 {
     [ThreadStatic]
-    private static bool lastResolveEnqueued;
+    private static EnqueueObservation lastEnqueueObservation;
 
-    public static bool LastResolveEnqueued => lastResolveEnqueued;
+    public static EnqueueObservation LastEnqueueObservation => lastEnqueueObservation;
+    public static bool LastResolveEnqueued => lastEnqueueObservation.AcceptedByLiveWorker;
 
     public static string ResolveAny(string original, bool enqueue = true)
     {
-        lastResolveEnqueued = false;
+        lastEnqueueObservation = default;
         if (!Config.Translation.Value || string.IsNullOrEmpty(original))
             return original;
 
@@ -25,13 +26,15 @@ public static class Translation
         }
         finally
         {
-            lastResolveEnqueued = Core.EndEnqueueObservation();
+            lastEnqueueObservation = CaptureObservation(
+                original,
+                Core.EndEnqueueObservation());
         }
     }
 
     public static bool ObserveForTranslation(string original, bool priority)
     {
-        lastResolveEnqueued = false;
+        lastEnqueueObservation = default;
         if (string.IsNullOrEmpty(original))
             return false;
 
@@ -43,8 +46,20 @@ public static class Translation
         }
         finally
         {
-            lastResolveEnqueued = Core.EndEnqueueObservation();
+            lastEnqueueObservation = CaptureObservation(
+                original,
+                Core.EndEnqueueObservation());
         }
-        return lastResolveEnqueued;
+        return lastEnqueueObservation.AcceptedByLiveWorker;
+    }
+
+    private static EnqueueObservation CaptureObservation(string original, bool acceptedByLiveWorker)
+    {
+        var source = Core.Cache.TryGetSourceForTranslatedValue(original, out var resolvedSource)
+            ? resolvedSource
+            : original;
+        var durablyPending = TextTemplate.IsTranslationCandidate(source)
+            && Core.Cache.TryGetPendingGeneration(TextTemplate.Normalize(source).Template, out _);
+        return new EnqueueObservation(durablyPending, acceptedByLiveWorker);
     }
 }

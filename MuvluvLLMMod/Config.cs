@@ -89,8 +89,8 @@ public static class Config
         DebugLogSeenText = configFile.Bind(
             "Translation.Debug",
             "DebugLogSeenText",
-            true,
-            "是否记录观察到的文本");
+            false,
+            "诊断用途：是否记录观察到的文本");
 
         configFile.SettingChanged += OnSettingChanged;
         Logger.Info("Translation: " + (Translation.Value ? "Enabled" : "Disabled"));

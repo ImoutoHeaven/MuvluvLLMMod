@@ -15,8 +15,7 @@ public static class Patch
     [ThreadStatic]
     private static bool translatingTmp;
 
-    private static readonly object debugGate = new();
-    private static readonly HashSet<string> debugSeenText = new(StringComparer.Ordinal);
+    private static readonly DebugTextLogPolicy debugTextLogPolicy = new();
     private static readonly TmpTranslationProvenance tmpProvenance = new();
     private static int refreshScanCount;
 
@@ -47,7 +46,7 @@ public static class Patch
 
         var original = value ?? string.Empty;
         var containsKana = TextTemplate.IsTranslationCandidate(original);
-        var enqueued = false;
+        var enqueueObservation = default(EnqueueObservation);
         translatingTmp = true;
         try
         {
@@ -56,13 +55,14 @@ public static class Patch
                 if (Config.Translation.Value)
                 {
                     value = Translation.ResolveAny(original, enqueue: true);
-                    enqueued = Translation.LastResolveEnqueued;
+                    enqueueObservation = Translation.LastEnqueueObservation;
                     if (!string.Equals(value, original, StringComparison.Ordinal))
                         tmpProvenance.Record(instanceId, value, original);
                 }
                 else
                 {
-                    enqueued = Translation.ObserveForTranslation(original, isPlayingScenario);
+                    Translation.ObserveForTranslation(original, isPlayingScenario);
+                    enqueueObservation = Translation.LastEnqueueObservation;
                     // HARD RULE: string equality alone is insufficient: only restore an exact value
                     // recorded for this TMP instance, and only while the cache resolves it to its source.
                     if (tmpProvenance.TryRestore(
@@ -83,7 +83,7 @@ public static class Patch
             translatingTmp = false;
         }
 
-        LogSeenText(original, containsKana, enqueued);
+        LogSeenText(original, containsKana, enqueueObservation);
     }
 
     [HarmonyPostfix]
@@ -129,26 +129,39 @@ public static class Patch
         }
     }
 
-    private static void LogSeenText(string text, bool containsKana, bool enqueued)
+    private static void LogSeenText(
+        string text,
+        bool containsKana,
+        EnqueueObservation enqueueObservation)
     {
         if (!Config.DebugLogSeenText.Value)
             return;
 
-        lock (debugGate)
+        var decision = debugTextLogPolicy.Observe(
+            text,
+            containsKana,
+            enqueueObservation.DurablyPending,
+            enqueueObservation.AcceptedByLiveWorker,
+            DateTimeOffset.UtcNow);
+        if (decision.SuppressedLines > 0)
         {
-            if (!debugSeenText.Add(text))
-                return;
+            Logger.Info($"[LLM] seen text: {decision.SuppressedLines} lines suppressed");
         }
 
-        var displayed = text
+        if (!decision.ShouldLog || decision.Text == null)
+            return;
+
+        var displayed = decision.Text
             .Replace("\\", "\\\\", StringComparison.Ordinal)
             .Replace("\r", "\\r", StringComparison.Ordinal)
             .Replace("\n", "\\n", StringComparison.Ordinal)
             .Replace("\"", "\\\"", StringComparison.Ordinal);
-        if (displayed.Length > 80)
-            displayed = displayed[..80] + "...";
+        displayed = DebugTextLogPolicy.Truncate(displayed);
 
-        Logger.Info($"[LLM] seen text=\"{displayed}\" kana={containsKana} enqueued={enqueued}");
+        Logger.Info(
+            $"[LLM] seen text=\"{displayed}\" kana={containsKana} "
+            + $"durablyPending={enqueueObservation.DurablyPending} "
+            + $"acceptedByLiveWorker={enqueueObservation.AcceptedByLiveWorker}");
     }
 
     private static void VerifyPatches(string harmonyId)
