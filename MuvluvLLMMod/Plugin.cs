@@ -64,36 +64,47 @@ public sealed class Plugin : BasePlugin
 
         Interlocked.Exchange(ref cleanupStarted, 0);
         Volatile.Write(ref cleanupSucceeded, 0);
-        TrySetUtf8Console();
 
-        Log = base.Log;
-        Logger.Info($"Plugin {PluginGuid} is loading");
-        MuvluvLLMMod.Config.Initialize(base.Config);
+        try
+        {
+            TrySetUtf8Console();
 
-        Cache = new TranslationCache(
-            ResolvePluginPath(MuvluvLLMMod.Config.CacheDirectory.Value),
-            message => Logger.Warn("Translation cache " + message));
-        Cache.Load();
-        Resolver = new TranslationResolver(Cache, EnqueuePriority, EnqueueNormal, CancelTranslation);
+            Log = base.Log;
+            Logger.Info($"Plugin {PluginGuid} is loading");
+            MuvluvLLMMod.Config.Initialize(base.Config);
 
-        persistenceCancellation = new CancellationTokenSource();
-        persistenceTask = Cache.RunPersistenceLoopAsync(persistenceCancellation.Token);
-        ObserveBackgroundTask(persistenceTask, "cache persistence");
+            Cache = new TranslationCache(
+                ResolvePluginPath(MuvluvLLMMod.Config.CacheDirectory.Value),
+                message => Logger.Warn("Translation cache " + message));
+            Cache.Load();
+            Resolver = new TranslationResolver(Cache, EnqueuePriority, EnqueueNormal, CancelTranslation);
 
-        var machineSettings = CaptureMachineSettings();
-        var retryPolicy = new TranslationRetryPolicy();
-        MachineLifecycle.Initialize(
-            machineSettings.Enabled,
-            machineSettings.RequestsPerSecond,
-            (limiter, backlog) => CreateMachineTranslator(machineSettings, limiter, backlog, retryPolicy),
-            retryPolicy);
+            // Patch and inject the component before starting any background workers. If either
+            // stage fails, the catch below can use the single normal cleanup path.
+            harmony = new Harmony(PluginGuid);
+            Patch.Initialize(harmony);
+            Instance = AddComponent<Hotkey>();
+            Application.quitting = Application.quitting + ApplicationQuittingHandler;
 
-        harmony = new Harmony(PluginGuid);
-        Patch.Initialize(harmony);
-        Instance = AddComponent<Hotkey>();
-        Application.quitting = Application.quitting + ApplicationQuittingHandler;
+            persistenceCancellation = new CancellationTokenSource();
+            persistenceTask = Cache.RunPersistenceLoopAsync(persistenceCancellation.Token);
+            ObserveBackgroundTask(persistenceTask, "cache persistence");
 
-        Logger.Info($"Plugin {PluginGuid} loaded successfully");
+            var machineSettings = CaptureMachineSettings();
+            var retryPolicy = new TranslationRetryPolicy();
+            MachineLifecycle.Initialize(
+                machineSettings.Enabled,
+                machineSettings.RequestsPerSecond,
+                (limiter, backlog) => CreateMachineTranslator(machineSettings, limiter, backlog, retryPolicy),
+                retryPolicy);
+
+            Logger.Info($"Plugin {PluginGuid} loaded successfully");
+        }
+        catch
+        {
+            Cleanup();
+            throw;
+        }
     }
 
     public override bool Unload() => Cleanup();
