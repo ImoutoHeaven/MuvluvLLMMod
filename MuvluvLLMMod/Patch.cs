@@ -17,6 +17,7 @@ public static class Patch
 
     private static readonly object debugGate = new();
     private static readonly HashSet<string> debugSeenText = new(StringComparer.Ordinal);
+    private static readonly TmpTranslationProvenance tmpProvenance = new();
     private static int refreshScanCount;
 
     public static void Initialize(Harmony harmony)
@@ -40,6 +41,10 @@ public static class Patch
         if (translatingTmp)
             return;
 
+        var instanceId = __instance.GetInstanceID();
+        var current = __instance.text ?? string.Empty;
+        tmpProvenance.InvalidateIfTextChanged(instanceId, current);
+
         var original = value ?? string.Empty;
         var containsKana = TextTemplate.IsTranslationCandidate(original);
         var enqueued = false;
@@ -52,13 +57,24 @@ public static class Patch
                 {
                     value = Translation.ResolveAny(original, enqueue: true);
                     enqueued = Translation.LastResolveEnqueued;
+                    if (!string.Equals(value, original, StringComparison.Ordinal))
+                        tmpProvenance.Record(instanceId, value, original);
                 }
                 else
                 {
                     enqueued = Translation.ObserveForTranslation(original, isPlayingScenario);
-                    // HARD RULE: only restore text that our reverse map resolves; upstream text is never reverted.
-                    if (Core.Cache.TryGetSourceForTranslatedValue(original, out var source))
+                    // HARD RULE: string equality alone is insufficient: only restore an exact value
+                    // recorded for this TMP instance, and only while the cache resolves it to its source.
+                    if (tmpProvenance.TryRestore(
+                        instanceId,
+                        original,
+                        translatedValue => Core.Cache.TryGetSourceForTranslatedValue(translatedValue, out var source)
+                            ? source
+                            : null,
+                        out var source))
+                    {
                         value = source;
+                    }
                 }
             }
         }
