@@ -740,7 +740,8 @@ integration/mutation-test batch.
 
 ## M-5 follow-up — exact production wiring harness and mutation gate (implementation submitted)
 
-This section records the M-5 implementation at `9616715` plus commits `53a2432` and `5ac464a`.
+This section records the M-5 implementation at `9616715` plus commits `53a2432`, `5ac464a`,
+and `4774c78`.
 It intentionally does **not** declare M-5 closed; that remains for the final reviewer.
 No production runtime source was changed. The two commits add only the exact-source test target,
 its runtime-boundary stubs, documentation, and the Docker-only mutation script.
