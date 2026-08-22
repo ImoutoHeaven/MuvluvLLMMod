@@ -5,7 +5,7 @@ set -euo pipefail
 # every mutant is made in a separate throwaway copy under /tmp and is deleted on exit.
 SOURCE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PROJECT="MuvluvLLMMod.IntegrationTests/MuvluvLLMMod.IntegrationTests.csproj"
-EXPECTED_BASELINE=25
+EXPECTED_BASELINE=27
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/muvluv-m5.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 ROOT="$WORK/base"
@@ -79,6 +79,11 @@ gate_mutant() {
             replace_once "$copy/MuvluvLLMMod/TranslationBudget.cs" \
                 'public static bool IsTextWithinBudget(string? text) => TryGetTextBytes(text, out _);' \
                 'public static bool IsTextWithinBudget(string? text) => true;'
+            ;;
+        FR2-1-disable-durable-admission)
+            replace_once "$copy/MuvluvLLMMod/TranslationCache.cs" \
+                $'            return EstimateDurableSnapshotUtf8Bytes(\n                generatedCount,\n                generatedJsonBytes,\n                pendingCount,\n                pendingJsonBytes,\n                rawCount,\n                rawJsonBytes) <= TranslationBudget.MaxCacheSnapshotBytes;' \
+                '            return true;'
             ;;
         M5-M4-remove-terminal-retry-guard)
             replace_once "$copy/MuvluvLLMMod/TranslationCache.cs" \
@@ -186,6 +191,8 @@ gate_mutant M5-N1-open-required-patch-verification \
     ProductionRenderIntegrationTests.Missing_required_patch_verification_rolls_back_before_hotkey_persistence_or_worker_start
 gate_mutant M5-M3-disable-budget-gate \
     ProductionBudgetAndShutdownIntegrationTests.Oversized_render_input_is_rejected_fail_closed_and_not_retained
+gate_mutant FR2-1-disable-durable-admission \
+    ProductionBudgetAndShutdownIntegrationTests.Full_cap_cjk_pairs_are_rejected_before_an_unwritable_authoritative_state
 gate_mutant M5-M4-remove-terminal-retry-guard \
     ProductionBudgetAndShutdownIntegrationTests.Terminal_flush_recovers_from_one_transient_write_failure
 gate_mutant M5-PF1-single-stopping-owner \
@@ -211,4 +218,4 @@ gate_mutant PF1-unbounded-callback-wait \
 gate_mutant M2-extra-nonrender-hook \
     ProductionSourceLinkIntegrationTests.Exact_source_harness_applies_only_final_tmp_and_scenario_priority_patches
 
-echo "PF-6 mutation gate: all 17 compile-valid configured mutants killed"
+echo "FR2-1 mutation gate: all 18 compile-valid configured mutants killed"

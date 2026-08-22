@@ -51,6 +51,103 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
     }
 
     [Fact]
+    public void Full_cap_cjk_pairs_are_rejected_before_an_unwritable_authoritative_state()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.snapshot-admission." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var cache = new TranslationCache(root);
+            const int pairCount = 4096;
+            var accepted = 0;
+            for (var index = 0; index < pairCount; index++)
+            {
+                var source = CjkPairPart(0x4e00 + index, 170, '字');
+                var translation = CjkPairPart(0x6000 + index, 171, '译');
+                if (!cache.StoreGenerated(source, translation))
+                    break;
+                accepted++;
+            }
+
+            Assert.InRange(accepted, 1, pairCount);
+            if (accepted < pairCount)
+            {
+                var before = cache.RetainedSnapshot;
+                var oversizedAggregateSource = new string('あ', TranslationBudget.MaxTextUtf16CodeUnits);
+                Assert.False(cache.ObserveNormal(oversizedAggregateSource, oversizedAggregateSource));
+                Assert.Equal(before.PendingCount, cache.RetainedSnapshot.PendingCount);
+                Assert.Equal(before.RawCount, cache.RetainedSnapshot.RawCount);
+            }
+
+            Assert.True(cache.Flush());
+            Assert.True(cache.FlushTerminal(TimeSpan.FromSeconds(1)));
+            Assert.True(File.Exists(cache.StatePath));
+            Assert.InRange(
+                new FileInfo(cache.StatePath).Length,
+                1,
+                TranslationBudget.MaxCacheSnapshotBytes);
+
+            var restarted = new TranslationCache(root);
+            restarted.Load();
+            Assert.Equal(accepted, restarted.GeneratedCount);
+            Assert.True(restarted.TryGetGenerated(
+                CjkPairPart(0x4e00, 170, '字'),
+                out var firstTranslation));
+            Assert.Equal(CjkPairPart(0x6000, 171, '译'), firstTranslation);
+            Assert.True(restarted.Flush());
+            Assert.True(restarted.FlushTerminal(TimeSpan.FromSeconds(1)));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Hostile_json_escapes_and_all_durable_collections_share_the_admission()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.snapshot-hostile." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var cache = new TranslationCache(root);
+            var source = "かな " + '"' + '\u0001' + '"' + " <b>{0}</b>\n";
+            var translation = "译 " + '"' + '\u0001' + '"' + " <b>{0}</b>\n";
+            Assert.True(cache.StoreGenerated(source, translation));
+
+            for (var index = 0; index < 300; index++)
+            {
+                var value = "待機する" + (char)(0x7000 + index) + " " + '"' + '\u0002' + '"' + " <i>";
+                Assert.True(cache.ObserveNormal(value, value));
+            }
+
+            var beforeFlush = cache.RetainedSnapshot;
+            Assert.True(beforeFlush.GeneratedCount > 0);
+            Assert.True(beforeFlush.PendingCount > 0);
+            Assert.True(beforeFlush.RawCount > 0);
+            Assert.True(cache.Flush());
+            Assert.InRange(
+                new FileInfo(cache.StatePath).Length,
+                1,
+                TranslationBudget.MaxCacheSnapshotBytes);
+            Assert.True(cache.FlushTerminal(TimeSpan.FromSeconds(1)));
+
+            var restarted = new TranslationCache(root);
+            restarted.Load();
+            Assert.True(restarted.TryGetGenerated(source, out var restored));
+            Assert.Equal(translation, restored);
+            Assert.Equal(beforeFlush.PendingCount, restarted.RetainedSnapshot.PendingCount);
+            Assert.Equal(beforeFlush.RawCount, restarted.RetainedSnapshot.RawCount);
+            Assert.True(restarted.Flush());
+            Assert.True(restarted.FlushTerminal(TimeSpan.FromSeconds(1)));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public void Reverse_index_retains_source_and_translation_bytes_for_admission()
     {
         var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.reverse." + Guid.NewGuid().ToString("N"));
@@ -541,6 +638,14 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> send;
         public DelegateHandler(Func<HttpRequestMessage, Task<HttpResponseMessage>> send) => this.send = send;
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => send(request);
+    }
+
+    private static string CjkPairPart(int firstCodePoint, int length, char filler)
+    {
+        var chars = new char[length];
+        chars[0] = (char)firstCodePoint;
+        Array.Fill(chars, filler, 1, length - 1);
+        return new string(chars);
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)

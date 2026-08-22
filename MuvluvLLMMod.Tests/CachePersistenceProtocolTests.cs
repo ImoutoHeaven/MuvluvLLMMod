@@ -13,6 +13,44 @@ public sealed class CachePersistenceProtocolTests : IDisposable
         Guid.NewGuid().ToString("N"));
 
     [Fact]
+    public void Legacy_load_applies_the_same_aggregate_serialized_admission_before_migration()
+    {
+        Directory.CreateDirectory(Path.Combine(root, "dump"));
+        var generated = new Dictionary<string, string>(StringComparer.Ordinal);
+        for (var index = 0; index < 3800; index++)
+        {
+            generated[CjkPairPart(0x4e00 + index, 170, '字')] =
+                CjkPairPart(0x6000 + index, 171, '译');
+        }
+        var pending = Enumerable.Range(0, 300)
+            .Select(index => new string('あ', 499) + (char)(0x7000 + index))
+            .ToArray();
+        var raw = pending.ToDictionary(value => value, _ => string.Empty, StringComparer.Ordinal);
+        File.WriteAllText(Path.Combine(root, "generated.zh_Hans.json"), JsonSerializer.Serialize(generated), new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(root, "pending.zh_Hans.json"), JsonSerializer.Serialize(pending), new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(root, "dump", "ui_raw.json"), JsonSerializer.Serialize(raw), new UTF8Encoding(false));
+
+        var cache = new TranslationCache(root);
+        cache.Load();
+        var before = cache.RetainedSnapshot;
+        Assert.True(before.GeneratedCount > 0);
+        Assert.True(before.PendingCount < pending.Length || before.RawCount < raw.Count);
+        Assert.True(cache.Flush());
+        Assert.InRange(new FileInfo(cache.StatePath).Length, 1, TranslationBudget.MaxCacheSnapshotBytes);
+
+        var restarted = new TranslationCache(root);
+        restarted.Load();
+        var after = restarted.RetainedSnapshot;
+        Assert.Equal(before.GeneratedCount, after.GeneratedCount);
+        Assert.Equal(before.PendingCount, after.PendingCount);
+        Assert.Equal(before.RawCount, after.RawCount);
+        Assert.True(restarted.TryGetGenerated(
+            CjkPairPart(0x4e00, 170, '字'),
+            out var translation));
+        Assert.Equal(CjkPairPart(0x6000, 171, '译'), translation);
+    }
+
+    [Fact]
     public void Canonical_state_snapshot_is_coherent_and_legacy_paths_remain_readable()
     {
         var cache = new TranslationCache(root);
@@ -271,5 +309,13 @@ public sealed class CachePersistenceProtocolTests : IDisposable
     {
         if (Directory.Exists(root))
             Directory.Delete(root, true);
+    }
+
+    private static string CjkPairPart(int firstCodePoint, int length, char filler)
+    {
+        var chars = new char[length];
+        chars[0] = (char)firstCodePoint;
+        Array.Fill(chars, filler, 1, length - 1);
+        return new string(chars);
     }
 }
