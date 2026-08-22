@@ -16,6 +16,7 @@
     <Compile Include="..\MuvluvLLMMod\MachineTranslator.cs" Link="Source\MachineTranslator.cs" />
     <Compile Include="..\MuvluvLLMMod\TranslationWorkQueue.cs" Link="Source\TranslationWorkQueue.cs" />
     <Compile Include="..\MuvluvLLMMod\MachineTranslatorLifecycle.cs" Link="Source\MachineTranslatorLifecycle.cs" />
+    <Compile Include="..\MuvluvLLMMod\PluginLifecycleGate.cs" Link="Source\PluginLifecycleGate.cs" />
     <Compile Include="..\MuvluvLLMMod\TranslationPriorityBacklog.cs" Link="Source\TranslationPriorityBacklog.cs" />
     <Compile Include="..\MuvluvLLMMod\OpenAiChatClient.cs" Link="Source\OpenAiChatClient.cs" />
     <Compile Include="..\MuvluvLLMMod\TranslationRetryPolicy.cs" Link="Source\TranslationRetryPolicy.cs" />

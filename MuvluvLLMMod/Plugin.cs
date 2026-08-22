@@ -26,9 +26,7 @@ public sealed class Plugin : BasePlugin
     private static Task persistenceTask = Task.CompletedTask;
     private static MachineTranslator? currentMachine;
     private static Harmony? harmony;
-    private static int loadStarted;
-    private static int cleanupStarted;
-    private static int cleanupSucceeded;
+    private static readonly PluginLifecycleGate lifecycleGate = new();
     private static readonly Action ApplicationQuittingHandler = OnApplicationQuitting;
     private static Il2CppSystem.Action? applicationQuittingHandler;
 
@@ -51,19 +49,16 @@ public sealed class Plugin : BasePlugin
     internal static (int Completed, int InFlight, int Failed) ProgressSnapshot =>
         Volatile.Read(ref currentMachine)?.ProgressSnapshot ?? (0, 0, 0);
 
-    internal static bool IsCleaningUp => Volatile.Read(ref cleanupStarted) != 0;
+    internal static bool IsCleaningUp => lifecycleGate.IsCleaningUp;
 
     public override void Load()
     {
-        if (Interlocked.CompareExchange(ref loadStarted, 1, 0) != 0)
+        if (!lifecycleGate.TryBeginLoad())
         {
             if (Log != null)
                 Logger.Warn("Load called more than once; keeping the existing Hotkey component");
             return;
         }
-
-        Interlocked.Exchange(ref cleanupStarted, 0);
-        Volatile.Write(ref cleanupSucceeded, 0);
         Volatile.Write(ref machineLifecycle, CreateMachineLifecycle());
 
         try
@@ -112,96 +107,82 @@ public sealed class Plugin : BasePlugin
 
     internal static bool Cleanup()
     {
-        if (Interlocked.CompareExchange(ref cleanupStarted, 1, 0) != 0)
-            return Volatile.Read(ref cleanupSucceeded) != 0;
-
-        var succeeded = true;
         var lifecycle = MachineLifecycle;
-        CleanupStep("remove application-quit handler", RemoveApplicationQuittingHandler, ref succeeded);
-        CleanupStep("shutdown configuration", MuvluvLLMMod.Config.Shutdown, ref succeeded);
-
-        CleanupStep("disable Hotkey", () =>
-        {
-            var instance = Instance;
-            Instance = null;
-            if (instance == null)
-                return;
-
-            instance.enabled = false;
-            UnityEngine.Object.Destroy(instance);
-        }, ref succeeded);
-
-        // Keep this order: freeze → stop workers → cancel persistence → flush → unpatch.
-        CleanupStep("freeze cache mutations", () =>
-        {
-            if (Cache != null)
-                Cache.FreezeMutations();
-        }, ref succeeded);
-        CleanupStep("shutdown machine translator", lifecycle.Shutdown, ref succeeded);
-
         CancellationTokenSource? persistenceSource = null;
-        CleanupStep("cancel cache persistence", () =>
-        {
-            persistenceSource = Interlocked.Exchange(ref persistenceCancellation, null);
-            if (persistenceSource == null)
-                return;
-
-            persistenceSource.Cancel();
-            var task = persistenceTask;
-            _ = task.ContinueWith(
-                completed =>
+        var succeeded = lifecycleGate.Cleanup(
+            new[]
+            {
+                new PluginCleanupStep("remove application-quit handler", RemoveApplicationQuittingHandler),
+                new PluginCleanupStep("shutdown configuration", MuvluvLLMMod.Config.Shutdown),
+                new PluginCleanupStep("disable Hotkey", () =>
                 {
-                    _ = completed.Exception;
-                    persistenceSource.Dispose();
-                },
-                CancellationToken.None,
-                TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default);
-        }, ref succeeded);
+                    var instance = Instance;
+                    Instance = null;
+                    if (instance == null)
+                        return;
 
-        CleanupStep("flush cache", () =>
-        {
-            if (Cache == null || Cache.FlushTerminal())
-                return;
+                    instance.enabled = false;
+                    UnityEngine.Object.Destroy(instance);
+                }),
 
-            Logger.Error(
-                $"[LLM] Terminal cache flush failed after {TranslationCache.TerminalFlushMaxAttempts} attempts; "
-                + "dirty cache data may be unrecoverable");
-            throw new InvalidOperationException("terminal cache flush failed");
-        }, ref succeeded);
-        CleanupStep("unpatch Harmony", () =>
-        {
-            harmony?.UnpatchSelf();
-            harmony = null;
-        }, ref succeeded);
+                // Keep this order: freeze → stop workers → cancel persistence → flush → unpatch.
+                new PluginCleanupStep("freeze cache mutations", () =>
+                {
+                    if (Cache != null)
+                        Cache.FreezeMutations();
+                }),
+                new PluginCleanupStep("shutdown machine translator", lifecycle.Shutdown),
+                new PluginCleanupStep("cancel cache persistence", () =>
+                {
+                    persistenceSource = Interlocked.Exchange(ref persistenceCancellation, null);
+                    if (persistenceSource == null)
+                        return;
+
+                    persistenceSource.Cancel();
+                    var task = persistenceTask;
+                    _ = task.ContinueWith(
+                        completed =>
+                        {
+                            _ = completed.Exception;
+                            persistenceSource.Dispose();
+                        },
+                        CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }),
+                new PluginCleanupStep("flush cache", () =>
+                {
+                    if (Cache == null || Cache.FlushTerminal())
+                        return;
+
+                    Logger.Error(
+                        $"[LLM] Terminal cache flush failed after {TranslationCache.TerminalFlushMaxAttempts} attempts; "
+                        + "dirty cache data may be unrecoverable");
+                    throw new InvalidOperationException("terminal cache flush failed");
+                }),
+                new PluginCleanupStep("unpatch Harmony", () =>
+                {
+                    harmony?.UnpatchSelf();
+                    harmony = null;
+                })
+            },
+            (name, exception) =>
+            {
+                try
+                {
+                    Logger.Error($"[LLM] Cleanup step '{name}' failed: {exception.GetType().Name}");
+                }
+                catch
+                {
+                }
+            });
         Volatile.Write(ref currentMachine, null);
-        Volatile.Write(ref cleanupSucceeded, succeeded ? 1 : 0);
-        Volatile.Write(ref loadStarted, 0);
 
         if (succeeded)
             Logger.Info($"Plugin {PluginGuid} unloaded");
         else
             Logger.Error($"Plugin {PluginGuid} cleanup completed with errors");
         return succeeded;
-    }
-
-    private static void CleanupStep(string name, Action action, ref bool succeeded)
-    {
-        try
-        {
-            action();
-        }
-        catch (Exception exception)
-        {
-            succeeded = false;
-            try
-            {
-                Logger.Error($"[LLM] Cleanup step '{name}' failed: {exception.GetType().Name}");
-            }
-            catch
-            {
-            }
-        }
     }
 
     private static void RegisterApplicationQuittingHandler()

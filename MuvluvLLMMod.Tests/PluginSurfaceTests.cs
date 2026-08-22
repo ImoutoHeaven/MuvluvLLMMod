@@ -23,16 +23,51 @@ public sealed class PluginSurfaceTests
     public void Cleanup_unsubscribes_config_before_freezing_and_load_gets_a_fresh_lifecycle()
     {
         var plugin = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "MuvluvLLMMod", "Plugin.cs"));
-        var configurationShutdown = plugin.IndexOf("CleanupStep(\"shutdown configuration\"", StringComparison.Ordinal);
+        var configurationShutdown = plugin.IndexOf(
+            "new PluginCleanupStep(\"shutdown configuration\"",
+            StringComparison.Ordinal);
         var freeze = plugin.IndexOf("Cache.FreezeMutations()", StringComparison.Ordinal);
-        var machineShutdown = plugin.IndexOf("CleanupStep(\"shutdown machine translator\"", StringComparison.Ordinal);
+        var machineShutdown = plugin.IndexOf(
+            "new PluginCleanupStep(\"shutdown machine translator\"",
+            StringComparison.Ordinal);
+        var cancelPersistence = plugin.IndexOf(
+            "new PluginCleanupStep(\"cancel cache persistence\"",
+            StringComparison.Ordinal);
+        var flush = plugin.IndexOf(
+            "new PluginCleanupStep(\"flush cache\"",
+            StringComparison.Ordinal);
+        var unpatch = plugin.IndexOf(
+            "new PluginCleanupStep(\"unpatch Harmony\"",
+            StringComparison.Ordinal);
 
         Assert.True(configurationShutdown >= 0);
         Assert.True(freeze > configurationShutdown);
         Assert.True(machineShutdown > freeze);
+        Assert.True(cancelPersistence > machineShutdown);
+        Assert.True(flush > cancelPersistence);
+        Assert.True(unpatch > flush);
         Assert.Equal(1, CountOccurrences(plugin, "Cache.FreezeMutations()"));
+        Assert.Contains("lifecycleGate.Cleanup(", plugin, StringComparison.Ordinal);
         Assert.Contains("Volatile.Write(ref machineLifecycle, CreateMachineLifecycle())", plugin, StringComparison.Ordinal);
         Assert.Contains("if (IsCleaningUp || Cache == null)", plugin, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Load_rolls_back_partial_initialization_through_the_single_cleanup_path()
+    {
+        var plugin = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "MuvluvLLMMod", "Plugin.cs"));
+        Assert.Contains("if (!lifecycleGate.TryBeginLoad())", plugin, StringComparison.Ordinal);
+
+        var load = plugin.IndexOf("public override void Load()", StringComparison.Ordinal);
+        var failure = plugin.IndexOf("catch", load, StringComparison.Ordinal);
+        var cleanup = plugin.IndexOf("Cleanup();", failure, StringComparison.Ordinal);
+        var rethrow = plugin.IndexOf("throw;", cleanup, StringComparison.Ordinal);
+
+        Assert.True(load >= 0);
+        Assert.True(failure > load);
+        Assert.True(cleanup > failure);
+        Assert.True(rethrow > cleanup);
+        Assert.Equal(1, CountOccurrences(plugin, "internal static bool Cleanup()"));
     }
 
     private static int CountOccurrences(string text, string value)
