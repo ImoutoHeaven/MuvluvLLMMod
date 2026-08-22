@@ -168,8 +168,11 @@ namespace HarmonyLib
 
     public sealed class Harmony
     {
+        public sealed record PatchApplication(string Owner, string PatchMethod, string Target);
+
         private static readonly object gate = new();
         private static readonly Dictionary<MethodInfo, HashSet<string>> owners = new();
+        private static readonly List<PatchApplication> applications = new();
 
         public Harmony(string id) => Id = id;
 
@@ -177,11 +180,18 @@ namespace HarmonyLib
         public static string? SkipPatchTarget { get; set; }
         public static int UnpatchSelfCalls { get; private set; }
 
+        public static IReadOnlyList<PatchApplication> SnapshotApplications()
+        {
+            lock (gate)
+                return applications.ToArray();
+        }
+
         public static void Reset()
         {
             lock (gate)
             {
                 owners.Clear();
+                applications.Clear();
                 SkipPatchTarget = null;
                 UnpatchSelfCalls = 0;
             }
@@ -206,6 +216,7 @@ namespace HarmonyLib
                         if (!owners.TryGetValue(target, out var targetOwners))
                             owners[target] = targetOwners = new HashSet<string>(StringComparer.Ordinal);
                         targetOwners.Add(Id);
+                        applications.Add(new PatchApplication(Id, method.Name, shortLabel));
                     }
                 }
             }
@@ -217,6 +228,7 @@ namespace HarmonyLib
             {
                 foreach (var entry in owners.Values)
                     entry.Remove(Id);
+                applications.RemoveAll(application => string.Equals(application.Owner, Id, StringComparison.Ordinal));
                 UnpatchSelfCalls++;
             }
         }

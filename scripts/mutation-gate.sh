@@ -5,6 +5,7 @@ set -euo pipefail
 # every mutant is made in a separate throwaway copy under /tmp and is deleted on exit.
 SOURCE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PROJECT="MuvluvLLMMod.IntegrationTests/MuvluvLLMMod.IntegrationTests.csproj"
+EXPECTED_BASELINE=25
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/muvluv-m5.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 ROOT="$WORK/base"
@@ -34,15 +35,15 @@ replace_once() {
     ' "$file"
 }
 
-echo "M-5 baseline: exact-source integration suite"
+echo "PF-6 baseline: exact-source integration suite"
 baseline_output=$(run_tests "$ROOT" 2>&1) || {
     printf '%s\n' "$baseline_output"
     echo "baseline integration suite failed" >&2
     exit 1
 }
 printf '%s\n' "$baseline_output"
-if ! grep -Eq 'Passed:[[:space:]]+20' <<<"$baseline_output" || ! grep -Eq 'Failed:[[:space:]]+0' <<<"$baseline_output"; then
-    echo "baseline did not report the expected 20 integration tests" >&2
+if ! grep -Eq "Passed:[[:space:]]+$EXPECTED_BASELINE" <<<"$baseline_output" || ! grep -Eq 'Failed:[[:space:]]+0' <<<"$baseline_output"; then
+    echo "baseline did not report the expected $EXPECTED_BASELINE integration tests" >&2
     exit 1
 fi
 
@@ -118,6 +119,36 @@ gate_mutant() {
                 '        return TranslationBudget.IsTextWithinBudget(filled) ? filled : null;' \
                 '        return filled;'
             ;;
+        PF2-preserve-recovery-false)
+            replace_once "$copy/MuvluvLLMMod/TranslationCache.cs" \
+                '&& TryWriteAtomic(StatePath, stateJson, preserveRecovery: true);' \
+                '&& TryWriteAtomic(StatePath, stateJson, preserveRecovery: false);'
+            ;;
+        PF2-ignore-checksum)
+            replace_once "$copy/MuvluvLLMMod/TranslationCache.cs" \
+                '            return string.Equals(expected, snapshot.Checksum, StringComparison.OrdinalIgnoreCase);' \
+                '            return true;'
+            ;;
+        PF2-accept-invalid-epoch)
+            replace_once "$copy/MuvluvLLMMod/TranslationCache.cs" \
+                '            || snapshot.Epoch < 0)' \
+                '            || false)'
+            ;;
+        PF1-unbounded-stage-wait)
+            replace_once "$copy/MuvluvLLMMod/PluginLifecycleGate.cs" \
+                '            if (!generation.WaitForStages(Remaining(deadline)))' \
+                '            if (!generation.WaitForStages(TimeSpan.FromHours(1)))'
+            ;;
+        PF1-unbounded-callback-wait)
+            replace_once "$copy/MuvluvLLMMod/PluginLifecycleGate.cs" \
+                '            if (!generation.WaitForCallbacks(Remaining(deadline)))' \
+                '            if (!generation.WaitForCallbacks(TimeSpan.FromHours(1)))'
+            ;;
+        M2-extra-nonrender-hook)
+            replace_once "$copy/MuvluvLLMMod/Patch.cs" \
+                $'[HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Leave))]\n    public static void SetIsNotPlayingScenario()' \
+                $'[HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Leave))]\n    [HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Refresh), new Type[] { })]\n    public static void SetIsNotPlayingScenario()'
+            ;;
         *)
             echo "unknown mutant $id" >&2
             return 1
@@ -130,7 +161,7 @@ gate_mutant() {
     status=$?
     set -e
     printf '%s\n' "$output"
-    if grep -q 'Build FAILED' <<<"$output"; then
+    if grep -q 'Build FAILED' <<<"$output" || ! grep -q -- '-> .*IntegrationTests.dll' <<<"$output"; then
         echo "$id was not compile-valid" >&2
         return 1
     fi
@@ -138,7 +169,11 @@ gate_mutant() {
         echo "$id SURVIVED (defect: integration coverage is insufficient)" >&2
         return 1
     fi
-    echo "$id KILLED (expected non-zero test result)"
+    if ! grep -Fq "$filter" <<<"$output"; then
+        echo "$id failed outside its focused exact-source test; gate result is invalid" >&2
+        return 1
+    fi
+    echo "$id KILLED (focused exact-source test failed as intended)"
 }
 
 gate_mutant M5-B1-broad-tmp-token \
@@ -163,5 +198,17 @@ gate_mutant PF4-translated-only-reverse-bytes \
     ProductionBudgetAndShutdownIntegrationTests.Reverse_index_retains_source_and_translation_bytes_for_admission
 gate_mutant PF5-unbounded-filled-output \
     ProductionRenderIntegrationTests.Over_budget_generated_expansion_stays_source_even_when_f2_is_off
+gate_mutant PF2-preserve-recovery-false \
+    ProductionBudgetAndShutdownIntegrationTests.Authoritative_write_preserves_the_previous_epoch_for_backup_recovery
+gate_mutant PF2-ignore-checksum \
+    ProductionBudgetAndShutdownIntegrationTests.Newer_invalid_checksum_is_rejected_in_favor_of_a_valid_canonical_epoch
+gate_mutant PF2-accept-invalid-epoch \
+    ProductionBudgetAndShutdownIntegrationTests.Negative_epoch_journal_is_rejected_even_when_its_checksum_matches_its_payload
+gate_mutant PF1-unbounded-stage-wait \
+    ProductionCoordinationIntegrationTests.Cleanup_stage_wait_deadline_quarantines_and_continues_later_teardown
+gate_mutant PF1-unbounded-callback-wait \
+    ProductionCoordinationIntegrationTests.Cleanup_callback_wait_deadline_has_shared_failure_and_late_callback_is_inert
+gate_mutant M2-extra-nonrender-hook \
+    ProductionSourceLinkIntegrationTests.Exact_source_harness_applies_only_final_tmp_and_scenario_priority_patches
 
-echo "M-5/PF-1/PF-2..PF-5 mutation gate: all 11 compile-valid configured mutants killed"
+echo "PF-6 mutation gate: all 17 compile-valid configured mutants killed"

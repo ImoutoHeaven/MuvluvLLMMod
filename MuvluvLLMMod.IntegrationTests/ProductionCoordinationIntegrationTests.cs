@@ -123,7 +123,10 @@ public sealed class ProductionCoordinationIntegrationTests
         await WaitUntilAsync(() => gate.State == PluginLifecycleState.Stopping);
         var second = Task.Run(() => gate.Cleanup(_ => true));
 
-        Assert.False(await first.WaitAsync(TimeSpan.FromSeconds(2)));
+        await AssertQuarantinedWithinDeadline(
+            first,
+            blockedStage.Dispose,
+            "load-stage cleanup exceeded its bounded quiescence deadline");
         Assert.False(await second.WaitAsync(TimeSpan.FromSeconds(2)));
         Assert.Equal(new[] { "freeze", "flush", "unpatch" }, later);
         Assert.Equal(PluginLifecycleState.Failed, gate.State);
@@ -156,7 +159,10 @@ public sealed class ProductionCoordinationIntegrationTests
         await WaitUntilAsync(() => gate.State == PluginLifecycleState.Stopping);
         var second = Task.Run(() => gate.Cleanup(_ => true));
 
-        Assert.False(await first.WaitAsync(TimeSpan.FromSeconds(2)));
+        await AssertQuarantinedWithinDeadline(
+            first,
+            blockedCallback!.Dispose,
+            "configuration-callback cleanup exceeded its bounded quiescence deadline");
         Assert.False(await second.WaitAsync(TimeSpan.FromSeconds(2)));
         Assert.Equal(new[] { "flush", "unpatch" }, later);
         Assert.Equal(PluginLifecycleState.Failed, gate.State);
@@ -269,6 +275,24 @@ public sealed class ProductionCoordinationIntegrationTests
         Assert.Equal(new[] { "flush", "unpatch" }, laterSteps);
         Assert.Equal(PluginLifecycleState.Failed, gate.State);
         Assert.False(gate.TryBeginLoad(out _));
+    }
+
+    private static async Task AssertQuarantinedWithinDeadline(
+        Task<bool> cleanup,
+        Action release,
+        string message)
+    {
+        var completed = await Task.WhenAny(cleanup, Task.Delay(TimeSpan.FromMilliseconds(500)));
+        if (!ReferenceEquals(completed, cleanup))
+        {
+            // Release the test boundary so a deliberately unbounded mutant cannot leave a
+            // background cleanup task holding the process open after this assertion.
+            release();
+            _ = await cleanup.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.Fail(message);
+        }
+
+        Assert.False(await cleanup);
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)

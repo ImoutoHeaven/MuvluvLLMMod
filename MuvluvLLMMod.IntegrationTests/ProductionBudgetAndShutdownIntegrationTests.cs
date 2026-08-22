@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Xunit;
@@ -59,9 +60,121 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
             var cache = new TranslationCache(root);
             var source = new string('あ', 4000);
             cache.RememberResolution(source, "译");
-            Assert.Equal(
-                Encoding.UTF8.GetByteCount(source) + Encoding.UTF8.GetByteCount("译"),
-                cache.RetainedSnapshot.ReverseUtf8Bytes);
+            var expected = Encoding.UTF8.GetByteCount(source) + Encoding.UTF8.GetByteCount("译");
+            Assert.Equal(expected, cache.RetainedSnapshot.ReverseUtf8Bytes);
+            Assert.True(cache.RetainedSnapshot.ReverseUtf8Bytes >= Encoding.UTF8.GetByteCount(source));
+            Assert.True(cache.TryGetSourceForTranslatedValue("译", out var retainedSource));
+            Assert.Equal(source, retainedSource);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Authoritative_write_preserves_the_previous_epoch_for_backup_recovery()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.backup." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var cache = new TranslationCache(root);
+            Assert.True(cache.StoreGenerated("旧する", "旧译"));
+            Assert.True(cache.Flush());
+            var oldState = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(
+                File.ReadAllText(cache.StatePath))!;
+
+            cache.RemoveGenerated("旧する");
+            Assert.True(cache.StoreGenerated("新する", "新译"));
+            Assert.True(cache.Flush());
+            Assert.True(File.Exists(cache.StateBackupPath));
+            var backup = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(
+                File.ReadAllText(cache.StateBackupPath))!;
+            Assert.Equal(oldState.Epoch, backup.Epoch);
+
+            // Remove every current mirror and canonical file. Recovery must still find the
+            // previous coherent epoch in the preserved backup rather than silently falling back
+            // to an empty/legacy epoch.
+            File.Delete(cache.StatePath);
+            File.Delete(cache.GeneratedPath);
+            File.Delete(cache.PendingPath);
+            File.Delete(cache.RawPath);
+
+            var recovered = new TranslationCache(root);
+            recovered.Load();
+            Assert.True(recovered.TryGetGenerated("旧する", out var oldTranslation));
+            Assert.Equal("旧译", oldTranslation);
+            Assert.False(recovered.TryGetGenerated("新する", out _));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Newer_invalid_checksum_is_rejected_in_favor_of_a_valid_canonical_epoch()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.checksum." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var cache = new TranslationCache(root);
+            Assert.True(cache.StoreGenerated("稳定する", "稳定译"));
+            Assert.True(cache.Flush());
+            var oldState = File.ReadAllText(cache.StatePath);
+
+            cache.RemoveGenerated("稳定する");
+            Assert.True(cache.StoreGenerated("损坏する", "损坏译"));
+            Assert.True(cache.Flush());
+            var newer = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(
+                File.ReadAllText(cache.StatePath))!;
+            var checksum = newer.Checksum!;
+            newer.Checksum = (checksum[0] == '0' ? '1' : '0') + checksum[1..];
+            File.WriteAllText(cache.StatePath, oldState, new UTF8Encoding(false));
+            File.WriteAllText(
+                cache.StateTemporaryPath,
+                JsonSerializer.Serialize(newer),
+                new UTF8Encoding(false));
+
+            var recovered = new TranslationCache(root);
+            recovered.Load();
+            Assert.True(recovered.TryGetGenerated("稳定する", out var stableTranslation));
+            Assert.Equal("稳定译", stableTranslation);
+            Assert.False(recovered.TryGetGenerated("损坏する", out _));
+            Assert.False(File.Exists(recovered.StateTemporaryPath));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Negative_epoch_journal_is_rejected_even_when_its_checksum_matches_its_payload()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.epoch." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var cache = new TranslationCache(root);
+            Assert.True(cache.StoreGenerated("不应恢复する", "不应恢复译"));
+            Assert.True(cache.Flush());
+            var invalid = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(
+                File.ReadAllText(cache.StatePath))!;
+            File.Delete(cache.StatePath);
+            File.Delete(cache.StateBackupPath);
+            invalid.Epoch = -1;
+            invalid.Checksum = ComputeChecksum(invalid);
+            File.WriteAllText(
+                cache.StateTemporaryPath,
+                JsonSerializer.Serialize(invalid),
+                new UTF8Encoding(false));
+
+            var recovered = new TranslationCache(root);
+            recovered.Load();
+            Assert.False(recovered.TryGetGenerated("不应恢复する", out _));
         }
         finally
         {
@@ -309,6 +422,33 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
             release.TrySetResult("翻译");
             try { Directory.Delete(root, recursive: true); } catch { }
         }
+    }
+
+    private sealed class SnapshotIntegrityPayload
+    {
+        public int Version { get; set; }
+        public long Epoch { get; set; }
+        public string TransactionId { get; set; } = string.Empty;
+        public SortedDictionary<string, string> Generated { get; set; } = new(StringComparer.Ordinal);
+        public string[] Pending { get; set; } = Array.Empty<string>();
+        public string[] Raw { get; set; } = Array.Empty<string>();
+    }
+
+    private static string ComputeChecksum(TranslationCache.DurableSnapshot snapshot)
+    {
+        var payload = new SnapshotIntegrityPayload
+        {
+            Version = snapshot.Version,
+            Epoch = snapshot.Epoch,
+            TransactionId = snapshot.TransactionId ?? string.Empty,
+            Generated = new SortedDictionary<string, string>(
+                snapshot.Generated ?? new Dictionary<string, string>(),
+                StringComparer.Ordinal),
+            Pending = snapshot.Pending ?? Array.Empty<string>(),
+            Raw = snapshot.Raw ?? Array.Empty<string>()
+        };
+        var canonical = JsonSerializer.Serialize(payload);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)));
     }
 
     private sealed class CountingChunkedContent : HttpContent
