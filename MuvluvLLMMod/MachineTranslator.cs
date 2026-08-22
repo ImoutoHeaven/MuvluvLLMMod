@@ -16,6 +16,8 @@ public sealed class MachineTranslator : IDisposable
     private TranslationWorkQueue? queue;
     private TranslationWorkQueue? stoppingQueue;
     private Task[] tasks = Array.Empty<Task>();
+    private Task<bool>? stopTask;
+    private int stopFinalized;
 
     public MachineTranslator(
         TranslationCache cache,
@@ -89,7 +91,7 @@ public sealed class MachineTranslator : IDisposable
     {
         lock (lifecycleGate)
         {
-            if (cancellation != null) return;
+            if (cancellation != null || stopTask != null) return;
             cancellation = new CancellationTokenSource();
             queue = new TranslationWorkQueue();
             SchedulePriorityBacklog(queue);
@@ -106,15 +108,18 @@ public sealed class MachineTranslator : IDisposable
         }
     }
 
-    public async Task StopAsync(TimeSpan? timeout = null)
+    public Task<bool> StopAsync(TimeSpan? timeout = null)
     {
         CancellationTokenSource? source;
         TranslationWorkQueue? workQueue;
         Task[] running;
         lock (lifecycleGate)
         {
+            if (stopTask != null)
+                return stopTask;
             source = cancellation;
-            if (source == null) return;
+            if (source == null)
+                return Task.FromResult(true);
             workQueue = queue;
             if (workQueue != null)
             {
@@ -127,47 +132,80 @@ public sealed class MachineTranslator : IDisposable
             running = tasks;
             tasks = Array.Empty<Task>();
             source.Cancel();
+            Volatile.Write(ref stopFinalized, 0);
+            stopTask = StopCoreAsync(source, workQueue, running, timeout);
+            return stopTask;
         }
+    }
 
+    private async Task<bool> StopCoreAsync(
+        CancellationTokenSource source,
+        TranslationWorkQueue? workQueue,
+        Task[] running,
+        TimeSpan? timeout)
+    {
+        var all = Task.WhenAll(running);
         try
         {
-            var all = Task.WhenAll(running);
             if (timeout.HasValue)
             {
-                if (await Task.WhenAny(all, Task.Delay(timeout.Value)).ConfigureAwait(false) != all)
+                var boundedTimeout = timeout.Value < TimeSpan.Zero ? TimeSpan.Zero : timeout.Value;
+                var completed = await Task.WhenAny(all, Task.Delay(boundedTimeout)).ConfigureAwait(false);
+                if (!ReferenceEquals(completed, all))
                 {
-                    _ = all.ContinueWith(
-                        completed =>
-                        {
-                            _ = completed.Exception;
-                            lock (lifecycleGate)
-                            {
-                                if (ReferenceEquals(stoppingQueue, workQueue)) stoppingQueue = null;
-                            }
-                            source.Dispose();
-                        },
-                        CancellationToken.None,
-                        TaskContinuationOptions.ExecuteSynchronously,
-                        TaskScheduler.Default);
-                    return;
+                    if (all.IsCompleted)
+                    {
+                        await all.ConfigureAwait(false);
+                        return true;
+                    }
+                    ObserveEventualStop(all, source, workQueue);
+                    return false;
                 }
             }
-            else
-            {
-                await all.ConfigureAwait(false);
-            }
+
+            await all.ConfigureAwait(false);
+            return true;
+        }
+        catch
+        {
+            if (!all.IsCompleted)
+                ObserveEventualStop(all, source, workQueue);
+            throw;
         }
         finally
         {
-            if (!timeout.HasValue || running.All(task => task.IsCompleted))
-            {
-                lock (lifecycleGate)
-                {
-                    if (ReferenceEquals(stoppingQueue, workQueue)) stoppingQueue = null;
-                }
-                source.Dispose();
-            }
+            if (all.IsCompleted)
+                FinalizeStop(source, workQueue);
         }
+    }
+
+    private void ObserveEventualStop(
+        Task all,
+        CancellationTokenSource source,
+        TranslationWorkQueue? workQueue)
+    {
+        _ = all.ContinueWith(
+            completed =>
+            {
+                _ = completed.Exception;
+                FinalizeStop(source, workQueue);
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private void FinalizeStop(
+        CancellationTokenSource source,
+        TranslationWorkQueue? workQueue)
+    {
+        if (Interlocked.Exchange(ref stopFinalized, 1) != 0)
+            return;
+        lock (lifecycleGate)
+        {
+            if (ReferenceEquals(stoppingQueue, workQueue)) stoppingQueue = null;
+        }
+        source.Dispose();
     }
 
     public void Stop()

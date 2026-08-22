@@ -9,6 +9,7 @@ public sealed class MachineTranslatorLifecycle
     private readonly Dictionary<string, LinkedListNode<string>> transitionCancellationNodes = new(StringComparer.Ordinal);
     private long transitionCancellationUtf8Bytes;
     private readonly Action<Exception>? diagnostic;
+    private readonly TimeSpan shutdownTimeout;
     private TranslationRetryPolicy? retryPolicy;
     private MachineTranslator? current;
     private MachineTranslator? stopping;
@@ -19,13 +20,20 @@ public sealed class MachineTranslatorLifecycle
     private int version;
     private bool initialized;
     private bool shutdown;
+    private bool shutdownTimedOut;
 
     public MachineTranslatorLifecycle(
         Action<Exception>? diagnostic = null,
-        TranslationRetryPolicy? retryPolicy = null)
+        TranslationRetryPolicy? retryPolicy = null,
+        TimeSpan? shutdownTimeout = null)
     {
         this.diagnostic = diagnostic;
         this.retryPolicy = retryPolicy;
+        this.shutdownTimeout = shutdownTimeout is { } value && value > TimeSpan.Zero
+            ? (value < TranslationBudget.MaxShutdownTimeout
+                ? value
+                : TranslationBudget.MaxShutdownTimeout)
+            : TranslationBudget.DefaultShutdownTimeout;
     }
 
     public Task TransitionTask
@@ -41,6 +49,11 @@ public sealed class MachineTranslatorLifecycle
     public long RetainedCancellationUtf8Bytes
     {
         get { lock (gate) return transitionCancellationUtf8Bytes; }
+    }
+
+    public bool ShutdownTimedOut
+    {
+        get { lock (gate) return shutdownTimedOut; }
     }
 
     public (int Completed, int InFlight, int Failed) ProgressSnapshot
@@ -227,22 +240,19 @@ public sealed class MachineTranslatorLifecycle
         MachineTranslator? stoppingMachine,
         Task pendingTransition)
     {
-        Exception? failure = null;
-        try
-        {
-            await pendingTransition.ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            failure ??= exception;
-            Diagnose(exception);
-        }
+        var deadline = DateTime.UtcNow + shutdownTimeout;
+        Exception? failure = await AwaitBounded(
+            pendingTransition,
+            Remaining(deadline),
+            "machine transition shutdown").ConfigureAwait(false);
 
-        var activeFailure = await StopSafelyAsync(active).ConfigureAwait(false);
+        var activeFailure = await StopSafelyAsync(active, Remaining(deadline)).ConfigureAwait(false);
         failure ??= activeFailure;
         if (stoppingMachine != null && !ReferenceEquals(stoppingMachine, active))
         {
-            var stoppingFailure = await StopSafelyAsync(stoppingMachine).ConfigureAwait(false);
+            var stoppingFailure = await StopSafelyAsync(
+                stoppingMachine,
+                Remaining(deadline)).ConfigureAwait(false);
             failure ??= stoppingFailure;
         }
 
@@ -251,6 +261,8 @@ public sealed class MachineTranslatorLifecycle
             current = null;
             stopping = null;
             limiter = null;
+            shutdownTimedOut = failure is TimeoutException
+                || failure?.InnerException is TimeoutException;
             ClearTransitionCancellationsUnsafe();
         }
 
@@ -283,8 +295,9 @@ public sealed class MachineTranslatorLifecycle
                 stopping = old;
             }
 
-            if (old != null)
-                await old.StopAsync().ConfigureAwait(false);
+            if (old != null
+                && !await old.StopAsync(shutdownTimeout).ConfigureAwait(false))
+                throw new TimeoutException("old machine translator did not stop before the transition budget");
             lock (gate)
             {
                 if (ReferenceEquals(stopping, old))
@@ -314,7 +327,7 @@ public sealed class MachineTranslatorLifecycle
             }
 
             if (!accepted)
-                await StopSafelyAsync(next).ConfigureAwait(false);
+                _ = await StopSafelyAsync(next, shutdownTimeout).ConfigureAwait(false);
         }
         catch (Exception exception)
         {
@@ -332,14 +345,22 @@ public sealed class MachineTranslatorLifecycle
         }
     }
 
-    private async Task<Exception?> StopSafelyAsync(MachineTranslator? machine)
+    private async Task<Exception?> StopSafelyAsync(
+        MachineTranslator? machine,
+        TimeSpan? timeout = null)
     {
         if (machine == null)
             return null;
 
         try
         {
-            await machine.StopAsync().ConfigureAwait(false);
+            if (!await machine.StopAsync(timeout).ConfigureAwait(false))
+            {
+                var timeoutException = new TimeoutException(
+                    "machine translator worker did not stop before the shutdown deadline");
+                Diagnose(timeoutException);
+                return timeoutException;
+            }
             return null;
         }
         catch (Exception exception)
@@ -347,6 +368,52 @@ public sealed class MachineTranslatorLifecycle
             Diagnose(exception);
             return exception;
         }
+    }
+
+    private async Task<Exception?> AwaitBounded(
+        Task task,
+        TimeSpan timeout,
+        string operation)
+    {
+        if (task.IsCompleted)
+        {
+            try
+            {
+                await task.ConfigureAwait(false);
+                return null;
+            }
+            catch (Exception exception)
+            {
+                Diagnose(exception);
+                return exception;
+            }
+        }
+
+        var boundedTimeout = timeout < TimeSpan.Zero ? TimeSpan.Zero : timeout;
+        if (await Task.WhenAny(task, Task.Delay(boundedTimeout)).ConfigureAwait(false) != task)
+        {
+            Observe(task);
+            var timeoutException = new TimeoutException(operation + " exceeded the shutdown deadline");
+            Diagnose(timeoutException);
+            return timeoutException;
+        }
+
+        try
+        {
+            await task.ConfigureAwait(false);
+            return null;
+        }
+        catch (Exception exception)
+        {
+            Diagnose(exception);
+            return exception;
+        }
+    }
+
+    private static TimeSpan Remaining(DateTime deadline)
+    {
+        var remaining = deadline - DateTime.UtcNow;
+        return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
     }
 
     private void FilterTransitionCancellationsUnsafe()

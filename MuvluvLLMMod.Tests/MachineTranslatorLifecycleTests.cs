@@ -601,6 +601,138 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task Shutdown_with_noncooperative_worker_is_bounded_and_quarantines_failure()
+    {
+        var cache = new TranslationCache(root);
+        cache.ObservePriority("永远等待する", "永远等待する");
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var never = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var diagnostics = new List<Exception>();
+        MachineTranslator? machine = null;
+        var lifecycle = new MachineTranslatorLifecycle(
+            diagnostics.Add,
+            shutdownTimeout: TimeSpan.FromMilliseconds(40));
+
+        Assert.True(lifecycle.Initialize(
+            true,
+            1,
+            (_, backlog) => machine = new MachineTranslator(
+                cache,
+                async (_, _) =>
+                {
+                    started.TrySetResult();
+                    return await never.Task;
+                },
+                1,
+                TimeSpan.FromSeconds(1),
+                backlog)));
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        cache.FreezeMutations();
+
+        var shutdown = lifecycle.ShutdownAsync();
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => shutdown.WaitAsync(TimeSpan.FromSeconds(1)));
+        stopwatch.Stop();
+
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(1));
+        Assert.True(lifecycle.ShutdownTimedOut);
+        Assert.Contains(diagnostics, exception => exception is TimeoutException);
+        Assert.Same(shutdown, lifecycle.ShutdownAsync());
+        Assert.True(lifecycle.IsShutdown);
+
+        never.TrySetResult("晚到翻译");
+        await Task.Delay(20);
+        Assert.False(cache.TryGetGenerated("永远等待する", out _));
+        _ = machine;
+    }
+
+    [Fact]
+    public async Task Timeout_does_not_skip_later_flush_and_unpatch_cleanup_steps()
+    {
+        var cache = new TranslationCache(root);
+        cache.ObservePriority("清理等待する", "清理等待する");
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var never = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var lifecycle = new MachineTranslatorLifecycle(
+            shutdownTimeout: TimeSpan.FromMilliseconds(30));
+        Assert.True(lifecycle.Initialize(
+            true,
+            1,
+            (_, backlog) => new MachineTranslator(
+                cache,
+                async (_, _) =>
+                {
+                    started.TrySetResult();
+                    return await never.Task;
+                },
+                1,
+                TimeSpan.FromSeconds(1),
+                backlog)));
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        cache.FreezeMutations();
+
+        var gate = new PluginLifecycleGate();
+        Assert.True(gate.TryBeginLoad());
+        var events = new List<string>();
+        Assert.False(gate.Cleanup(_ =>
+        {
+            try
+            {
+                lifecycle.Shutdown();
+            }
+            catch (InvalidOperationException)
+            {
+                events.Add("machine-timeout");
+            }
+            events.Add("flush");
+            events.Add("unpatch");
+            return false;
+        }));
+
+        Assert.Equal(new[] { "machine-timeout", "flush", "unpatch" }, events);
+        Assert.Equal(PluginLifecycleState.Failed, gate.State);
+        never.TrySetResult(null);
+    }
+
+    [Fact]
+    public async Task Shutdown_bounds_a_noncooperative_reload_transition_before_later_cleanup_steps()
+    {
+        var cache = new TranslationCache(root);
+        cache.ObservePriority("转换等待する", "转换等待する");
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var never = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var generation = 0;
+        var lifecycle = new MachineTranslatorLifecycle(
+            shutdownTimeout: TimeSpan.FromMilliseconds(40));
+
+        MachineTranslator Factory(RequestRateLimiter _, TranslationPriorityBacklog backlog)
+        {
+            Interlocked.Increment(ref generation);
+            return new MachineTranslator(
+                cache,
+                async (_, _) =>
+                {
+                    started.TrySetResult();
+                    return await never.Task;
+                },
+                1,
+                TimeSpan.FromSeconds(1),
+                backlog);
+        }
+
+        Assert.True(lifecycle.Initialize(true, 1, Factory));
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(lifecycle.Reload(true, 1, Factory));
+
+        var shutdown = lifecycle.ShutdownAsync();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => shutdown.WaitAsync(TimeSpan.FromSeconds(1)));
+        Assert.True(lifecycle.ShutdownTimedOut);
+        Assert.Equal(1, generation);
+
+        never.TrySetResult(null);
+    }
+
+    [Fact]
     public async Task Shutdown_async_settles_a_transition_before_returning()
     {
         var cache = new TranslationCache(root);

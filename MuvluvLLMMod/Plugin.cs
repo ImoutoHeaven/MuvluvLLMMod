@@ -458,7 +458,8 @@ public sealed class Plugin : BasePlugin
         generation.IsRunning ? generation.GetOwner<GenerationResources>() : null;
 
     private static MachineTranslatorLifecycle CreateMachineLifecycle() => new(
-        exception => SafeError("[LLM] Lifecycle failure: " + exception.GetType().Name));
+        exception => SafeError("[LLM] Lifecycle failure: " + exception.GetType().Name),
+        shutdownTimeout: TranslationBudget.DefaultShutdownTimeout);
 
     private static MachineSettings CaptureMachineSettings() => new(
         MuvluvLLMMod.Config.LlmEnable.Value,
