@@ -5,9 +5,18 @@ namespace MuvluvLLMMod;
 /// </summary>
 public static class Logger
 {
-    public static void Info(string message) => Plugin.Log.LogInfo(message);
+    public static void Info(string message)
+    {
+        try { Plugin.Log?.LogInfo(message); } catch { }
+    }
 
-    public static void Warn(string message) => Plugin.Log.LogWarning(message);
+    public static void Warn(string message)
+    {
+        try { Plugin.Log?.LogWarning(message); } catch { }
+    }
 
-    public static void Error(string message) => Plugin.Log.LogError(message);
+    public static void Error(string message)
+    {
+        try { Plugin.Log?.LogError(message); } catch { }
+    }
 }

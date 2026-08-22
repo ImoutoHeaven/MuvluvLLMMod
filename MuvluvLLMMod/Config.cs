@@ -23,15 +23,82 @@ public static class Config
     public static ConfigEntry<string> CacheDirectory { get; private set; } = null!;
     public static ConfigEntry<bool> DebugLogSeenText { get; private set; } = null!;
 
-    public static void Initialize(ConfigFile configFile)
+    public static void Initialize(ConfigFile configFile) => _ = InitializeCore(configFile, null);
+
+    internal static bool Initialize(
+        ConfigFile configFile,
+        PluginLifecycleGate.PluginGeneration generation) =>
+        InitializeCore(configFile, generation);
+
+    internal static int StaticEntryCount
+    {
+        get
+        {
+            lock (lifecycleGate)
+                return StaticEntryCountUnsafe();
+        }
+    }
+
+    internal static bool StaticRootsDetached
+    {
+        get
+        {
+            lock (lifecycleGate)
+                return config == null && StaticEntryCountUnsafe() == 0;
+        }
+    }
+
+    private static int StaticEntryCountUnsafe() => new ConfigEntryBase?[]
+    {
+        Translation,
+        LlmEnable,
+        LlmEndpoint,
+        LlmModel,
+        LlmApiKey,
+        LlmTimeoutSeconds,
+        LlmRetryCount,
+        LlmRequestsPerSecond,
+        LlmMaxInFlight,
+        LlmTranslatePeriodSeconds,
+        LlmRefreshPeriodSeconds,
+        CacheDirectory,
+        DebugLogSeenText
+    }.Count(entry => entry != null);
+
+    private static void ClearStaticEntriesUnsafe()
+    {
+        Translation = null!;
+        LlmEnable = null!;
+        LlmEndpoint = null!;
+        LlmModel = null!;
+        LlmApiKey = null!;
+        LlmTimeoutSeconds = null!;
+        LlmRetryCount = null!;
+        LlmRequestsPerSecond = null!;
+        LlmMaxInFlight = null!;
+        LlmTranslatePeriodSeconds = null!;
+        LlmRefreshPeriodSeconds = null!;
+        CacheDirectory = null!;
+        DebugLogSeenText = null!;
+    }
+
+    private static bool InitializeCore(
+        ConfigFile configFile,
+        PluginLifecycleGate.PluginGeneration? generation)
     {
         ArgumentNullException.ThrowIfNull(configFile);
+        if (generation?.IsCancellationRequested == true)
+            return false;
+
         // A new generation should never inherit an event handler. This is also safe for a
         // defensive re-initialize from a loader that did not complete the previous rollback.
         Shutdown();
 
         lock (lifecycleGate)
         {
+            if (generation?.IsCancellationRequested == true)
+                return false;
+
             config = configFile;
 
             Translation = configFile.Bind(
@@ -103,8 +170,15 @@ public static class Config
                 "诊断用途：是否记录观察到的文本");
         }
 
+        if (generation?.IsCancellationRequested == true)
+        {
+            Shutdown();
+            return false;
+        }
+
         SafeInfo("Translation: " + (Translation.Value ? "Enabled" : "Disabled"));
         SafeInfo("[LLM] Enable: " + (LlmEnable.Value ? "Enabled" : "Disabled"));
+        return true;
     }
 
     /// <summary>
@@ -155,6 +229,7 @@ public static class Config
             if (oldConfig != null && oldHandler != null)
                 oldConfig.SettingChanged -= oldHandler;
             config = null;
+            ClearStaticEntriesUnsafe();
         }
 
         // Revoking the lease waits for a handler that was already inside the callback. Merely

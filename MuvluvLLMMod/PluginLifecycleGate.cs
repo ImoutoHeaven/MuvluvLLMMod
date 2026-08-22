@@ -618,7 +618,11 @@ public sealed class PluginLifecycleGate
             if (lease.ActiveCallbacksUnsafe > 0)
                 lease.ActiveCallbacksUnsafe--;
             if (lease.ActiveCallbacksUnsafe == 0)
+            {
                 lease.CallbacksDrainedUnsafe?.TrySetResult(true);
+                if (lease.Generation.CleanupCompleteUnsafe && lease.DeactivatedUnsafe)
+                    lease.Generation.LeasesUnsafe.Remove(lease);
+            }
         }
     }
 
@@ -765,8 +769,13 @@ public sealed class PluginLifecycleGate
         internal void MarkCleanupCompleteUnsafe()
         {
             CleanupCompleteUnsafe = true;
-            // Keep the owner on the stale token for cleanup diagnostics, but it is no longer
-            // reachable from CurrentOwner because the gate state is Stopped/Failed.
+            // A stale generation token is retained to enforce quarantine and to follow any late
+            // reservations, but the plugin owner is a static root for the complete cache graph.
+            // Detach it after the terminal cleanup callback has returned; pending reservations
+            // retain only the local rollback state needed by the gate.
+            Owner = null;
+            if (LeasesUnsafe.All(static lease => lease.ActiveCallbacksUnsafe == 0))
+                LeasesUnsafe.Clear();
             try
             {
                 cancellation.Dispose();

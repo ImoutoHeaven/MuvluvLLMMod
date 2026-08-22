@@ -53,6 +53,28 @@ public sealed class Plugin : BasePlugin
         public PluginLifecycleGate.PluginGenerationResource? PersistenceResource { get; set; }
         public PluginLifecycleGate.PluginGenerationResource? MachineStartupResource { get; set; }
         public PluginLifecycleGate.PluginGenerationResource? ActivationResource { get; set; }
+
+        public void Detach()
+        {
+            Cache = null;
+            Resolver = null;
+            MachineLifecycle = null;
+            Harmony = null;
+            PendingHarmony = null;
+            Hotkey = null;
+            PersistenceCancellation = null;
+            PersistenceTask = Task.CompletedTask;
+            ConfigLease = null;
+            ConfigurationResource = null;
+            MachineOwnerResource = null;
+            CacheResource = null;
+            HarmonyResource = null;
+            HotkeyResource = null;
+            QuittingResource = null;
+            PersistenceResource = null;
+            MachineStartupResource = null;
+            ActivationResource = null;
+        }
     }
 
     private sealed class PersistenceHandle
@@ -77,6 +99,11 @@ public sealed class Plugin : BasePlugin
 
     internal static TranslationCache? CurrentCache => RunningResources?.Cache;
     internal static TranslationResolver? CurrentResolver => RunningResources?.Resolver;
+    internal static PluginLifecycleGate.PluginGeneration? CurrentGeneration =>
+        lifecycleGate.CurrentGeneration;
+    internal static object? CurrentGenerationOwner =>
+        lifecycleGate.CurrentGeneration?.GetOwner<object>();
+    internal static PluginLifecycleState CurrentGenerationState => lifecycleGate.State;
 
     internal static (int Completed, int InFlight, int Failed) ProgressSnapshot =>
         RunningResources?.MachineLifecycle?.ProgressSnapshot ?? (0, 0, 0);
@@ -109,7 +136,8 @@ public sealed class Plugin : BasePlugin
 
                 TrySetUtf8Console();
                 Logger.Info($"Plugin {PluginGuid} is loading (generation {generation.Id})");
-                MuvluvLLMMod.Config.Initialize(base.Config);
+                if (!MuvluvLLMMod.Config.Initialize(base.Config, generation))
+                    throw CanceledGeneration(generation, "configuration initialization");
                 if (!configurationResource.Commit())
                     throw CanceledGeneration(generation, "configuration initialization");
 
@@ -349,7 +377,8 @@ public sealed class Plugin : BasePlugin
             "shutdown configuration",
             resources?.ConfigurationResource,
             MuvluvLLMMod.Config.Shutdown,
-            ref succeeded);
+            ref succeeded,
+            runFallbackWhenPending: true);
         RunCleanupResource(
             "remove application-quit handler",
             resources?.QuittingResource,
@@ -405,22 +434,13 @@ public sealed class Plugin : BasePlugin
             ref succeeded,
             runFallbackWhenPending: true);
 
-        if (resources != null)
-        {
-            resources.Cache = null;
-            resources.Resolver = null;
-            resources.MachineLifecycle = null;
-            resources.Harmony = null;
-            resources.PendingHarmony = null;
-            resources.Hotkey = null;
-            resources.PersistenceCancellation = null;
-            resources.ConfigLease = null;
-        }
-
         if (succeeded)
             SafeInfo($"Plugin {PluginGuid} unloaded (generation {generation.Id})");
         else
             SafeError($"Plugin {PluginGuid} generation {generation.Id} is quarantined after cleanup errors");
+
+        resources?.Detach();
+        Log = null!;
         return succeeded;
     }
 

@@ -5,8 +5,8 @@ set -euo pipefail
 # every mutant is made in a separate throwaway copy under /tmp and is deleted on exit.
 SOURCE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PROJECT="MuvluvLLMMod.IntegrationTests/MuvluvLLMMod.IntegrationTests.csproj"
-EXPECTED_BASELINE=40
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/muvluv-m5.XXXXXX")
+EXPECTED_BASELINE=42
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/muvluv-fr3.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 ROOT="$WORK/base"
 mkdir -p "$ROOT"
@@ -35,7 +35,7 @@ replace_once() {
     ' "$file"
 }
 
-echo "PF-6 baseline: exact-source integration suite"
+echo "FR3 baseline: exact-source integration suite"
 baseline_output=$(run_tests "$ROOT" 2>&1) || {
     printf '%s\n' "$baseline_output"
     echo "baseline integration suite failed" >&2
@@ -169,6 +169,21 @@ gate_mutant() {
                 '        if (nextSnapshotEpoch == long.MaxValue)' \
                 '        if (false)'
             ;;
+        FR3-2-retain-generation-owner)
+            replace_once "$copy/MuvluvLLMMod/PluginLifecycleGate.cs" \
+                '            Owner = null;' \
+                '            // mutant: retain the terminated generation owner.'
+            ;;
+        FR3-2-retain-config-entry-roots)
+            replace_once "$copy/MuvluvLLMMod/Config.cs" \
+                $'            if (oldConfig != null && oldHandler != null)\n                oldConfig.SettingChanged -= oldHandler;\n            config = null;\n            ClearStaticEntriesUnsafe();' \
+                $'            if (oldConfig != null && oldHandler != null)\n                oldConfig.SettingChanged -= oldHandler;\n            config = null;\n            // mutant: retain terminated ConfigEntry roots.'
+            ;;
+        FR3-2-retain-resource-fields)
+            replace_once "$copy/MuvluvLLMMod/Plugin.cs" \
+                '        resources?.Detach();' \
+                '        // mutant: retain terminated generation resource fields.'
+            ;;
         *)
             echo "unknown mutant $id" >&2
             return 1
@@ -238,4 +253,11 @@ gate_mutant M2-extra-nonrender-hook \
     ProductionSourceLinkIntegrationTests.Exact_source_harness_applies_only_final_tmp_and_scenario_priority_patches
 gate_mutant FR3-1-remove-epoch-overflow-guard \
     ProductionBudgetAndShutdownIntegrationTests.Maximum_epoch_is_terminal_and_flush_never_claims_an_invalid_success
-echo "FR3 mutation gate: all 21 compile-valid configured mutants killed"
+gate_mutant FR3-2-retain-generation-owner \
+    ZzzProductionLateStageIntegrationTests.Real_successful_cleanup_detaches_static_generation_owner_and_config_roots
+gate_mutant FR3-2-retain-config-entry-roots \
+    ZzzProductionLateStageIntegrationTests.Real_successful_cleanup_detaches_static_generation_owner_and_config_roots
+gate_mutant FR3-2-retain-resource-fields \
+    ZzzProductionLateStageIntegrationTests.Real_successful_cleanup_detaches_static_generation_owner_and_config_roots
+
+echo "FR3 mutation gate: all 24 compile-valid configured mutants killed"
