@@ -1209,3 +1209,66 @@ bash scripts/mutation-gate.sh
   exact-source baseline: 39 passed, 0 failed, 0 skipped
   20/20 compile-valid mutants killed
 ```
+
+## FR3 follow-up — DONE (`5e845bd`, `a76ff2e`)
+
+The historical review files, including `docs/FINAL-REVIEW-3.md`, were not modified. This batch
+closes both release blockers with fail-closed production behavior and exact-source integration
+coverage.
+
+### FR3-1 — terminal snapshot epoch
+
+`TranslationCache` now treats `long.MaxValue` as a terminal authoritative epoch. Loading a valid
+checksummed maximum-epoch candidate marks the cache read-only for durable collections: generated,
+pending, raw observation, replacement, removal, and cancellation mutations are rejected before
+in-memory durable state or `dirty` changes. A normal or terminal flush with a dirty terminal state
+returns `false`, preserves the dirty signal, and does not serialize or write an invalid successor;
+a clean no-op flush still returns `true`. Epoch advancement is checked and the existing newest-valid
+candidate, checksum, temp, and backup recovery protocol is unchanged. A successful write of the
+maximum valid successor also enters the same terminal read-only state.
+
+The exact linked `TranslationCache` test seeds a checksum/schema-valid maximum-epoch journal,
+exercises rejected mutation plus both flush paths, verifies the canonical epoch remains maximum,
+and restarts to prove the attempted new entry was not accepted-and-lost. Its sanitized dirty seed
+also forces both flush guards instead of testing only a clean no-op. The Docker gate adds the
+compile-valid `FR3-1-remove-epoch-overflow-guard` mutant; it is killed by the focused test.
+
+### FR3-2 — terminal static-root detachment
+
+`PluginLifecycleGate` now detaches `PluginGeneration.Owner` when terminal cleanup publishes its
+shared result. It retains only the generation token and any pending `PluginGenerationResource`
+rollback state needed for a late stage; callbacks and resource reservations drain locally without
+being republished through the static owner. `Plugin.GenerationResources.Detach` clears cache,
+resolver, machine, Harmony, component, lease, CTS/task, and all nine resource-handle fields, and
+`Config.Shutdown` clears all 13 static `ConfigEntry` properties and the ConfigFile root. Generation-
+aware Config initialization rejects a canceled late stage, while the logging facade remains safe
+when the terminal cleanup clears the old logger. Failed generations remain quarantined and cannot
+load again.
+
+Exact integration tests use the real linked `Plugin`, `Core`, `Config`, lifecycle gate, cache,
+Harmony, Unity, native delegate, persistence, and machine boundaries. They assert runtime static
+owner/config observability and reflected owner fields after successful cleanup, after timed-out
+blocked `PatchAll` late rollback, and after a persistence-failure quarantine; they also assert
+hooks/components/delegates and outstanding resources, late unpatch completion, and safe repeated
+cleanup. The gate adds three compile-valid FR3-2 mutants for owner, ConfigEntry, and resource-field
+detachment; all are killed without source-string-only assertions.
+
+### Final Docker evidence
+
+All checks used `docker run --rm`; source and
+`C:/Users/Eden/Muv-Luv/muv_luv_girlsgarden_cl` were mounted read-only, the source was copied into
+a disposable container layer, and no game process was launched or host dependency was changed:
+
+```text
+dotnet test MuvluvLLMMod.sln -c Release
+  MuvluvLLMMod.Tests: 251 passed, 0 failed, 0 skipped
+  MuvluvLLMMod.IntegrationTests: 42 passed, 0 failed, 0 skipped
+  TOTAL: 293 passed, 0 failed, 0 skipped
+
+dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game
+  0 warnings, 0 errors
+
+bash scripts/mutation-gate.sh
+  exact-source baseline: 42 passed, 0 failed, 0 skipped
+  24/24 compile-valid mutants killed
+```
