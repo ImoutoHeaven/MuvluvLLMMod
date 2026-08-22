@@ -224,7 +224,7 @@ Fix: make initialization transactional — prefer starting workers only *after* 
 setup succeeds; wrap staged init in `try/catch`, invoke ITEM 3's idempotent cleanup on failure,
 then rethrow.
 
-## ITEM 10 — `TODO` — MINOR: pin the kana boundaries in tests
+## ITEM 10 — `DONE` (commit `b2a74d4`) — MINOR: pin the kana boundaries in tests
 
 `MuvluvLLMMod.Tests/TextTemplateTests.cs` ~156-173. Implementation is correct but tests omit most
 endpoints/neighbours. Add a numeric-codepoint `[Theory]` asserting BOTH inclusive endpoints AND
@@ -262,13 +262,13 @@ pure classes, link them into the test project, and unit-test them. Highest-value
 are applied, so a missing `Refresh`/`Leave` hook would silently break priority routing yet still
 log success. Include all four and report exact targets.
 
-## ITEM 13 — `TODO` — MINOR: pin dependency versions
+## ITEM 13 — `DONE` (commit `8115d17`) — MINOR: pin dependency versions
 
 `MuvluvLLMMod.csproj` ~30-31 uses floating `6.0.0-be.*` and `2.*`. Target install is BepInEx
 `6.0.0-be.785`. Pin `BepInEx.Unity.IL2CPP` to `6.0.0-be.785`, pin the props package. Confirm the
 Docker build still passes.
 
-## ITEM 14 — `TODO` — docs + licence
+## ITEM 14 — `DONE` (commit `918736c`) — docs + licence
 
 Fix `README.md`:
 - It claims the two plugins share no Harmony target — **false**, both patch
