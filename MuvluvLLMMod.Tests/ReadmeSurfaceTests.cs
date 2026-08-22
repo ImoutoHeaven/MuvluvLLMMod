@@ -32,6 +32,17 @@ public sealed class ReadmeSurfaceTests
         }
 
         Assert.Contains("kana-free incoming text is not queued", readme, StringComparison.Ordinal);
+        Assert.Contains("Kana is necessary but not sufficient", readme, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "if and only if it contains Japanese kana",
+            readme,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(
+            "successfully provenance-recorded render-layer translations",
+            readme,
+            StringComparison.Ordinal);
+        Assert.Contains("Out-of-budget or otherwise invalid", readme, StringComparison.Ordinal);
+        Assert.Contains("ambiguity or failed validation is", readme, StringComparison.Ordinal);
         Assert.Contains("font fallback and glyph coverage", readme, StringComparison.Ordinal);
         Assert.Contains("not a claim of complete", readme, StringComparison.Ordinal);
     }

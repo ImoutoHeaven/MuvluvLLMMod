@@ -13,18 +13,22 @@ load-order requirement. Its fallback behavior is based only on the text arriving
 `TMP_Text` assignment:
 
 - kana-free incoming text is not queued;
-- text that still contains Japanese kana may be queued; and
+- kana-bearing text may enter the bounded pipeline only when its input and normalized-template
+  budgets are accepted; and
 - if another renderer or data mod has already supplied Chinese (or another kana-free value), this
-  plugin does not actively queue that incoming value.
+  plugin does not actively queue that incoming value. A generated or filled result is used only
+  after its final output budget is accepted.
 
 Those are render-layer rules, not a guarantee that unrelated mods cannot affect the same UI or that
 every game text path is covered. The plugin never reads another mod's data or state.
 
 ## What gets translated
 
-A string is eligible for production **if and only if it contains Japanese kana** (hiragana,
-katakana, or half-width katakana). Pure-kanji strings (for example `提供割合`) are deliberately
-not translated; this keeps the candidate test conservative.
+A string is eligible for the bounded translation pipeline only when it contains Japanese kana
+(hiragana, katakana, or half-width katakana) **and** its accepted input and normalized-template
+budgets permit admission. The generated or filled output must pass its own bounded output check
+before it is displayed or retained. Kana is necessary but not sufficient. Pure-kanji strings (for
+example `提供割合`) are deliberately not translated; this keeps the candidate test conservative.
 
 Game-produced text is not modified by a data-layer hook. Translation is applied when the final UI
 assignment is observed by this plugin's `TMP_Text` render Prefix. Text produced by a game builder
@@ -79,16 +83,17 @@ needed for the first three, while a cache-directory change takes effect after re
 
 ## Hotkey and display fallback
 
-**F2** toggles whether this plugin's translations are displayed. The toggle is a display operation
-only: when `[LLM] Enable` is true, production continues while display is off so translations can be
-available when display is enabled again.
+**F2** toggles whether this plugin's successfully provenance-recorded render-layer translations
+are displayed. The toggle is a display operation only: when `[LLM] Enable` is true, production
+continues while display is off so translations can be available when display is enabled again.
 
-For a TMP object whose assignment was translated by this plugin, display-off refresh can restore the
-source only when the object identity, assignment generation, lifecycle epoch, and cache reverse
-mapping all validate. An external setter starts a new assignment even when its value is identical.
-A plugin refresh uses a one-shot token only around the exact setter write it owns. If any check is
-uncertain, the current text is left unchanged; the plugin does not guess ownership from a translated
-string. Text rendered outside an observed TMP setter path is not claimed by this toggle.
+For an observed TMP assignment, display-off refresh can restore the source only when the object
+identity, assignment generation, lifecycle epoch, and cache reverse mapping all validate. An
+external setter starts a new assignment even when its value is identical. A plugin refresh uses a
+one-shot token only around the exact setter write it owns. Out-of-budget or otherwise invalid
+values remain the original text and are not provenance-recorded; ambiguity or failed validation is
+a no-op that leaves the current text unchanged. The toggle does not claim text rendered outside an
+observed TMP setter path or promise every game UI route.
 
 ## Runtime verification gates
 
@@ -128,7 +133,7 @@ docker run --rm \
   -w / mcr.microsoft.com/dotnet/sdk:8.0 \
   bash -lc 'cp -a /src /work && cd /work && dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release'
 
-# exact-source production integration tests (13 deterministic tests; no game mount needed)
+# exact-source production integration tests (deterministic; no game mount needed)
 docker run --rm \
   --mount type=bind,src=/path/to/MuvluvLLMMod,dst=/src,readonly \
   -w / mcr.microsoft.com/dotnet/sdk:8.0 \
@@ -142,10 +147,12 @@ docker run --rm \
   bash scripts/mutation-gate.sh
 ```
 
-`MuvluvLLMMod.IntegrationTests` links the checked-in production `.cs` files directly (including
-`Patch.cs`, `Plugin.cs`, `Config.cs`, `Hotkey.cs`, `Logger.cs`, `RetainedDelegate.cs`,
-`NativeDelegateCoordinator`, and all of their real translation/lifecycle dependencies). It does
-not copy a parallel implementation. `Stubs/RuntimeStubs.cs` replaces only external boundaries:
+`MuvluvLLMMod.IntegrationTests` links the checked-in production `.cs` files directly (the test
+also asserts this project link and executes current linked budget behavior; it is not a copied
+implementation). It includes `Patch.cs`, `Plugin.cs`, `Config.cs`, `Hotkey.cs`, `Logger.cs`,
+`RetainedDelegate.cs`, `NativeDelegateCoordinator`, and all of their real translation/lifecycle
+dependencies. It does not copy a parallel implementation. `Stubs/RuntimeStubs.cs` replaces only
+external boundaries:
 BepInEx configuration/logging/BasePlugin, Harmony discovery/ownership, Unity object/component
 lifetime and time/input, the TMP type, the application-quitting add/remove calls, and the two
 scenario target types. The fake `TMP_Text.text` setter calls the real `Patch.TranslateTmpSetter`
