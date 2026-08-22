@@ -41,8 +41,8 @@ baseline_output=$(run_tests "$ROOT" 2>&1) || {
     exit 1
 }
 printf '%s\n' "$baseline_output"
-if ! grep -Eq 'Passed:[[:space:]]+16' <<<"$baseline_output" || ! grep -Eq 'Failed:[[:space:]]+0' <<<"$baseline_output"; then
-    echo "baseline did not report the expected 16 integration tests" >&2
+if ! grep -Eq 'Passed:[[:space:]]+20' <<<"$baseline_output" || ! grep -Eq 'Failed:[[:space:]]+0' <<<"$baseline_output"; then
+    echo "baseline did not report the expected 20 integration tests" >&2
     exit 1
 fi
 
@@ -98,6 +98,26 @@ gate_mutant() {
                 '                if (!shutdown && terminalException == null && generation == version)' \
                 '                if (!shutdown && generation == version)'
             ;;
+        PF2-fixed-filename-priority)
+            replace_once "$copy/MuvluvLLMMod/TranslationCache.cs" \
+                $'        var selected = candidates\n            .OrderByDescending(candidate => candidate.Snapshot.Epoch)\n            .ThenBy(candidate => candidate.Priority)\n            .First();' \
+                $'        var selected = candidates\n            .OrderBy(candidate => candidate.Priority)\n            .First();'
+            ;;
+        PF3-response-content-read)
+            replace_once "$copy/MuvluvLLMMod/OpenAiChatClient.cs" \
+                '            () => client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token),' \
+                '            () => client.SendAsync(request, token),'
+            ;;
+        PF4-translated-only-reverse-bytes)
+            replace_once "$copy/MuvluvLLMMod/TranslationCache.cs" \
+                '        var entryBytes = translatedBytes + Utf8Bytes(source);' \
+                '        var entryBytes = translatedBytes;'
+            ;;
+        PF5-unbounded-filled-output)
+            replace_once "$copy/MuvluvLLMMod/TextTemplate.cs" \
+                '        return TranslationBudget.IsTextWithinBudget(filled) ? filled : null;' \
+                '        return filled;'
+            ;;
         *)
             echo "unknown mutant $id" >&2
             return 1
@@ -135,5 +155,13 @@ gate_mutant M5-M4-remove-terminal-retry-guard \
     ProductionBudgetAndShutdownIntegrationTests.Terminal_flush_recovers_from_one_transient_write_failure
 gate_mutant M5-PF1-single-stopping-owner \
     ProductionBudgetAndShutdownIntegrationTests.Timed_out_reload_is_terminal_and_retains_the_old_worker_for_cleanup
+gate_mutant PF2-fixed-filename-priority \
+    ProductionBudgetAndShutdownIntegrationTests.Durable_cache_recovery_chooses_the_newest_valid_journal_epoch
+gate_mutant PF3-response-content-read \
+    ProductionBudgetAndShutdownIntegrationTests.Response_body_budget_stops_unknown_length_producer_before_full_buffer
+gate_mutant PF4-translated-only-reverse-bytes \
+    ProductionBudgetAndShutdownIntegrationTests.Reverse_index_retains_source_and_translation_bytes_for_admission
+gate_mutant PF5-unbounded-filled-output \
+    ProductionRenderIntegrationTests.Over_budget_generated_expansion_stays_source_even_when_f2_is_off
 
-echo "M-5/PF-1 mutation gate: all 7 compile-valid mutants killed"
+echo "M-5/PF-1/PF-2..PF-5 mutation gate: all 11 compile-valid configured mutants killed"
