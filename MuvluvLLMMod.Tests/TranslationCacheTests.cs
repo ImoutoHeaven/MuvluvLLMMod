@@ -26,7 +26,7 @@ public sealed class TranslationCacheTests : IDisposable
         var raw = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(cache.RawPath));
         Assert.Equal("技能 {0}", generated!["スキル {0}"]);
         Assert.Equal(new[] { "回復する" }, pending);
-        Assert.Equal(string.Empty, raw!["スキル 12"]);
+        Assert.Equal(string.Empty, raw!["スキル {0}"]);
         Assert.Equal(string.Empty, raw["回復する"]);
         Assert.Empty(Directory.GetFiles(root, "*.tmp", SearchOption.AllDirectories));
 
@@ -132,6 +132,42 @@ public sealed class TranslationCacheTests : IDisposable
     }
 
     [Fact]
+    public void Runtime_raw_samples_are_normalized_and_bounded()
+    {
+        var cache = new TranslationCache(root);
+        cache.ObserveNormal("数字 12する", "数字 {0}する");
+        for (var index = 0; index < 5000; index++)
+        {
+            var source = "表示する-" + Suffix(index);
+            cache.ObserveNormal(source, source);
+        }
+
+        cache.Flush();
+
+        var raw = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(cache.RawPath));
+        Assert.Contains("数字 {0}する", raw!.Keys);
+        Assert.InRange(raw.Count, 1, 4096);
+    }
+
+    [Fact]
+    public void Runtime_reverse_indexes_evict_the_least_recently_used_value()
+    {
+        var cache = new TranslationCache(root);
+        for (var index = 0; index < 4096; index++)
+        {
+            var suffix = Suffix(index);
+            cache.RememberResolution("源する-" + suffix, "译-" + suffix);
+        }
+
+        Assert.True(cache.TryGetSourceForTranslatedValue("译-" + Suffix(0), out _));
+        cache.RememberResolution("源する-" + Suffix(4096), "译-" + Suffix(4096));
+
+        Assert.True(cache.TryGetSourceForTranslatedValue("译-" + Suffix(0), out _));
+        Assert.False(cache.TryGetSourceForTranslatedValue("译-" + Suffix(1), out _));
+        Assert.False(cache.IsKnownTranslatedValue("译-" + Suffix(1)));
+    }
+
+    [Fact]
     public async Task Persistence_loop_retries_a_failed_write_without_another_mutation()
     {
         var generatedAttempts = 0;
@@ -219,5 +255,16 @@ public sealed class TranslationCacheTests : IDisposable
     public void Dispose()
     {
         if (Directory.Exists(root)) Directory.Delete(root, true);
+    }
+
+    private static string Suffix(int value)
+    {
+        var chars = new char[4];
+        for (var index = 0; index < chars.Length; index++)
+        {
+            chars[index] = (char)('a' + value % 26);
+            value /= 26;
+        }
+        return new string(chars);
     }
 }

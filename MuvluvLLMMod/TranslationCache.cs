@@ -7,6 +7,8 @@ public sealed class TranslationCache
 {
     public readonly record struct PendingObservation(bool ShouldEnqueue, long Generation);
 
+    private const int RawSampleCapacity = 4096;
+    private const int RuntimeReverseIndexCapacity = 4096;
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private readonly object gate = new();
     private readonly object writerGate = new();
@@ -22,6 +24,8 @@ public sealed class TranslationCache
     private readonly Dictionary<string, string> sourceByTranslatedValue = new(StringComparer.Ordinal);
     private readonly HashSet<string> knownTranslatedValues = new(StringComparer.Ordinal);
     private readonly HashSet<string> ambiguousTranslatedValues = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, LinkedListNode<string>> reverseIndexNodes = new(StringComparer.Ordinal);
+    private readonly LinkedList<string> reverseIndexLru = new();
     private readonly HashSet<string> runtimePromotedPending = new(StringComparer.Ordinal);
     private bool dirty;
     private bool acceptingMutations = true;
@@ -139,12 +143,22 @@ public sealed class TranslationCache
 
     public bool IsKnownTranslatedValue(string value)
     {
-        lock (gate) return knownTranslatedValues.Contains(value);
+        lock (gate)
+        {
+            if (!knownTranslatedValues.Contains(value)) return false;
+            TouchReverseIndexUnsafe(value);
+            return true;
+        }
     }
 
     public bool TryGetSourceForTranslatedValue(string translatedValue, out string source)
     {
-        lock (gate) return sourceByTranslatedValue.TryGetValue(translatedValue, out source!);
+        lock (gate)
+        {
+            if (!sourceByTranslatedValue.TryGetValue(translatedValue, out source!)) return false;
+            TouchReverseIndexUnsafe(translatedValue);
+            return true;
+        }
     }
 
     public void ConfirmSourceIdentity(string source)
@@ -156,6 +170,7 @@ public sealed class TranslationCache
             if (!sourceByTranslatedValue.Remove(source)) return;
             knownTranslatedValues.Add(source);
             ambiguousTranslatedValues.Add(source);
+            TouchReverseIndexUnsafe(source);
         }
     }
 
@@ -217,12 +232,22 @@ public sealed class TranslationCache
             raw.Clear();
             foreach (var value in loadedRaw)
             {
-                if (TextTemplate.IsTranslationCandidate(value)) raw.Add(value);
-                else cleaned = true;
+                if (!TextTemplate.IsTranslationCandidate(value))
+                {
+                    cleaned = true;
+                    continue;
+                }
+                var normalized = TextTemplate.Normalize(value).Template;
+                if (!string.Equals(value, normalized, StringComparison.Ordinal)
+                    || raw.Count >= RawSampleCapacity)
+                    cleaned = true;
+                if (raw.Count < RawSampleCapacity) raw.Add(normalized);
             }
             sourceByTranslatedValue.Clear();
             knownTranslatedValues.Clear();
             ambiguousTranslatedValues.Clear();
+            reverseIndexNodes.Clear();
+            reverseIndexLru.Clear();
             runtimePromotedPending.Clear();
             foreach (var entry in generated) RememberResolutionUnsafe(entry.Key, entry.Value);
             if (cleaned) MarkDirtyUnsafe();
@@ -286,7 +311,8 @@ public sealed class TranslationCache
         lock (gate)
         {
             if (!acceptingMutations) return default;
-            var changed = raw.Add(original);
+            var rawSample = TextTemplate.Normalize(original).Template;
+            var changed = raw.Count < RawSampleCapacity && raw.Add(rawSample);
             if (generated.ContainsKey(normalizedTemplate))
             {
                 if (changed) MarkDirtyUnsafe();
@@ -325,6 +351,7 @@ public sealed class TranslationCache
     {
         if (string.Equals(source, translatedValue, StringComparison.Ordinal)) return;
         knownTranslatedValues.Add(translatedValue);
+        TouchReverseIndexUnsafe(translatedValue);
         if (ambiguousTranslatedValues.Contains(translatedValue)) return;
         if (sourceByTranslatedValue.TryGetValue(translatedValue, out var existing)
             && !string.Equals(existing, source, StringComparison.Ordinal))
@@ -334,6 +361,27 @@ public sealed class TranslationCache
             return;
         }
         sourceByTranslatedValue[translatedValue] = source;
+    }
+
+    private void TouchReverseIndexUnsafe(string translatedValue)
+    {
+        if (reverseIndexNodes.TryGetValue(translatedValue, out var existing))
+        {
+            reverseIndexLru.Remove(existing);
+            reverseIndexLru.AddLast(existing);
+            return;
+        }
+        var node = reverseIndexLru.AddLast(translatedValue);
+        reverseIndexNodes[translatedValue] = node;
+        while (reverseIndexNodes.Count > RuntimeReverseIndexCapacity)
+        {
+            var oldest = reverseIndexLru.First!;
+            reverseIndexLru.RemoveFirst();
+            reverseIndexNodes.Remove(oldest.Value);
+            sourceByTranslatedValue.Remove(oldest.Value);
+            knownTranslatedValues.Remove(oldest.Value);
+            ambiguousTranslatedValues.Remove(oldest.Value);
+        }
     }
 
     private Dictionary<string, string> LoadGenerated(out bool cleaned)
