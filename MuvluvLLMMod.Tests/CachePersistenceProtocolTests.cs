@@ -107,6 +107,10 @@ public sealed class CachePersistenceProtocolTests : IDisposable
         Assert.Equal(
             oldSnapshot.Epoch,
             JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(File.ReadAllText(recovered.StateBackupPath))!.Epoch);
+        Assert.True(recovered.Flush());
+        Assert.Equal(
+            newerSnapshot.Epoch,
+            JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(File.ReadAllText(recovered.StatePath))!.Epoch);
 
         var restarted = new TranslationCache(root);
         restarted.Load();
@@ -130,7 +134,7 @@ public sealed class CachePersistenceProtocolTests : IDisposable
         var newerState = File.ReadAllText(cache.StatePath);
         var newerSnapshot = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(newerState);
         File.Copy(cache.StatePath, cache.StateBackupPath, true);
-        File.WriteAllText(cache.StatePath, oldState, new UTF8Encoding(false));
+        File.Delete(cache.StatePath);
         File.Delete(cache.StateTemporaryPath);
 
         var loaded = new TranslationCache(root);
