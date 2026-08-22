@@ -29,6 +29,7 @@
     <Compile Include="..\MuvluvLLMMod\TranslationResolver.cs" Link="Source\TranslationResolver.cs" />
     <Compile Include="..\MuvluvLLMMod\TmpTranslationProvenance.cs" Link="Source\TmpTranslationProvenance.cs" />
     <Compile Include="..\MuvluvLLMMod\TmpRestoreDecision.cs" Link="Source\TmpRestoreDecision.cs" />
+    <Compile Include="..\MuvluvLLMMod\TmpPluginWriteOwnership.cs" Link="Source\TmpPluginWriteOwnership.cs" />
     <Compile Include="..\MuvluvLLMMod\DebugTextLogPolicy.cs" Link="Source\DebugTextLogPolicy.cs" />
     <Compile Include="..\MuvluvLLMMod\ConfigReloadPolicy.cs" Link="Source\ConfigReloadPolicy.cs" />
     <Compile Include="..\MuvluvLLMMod\Translation.cs" Link="Source\Translation.cs" />

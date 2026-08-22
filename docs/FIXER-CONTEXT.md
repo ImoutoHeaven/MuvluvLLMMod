@@ -461,3 +461,65 @@ rejection. In throwaway Docker copies (the repository was never mutated), the re
 
 `ReloadMachineTranslator` was checked as well; its terminal path delegates to the already-tested
 terminal `MachineTranslatorLifecycle.Reload` rejection, so no additional unpinned guard was found.
+
+---
+
+## B-1 follow-up — TMP setter ownership and lifecycle provenance
+
+**Status: DONE (feature commit `25e6845`; companion tests/docs commit is included with this status update).** This batch addresses only
+B-1 from `docs/FINAL-REVIEW.md`; B-2, M-1, M-2, and the other outstanding review IDs remain
+unchanged for later batches.
+
+The broad thread-wide `translatingTmp` flag was removed. `TmpPluginWriteOwnership` now registers a
+per-thread, one-shot token immediately before the exact `text.text = value` issued by
+`RefreshAllTmpText`. The TMP Prefix consumes that token only once when object reference, native
+instance ID, provenance assignment generation, provenance lifecycle epoch, and token lifecycle
+match. A consumed token cannot cover a nested setter; a mismatch is processed as an external
+setter. All non-token Prefix calls therefore enter `BeginExternalSetter` before resolution,
+including byte-identical assignments and synchronous callbacks from resolution or logging.
+The scope is disposed with `using`, including exception/no-prefix paths.
+
+`TmpTranslationProvenance.ResetForLifecycle` retires all entries and advances an epoch. Patch load
+resets provenance and ownership before publishing Harmony hooks; cleanup retires them before
+`UnpatchSelf`. Patch runtime state relevant to this path (active epoch, scenario flag, scan count,
+and outstanding token generation) is reset as part of those transitions. An assignment made while
+hooks are absent consequently cannot find an entry from the previous lifecycle after reload.
+
+### Regression coverage
+
+The loader-free ownership/provenance tests cover:
+
+- exact plugin-refresh setter bypass and one-shot consumption;
+- nested other-TMP and same-TMP external setters, including byte-identical `确定`;
+- target/ID/generation/lifecycle token mismatch as external, plus scope cleanup on exception and
+  when no Prefix consumes the token;
+- unload/clear/reload stale-entry non-restoration; and
+- the normal valid F2-off restore path.
+
+`PatchSurfaceTests` additionally require the real production Prefix wiring, require the
+`[HarmonyPrefix]` TMP target, reject the old broad guard, and verify that `Patch.Retire` is ordered
+before production unpatch. The test project links the actual loader-free ownership component;
+there is no Unity/game process dependency. The native IL2CPP/Harmony boundary remains covered by
+source/wiring assertions rather than a fake claim of execution in net8.0.
+
+### Docker validation
+
+Both validations copied the read-only repository mount into a throwaway container directory.
+The game directory was mounted read-only for the plugin build and was never launched or written.
+
+```text
+MSYS_NO_PATHCONV=1 docker run --rm \
+  --mount type=bind,src=C:/Users/Eden/Muv-Luv/MuvluvLLMMod,dst=/src,readonly \
+  -w / mcr.microsoft.com/dotnet/sdk:8.0 \
+  bash -lc 'cp -a /src /work; cd /work; dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release'
+
+PASS — 209 passed, 0 failed, 0 skipped.
+
+MSYS_NO_PATHCONV=1 docker run --rm \
+  --mount type=bind,src=C:/Users/Eden/Muv-Luv/MuvluvLLMMod,dst=/src,readonly \
+  --mount type=bind,src=C:/Users/Eden/Muv-Luv/muv_luv_girlsgarden_cl,dst=/game,readonly \
+  -w / mcr.microsoft.com/dotnet/sdk:8.0 \
+  bash -lc 'cp -a /src /work; cd /work; dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game'
+
+PASS — build succeeded, 0 warnings, 0 errors.
+```

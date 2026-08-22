@@ -92,12 +92,17 @@ needed for the first three, while a cache-directory change takes effect after re
 **F2** — toggle whether translations are *displayed*.
 
 Turning it off restores original text, but **only on the TMP object whose current assignment this
-plugin translated**. Every unguarded `TMP_Text.set_text` call starts a new external assignment—even
-when its value is byte-identical—so pooled reuse cannot reactivate stale provenance. Restoration is
-allowed only during the plugin's guarded refresh path and requires both the validated object identity /
-assignment generation and the cache's reverse mapping to match; any uncertainty leaves the text alone.
-Text assigned by another mod is therefore left alone: its external setter invalidates our prior record,
-and we have no record of its original to restore.
+plugin translated** and only while this plugin's setter prefix is observing the assignment. A normal
+setter prefix starts a new external assignment—even when its value is byte-identical—so pooled reuse
+cannot reactivate stale provenance. The sole bypass is a one-shot token around the exact
+`text.text = value` write issued by the refresh scan; resolver, queue, reverse-lookup, and logging
+callbacks do not inherit that token, so nested setters invalidate provenance normally. Restoration is
+allowed only during that plugin-owned refresh path and requires the validated object identity,
+assignment generation, lifecycle epoch, and cache reverse mapping to match; any uncertainty leaves the
+current text alone. Provenance is retired before unload unpatches the hook and reset before a new load
+publishes hooks, so assignments made during the unpatched window cannot reuse an old entry. Text
+assigned by another mod is therefore left alone when its setter is observed; the plugin does not claim
+to infer ownership for text rendered outside this TMP setter path.
 
 LLM production continues in the background while display is off because it is controlled by `[LLM] Enable`,
 not by F2. Toggling back on is therefore instant, without restarting the worker. Pressing F2 also logs a
