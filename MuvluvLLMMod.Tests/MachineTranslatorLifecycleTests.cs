@@ -1,3 +1,5 @@
+using System.Collections;
+using System.Reflection;
 using Xunit;
 
 namespace MuvluvLLMMod.Tests;
@@ -541,17 +543,77 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
     }
 
     [Fact]
-    public async Task Shutdown_is_terminal_and_rejects_future_scheduler_mutations()
+    public async Task Shutdown_rejects_every_enqueue_overload_without_retaining_work()
     {
-        var lifecycle = new MachineTranslatorLifecycle();
+        var retryPolicy = new TranslationRetryPolicy();
+        var lifecycle = new MachineTranslatorLifecycle(retryPolicy: retryPolicy);
+        var priorityBacklog = ReadPrivateField<TranslationPriorityBacklog>(lifecycle, "priorityBacklog");
+        var retryStatesBefore = RetryStateCount(retryPolicy);
 
         lifecycle.Shutdown();
 
         Assert.True(lifecycle.IsShutdown);
         Assert.False(lifecycle.Reload(false, 1, null));
         Assert.False(lifecycle.EnqueuePriority("关闭后优先する"));
+        Assert.False(lifecycle.EnqueuePriority("关闭后优先世代する", 11));
         Assert.False(lifecycle.EnqueueNormal("关闭后通常する"));
+        Assert.False(lifecycle.EnqueueNormal("关闭後通常世代する", 12));
+        Assert.Empty(priorityBacklog.DrainWork());
+        Assert.Equal(retryStatesBefore, RetryStateCount(retryPolicy));
         await lifecycle.TransitionTask;
+    }
+
+    [Fact]
+    public void Shutdown_guards_reject_work_even_if_a_stale_current_translator_is_present()
+    {
+        var retryPolicy = new TranslationRetryPolicy();
+        var lifecycle = new MachineTranslatorLifecycle(retryPolicy: retryPolicy);
+        var priorityBacklog = ReadPrivateField<TranslationPriorityBacklog>(lifecycle, "priorityBacklog");
+        var workQueue = new TranslationWorkQueue();
+        var staleMachine = new MachineTranslator(
+            new TranslationCache(root),
+            (_, _) => Task.FromResult<string?>("不应执行"),
+            1,
+            TimeSpan.FromSeconds(1),
+            priorityBacklog: priorityBacklog,
+            retryPolicy: retryPolicy);
+        SetPrivateField(staleMachine, "queue", workQueue);
+
+        lifecycle.Shutdown();
+        // A normal shutdown clears current. Reinstalling a test-only stale reference makes the
+        // short-circuit observable for the normal overloads, which otherwise return false from
+        // MachineTranslator because there is no queue to retain into.
+        SetPrivateField(lifecycle, "current", staleMachine);
+
+        Assert.False(lifecycle.EnqueuePriority("残留優先する"));
+        Assert.False(lifecycle.EnqueuePriority("残留優先世代する", 21));
+        Assert.False(lifecycle.EnqueueNormal("残留通常する"));
+        Assert.False(lifecycle.EnqueueNormal("残留通常世代する", 22));
+        Assert.Equal(0, PrivateCollectionCount(workQueue, "priorityQueue"));
+        Assert.Equal(0, PrivateCollectionCount(workQueue, "normalQueue"));
+        Assert.Empty(priorityBacklog.DrainWork());
+        Assert.Equal(0, RetryStateCount(retryPolicy));
+    }
+
+    [Fact]
+    public async Task Initialize_after_terminal_shutdown_cannot_create_a_worker()
+    {
+        var lifecycle = new MachineTranslatorLifecycle();
+        var factoryCalls = 0;
+
+        lifecycle.Shutdown();
+
+        lifecycle.Initialize(
+            true,
+            1,
+            (_, _) =>
+            {
+                Interlocked.Increment(ref factoryCalls);
+                return null!;
+            });
+
+        await lifecycle.TransitionTask;
+        Assert.Equal(0, factoryCalls);
     }
 
     [Fact]
@@ -610,6 +672,30 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
         while (!condition()) await Task.Delay(10, timeout.Token);
     }
+
+    private static T ReadPrivateField<T>(object target, string name)
+    {
+        var field = target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        return (T)field!.GetValue(target)!;
+    }
+
+    private static void SetPrivateField(object target, string name, object value)
+    {
+        var field = target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        field!.SetValue(target, value);
+    }
+
+    private static int PrivateCollectionCount(object target, string name)
+    {
+        var field = target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        return Assert.IsAssignableFrom<ICollection>(field!.GetValue(target)).Count;
+    }
+
+    private static int RetryStateCount(TranslationRetryPolicy retryPolicy) =>
+        PrivateCollectionCount(retryPolicy, "states");
 
     public void Dispose()
     {
