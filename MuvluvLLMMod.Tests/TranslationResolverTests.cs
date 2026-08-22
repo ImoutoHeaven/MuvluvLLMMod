@@ -4,7 +4,7 @@ namespace MuvluvLLMMod.Tests;
 
 public sealed class TranslationResolverTests : IDisposable
 {
-    private readonly string root = Path.Combine(Path.GetTempPath(), "MuvluvMod.Resolver.Tests", Guid.NewGuid().ToString("N"));
+    private readonly string root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.Resolver.Tests", Guid.NewGuid().ToString("N"));
 
     [Fact]
     public void Curated_wins_over_generated_and_equal_curated_falls_through()

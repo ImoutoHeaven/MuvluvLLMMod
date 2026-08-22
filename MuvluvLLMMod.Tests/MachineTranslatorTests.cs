@@ -4,7 +4,7 @@ namespace MuvluvLLMMod.Tests;
 
 public sealed class MachineTranslatorTests : IDisposable
 {
-    private readonly string root = Path.Combine(Path.GetTempPath(), "MuvluvMod.Machine.Tests", Guid.NewGuid().ToString("N"));
+    private readonly string root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.Machine.Tests", Guid.NewGuid().ToString("N"));
 
     [Fact]
     public async Task Priority_backlog_runs_before_start_and_success_is_cached()

@@ -5,7 +5,7 @@ namespace MuvluvLLMMod.Tests;
 
 public sealed class TranslationCacheTests : IDisposable
 {
-    private readonly string root = Path.Combine(Path.GetTempPath(), "MuvluvMod.Tests", Guid.NewGuid().ToString("N"));
+    private readonly string root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.Tests", Guid.NewGuid().ToString("N"));
 
     [Fact]
     public void Paths_and_json_shapes_round_trip_without_temporary_files()

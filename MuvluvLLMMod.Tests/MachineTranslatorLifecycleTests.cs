@@ -4,7 +4,7 @@ namespace MuvluvLLMMod.Tests;
 
 public sealed class MachineTranslatorLifecycleTests : IDisposable
 {
-    private readonly string root = Path.Combine(Path.GetTempPath(), "MuvluvMod.Lifecycle.Tests", Guid.NewGuid().ToString("N"));
+    private readonly string root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.Lifecycle.Tests", Guid.NewGuid().ToString("N"));
 
     [Fact]
     public void Blocked_priority_is_rejected_while_lifecycle_has_no_current_translator()
