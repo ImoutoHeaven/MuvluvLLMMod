@@ -12,6 +12,9 @@ public sealed class Hotkey : MonoBehaviour
 
     private void Update()
     {
+        if (Plugin.IsCleaningUp || !ReferenceEquals(Plugin.Instance, this))
+            return;
+
         var keyboard = Keyboard.current;
         if (keyboard != null && keyboard[Key.F2].wasPressedThisFrame)
         {

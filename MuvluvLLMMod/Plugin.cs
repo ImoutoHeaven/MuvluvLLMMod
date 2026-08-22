@@ -29,6 +29,10 @@ public sealed class Plugin : BasePlugin
     private static Task persistenceTask = Task.CompletedTask;
     private static MachineTranslator? currentMachine;
     private static Harmony? harmony;
+    private static int loadStarted;
+    private static int cleanupStarted;
+    private static int cleanupSucceeded;
+    private static readonly Action ApplicationQuittingHandler = OnApplicationQuitting;
 
     [ThreadStatic]
     private static bool observingEnqueue;
@@ -49,8 +53,19 @@ public sealed class Plugin : BasePlugin
     internal static (int Completed, int InFlight, int Failed) ProgressSnapshot =>
         Volatile.Read(ref currentMachine)?.ProgressSnapshot ?? (0, 0, 0);
 
+    internal static bool IsCleaningUp => Volatile.Read(ref cleanupStarted) != 0;
+
     public override void Load()
     {
+        if (Interlocked.CompareExchange(ref loadStarted, 1, 0) != 0)
+        {
+            if (Log != null)
+                Logger.Warn("Load called more than once; keeping the existing Hotkey component");
+            return;
+        }
+
+        Interlocked.Exchange(ref cleanupStarted, 0);
+        Volatile.Write(ref cleanupSucceeded, 0);
         TrySetUtf8Console();
 
         Log = base.Log;
@@ -76,44 +91,102 @@ public sealed class Plugin : BasePlugin
         harmony = new Harmony(PluginGuid);
         Patch.Initialize(harmony);
         Instance = AddComponent<Hotkey>();
+        Application.quitting = Application.quitting + ApplicationQuittingHandler;
 
         Logger.Info($"Plugin {PluginGuid} loaded successfully");
     }
 
-    public override bool Unload()
+    public override bool Unload() => Cleanup();
+
+    internal static bool Cleanup()
     {
-        if (Cache != null)
+        if (Interlocked.CompareExchange(ref cleanupStarted, 1, 0) != 0)
+            return Volatile.Read(ref cleanupSucceeded) != 0;
+
+        var succeeded = true;
+        Application.quitting = Application.quitting - ApplicationQuittingHandler;
+
+        CleanupStep("disable Hotkey", () =>
         {
-            Cache.FreezeMutations();
-            MachineLifecycle.Shutdown();
+            var instance = Instance;
+            Instance = null;
+            if (instance == null)
+                return;
 
-            var persistenceSource = persistenceCancellation;
-            persistenceCancellation = null;
-            persistenceSource?.Cancel();
-            if (persistenceSource != null)
-            {
-                _ = persistenceTask.ContinueWith(
-                    completed =>
-                    {
-                        _ = completed.Exception;
-                        persistenceSource.Dispose();
-                    },
-                    CancellationToken.None,
-                    TaskContinuationOptions.ExecuteSynchronously,
-                    TaskScheduler.Default);
-            }
+            instance.enabled = false;
+            UnityEngine.Object.Destroy(instance);
+        }, ref succeeded);
 
-            Cache.Flush();
-        }
+        // Keep this order: freeze → stop workers → cancel persistence → flush → unpatch.
+        CleanupStep("freeze cache mutations", () =>
+        {
+            if (Cache != null)
+                Cache.FreezeMutations();
+        }, ref succeeded);
+        CleanupStep("shutdown machine translator", MachineLifecycle.Shutdown, ref succeeded);
 
-        MuvluvLLMMod.Config.Shutdown();
-        harmony?.UnpatchSelf();
-        harmony = null;
-        Instance = null;
+        CancellationTokenSource? persistenceSource = null;
+        CleanupStep("cancel cache persistence", () =>
+        {
+            persistenceSource = Interlocked.Exchange(ref persistenceCancellation, null);
+            if (persistenceSource == null)
+                return;
+
+            persistenceSource.Cancel();
+            var task = persistenceTask;
+            _ = task.ContinueWith(
+                completed =>
+                {
+                    _ = completed.Exception;
+                    persistenceSource.Dispose();
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }, ref succeeded);
+
+        CleanupStep("flush cache", () =>
+        {
+            if (Cache != null)
+                Cache.Flush();
+        }, ref succeeded);
+        CleanupStep("unpatch Harmony", () =>
+        {
+            harmony?.UnpatchSelf();
+            harmony = null;
+        }, ref succeeded);
+        CleanupStep("shutdown configuration", MuvluvLLMMod.Config.Shutdown, ref succeeded);
         Volatile.Write(ref currentMachine, null);
-        Logger.Info($"Plugin {PluginGuid} unloaded");
-        return base.Unload();
+        Volatile.Write(ref cleanupSucceeded, succeeded ? 1 : 0);
+        Volatile.Write(ref loadStarted, 0);
+
+        if (succeeded)
+            Logger.Info($"Plugin {PluginGuid} unloaded");
+        else
+            Logger.Error($"Plugin {PluginGuid} cleanup completed with errors");
+        return succeeded;
     }
+
+    private static void CleanupStep(string name, Action action, ref bool succeeded)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception exception)
+        {
+            succeeded = false;
+            try
+            {
+                Logger.Error($"[LLM] Cleanup step '{name}' failed: {exception.GetType().Name}");
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static void OnApplicationQuitting() => Cleanup();
 
     internal static void ReloadMachineTranslator()
     {
