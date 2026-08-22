@@ -181,18 +181,33 @@ public static class Patch
     {
         var targets = new[]
         {
-            AccessTools.Method(typeof(TMP_Text), "set_text"),
-            AccessTools.Method(
-                typeof(SkillDescriptionBuilder),
-                nameof(SkillDescriptionBuilder.GetDescription),
-                new[] { typeof(SkillMaster), typeof(int), typeof(bool) })
+            (
+                Label: "TMPro.TMP_Text.set_text",
+                Method: AccessTools.Method(typeof(TMP_Text), "set_text")),
+            (
+                Label: "Assets.GameUi.Scenario.ScenarioController.Refresh",
+                Method: AccessTools.Method(
+                    typeof(ScenarioController),
+                    nameof(ScenarioController.Refresh),
+                    new Type[] { })),
+            (
+                Label: "Assets.GameUi.Scenario.ScenarioController.Leave",
+                Method: AccessTools.Method(typeof(ScenarioController), nameof(ScenarioController.Leave))),
+            (
+                Label: "Assets.GameUi.Utilities.SkillDescriptionBuilder.GetDescription",
+                Method: AccessTools.Method(
+                    typeof(SkillDescriptionBuilder),
+                    nameof(SkillDescriptionBuilder.GetDescription),
+                    new[] { typeof(SkillMaster), typeof(int), typeof(bool) }))
         };
         var missing = targets
-            .Where(target => target == null || Harmony.GetPatchInfo(target)?.Owners.Contains(harmonyId) != true)
-            .Select(target => target == null ? "unknown" : target.DeclaringType?.FullName + "." + target.Name)
+            .Where(target => target.Method == null
+                || Harmony.GetPatchInfo(target.Method)?.Owners.Contains(harmonyId) != true)
+            .Select(target => target.Label)
             .ToArray();
+        var targetList = string.Join(", ", targets.Select(target => target.Label));
         if (missing.Length == 0)
-            Logger.Info($"Harmony patches verified: owner={harmonyId}, targets={targets.Length}");
+            Logger.Info($"Harmony patches verified: owner={harmonyId}, targets=[{targetList}]");
         else
             Logger.Error($"Harmony patch verification failed: owner={harmonyId}, missing={string.Join(", ", missing)}");
     }
