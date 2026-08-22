@@ -50,6 +50,26 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
     }
 
     [Fact]
+    public void Reverse_index_retains_source_and_translation_bytes_for_admission()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.reverse." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var cache = new TranslationCache(root);
+            var source = new string('あ', 4000);
+            cache.RememberResolution(source, "译");
+            Assert.Equal(
+                Encoding.UTF8.GetByteCount(source) + Encoding.UTF8.GetByteCount("译"),
+                cache.RetainedSnapshot.ReverseUtf8Bytes);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Response_body_budget_stops_unknown_length_producer_before_full_buffer()
     {
         const int totalBytes = 512 * 1024;

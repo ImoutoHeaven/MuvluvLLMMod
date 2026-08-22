@@ -250,8 +250,15 @@ public sealed class TranslationCache
         {
             if (!knownTranslatedValues.Contains(value))
                 return false;
-            TouchReverseIndexUnsafe(value);
-            return true;
+
+            var retainedBytes = sourceByTranslatedValue.TryGetValue(value, out var source)
+                ? Utf8Bytes(value) + Utf8Bytes(source)
+                : Utf8Bytes(value);
+            if (TryTouchReverseIndexUnsafe(value, retainedBytes))
+                return true;
+
+            RemoveReverseUnsafe(value);
+            return false;
         }
     }
 
@@ -264,8 +271,14 @@ public sealed class TranslationCache
         {
             if (!sourceByTranslatedValue.TryGetValue(translatedValue, out source!))
                 return false;
-            TouchReverseIndexUnsafe(translatedValue);
-            return true;
+
+            var retainedBytes = Utf8Bytes(translatedValue) + Utf8Bytes(source);
+            if (TryTouchReverseIndexUnsafe(translatedValue, retainedBytes))
+                return true;
+
+            RemoveReverseUnsafe(translatedValue);
+            source = string.Empty;
+            return false;
         }
     }
 
@@ -279,8 +292,10 @@ public sealed class TranslationCache
                 return;
             knownTranslatedValues.Add(source);
             ambiguousTranslatedValues.Add(source);
-            SetReverseEntryBytesUnsafe(source, Utf8Bytes(source));
-            TouchReverseIndexUnsafe(source);
+            if (!SetReverseEntryBytesUnsafe(source, Utf8Bytes(source)))
+                RemoveReverseUnsafe(source);
+            else
+                TouchReverseIndexUnsafe(source);
         }
     }
 
@@ -622,42 +637,64 @@ public sealed class TranslationCache
             || !TranslationBudget.TryGetPairBytes(source, translatedValue, out _))
             return;
 
+        var translatedBytes = Utf8Bytes(translatedValue);
         if (ambiguousTranslatedValues.Contains(translatedValue))
         {
-            TouchReverseIndexUnsafe(translatedValue);
+            if (!TryTouchReverseIndexUnsafe(translatedValue, translatedBytes))
+                RemoveReverseUnsafe(translatedValue);
             return;
         }
 
         if (sourceByTranslatedValue.TryGetValue(translatedValue, out var existing))
         {
+            var existingBytes = translatedBytes + Utf8Bytes(existing);
             if (string.Equals(existing, source, StringComparison.Ordinal))
             {
-                TouchReverseIndexUnsafe(translatedValue);
+                if (!TryTouchReverseIndexUnsafe(translatedValue, existingBytes))
+                    RemoveReverseUnsafe(translatedValue);
                 return;
             }
 
+            // A shared translated value is retained only as an ambiguity marker: no source may
+            // be restored from it. The pair's source bytes therefore leave the accounting here.
             sourceByTranslatedValue.Remove(translatedValue);
             ambiguousTranslatedValues.Add(translatedValue);
-            SetReverseEntryBytesUnsafe(translatedValue, Utf8Bytes(translatedValue));
-            TouchReverseIndexUnsafe(translatedValue);
+            if (!SetReverseEntryBytesUnsafe(translatedValue, translatedBytes))
+                RemoveReverseUnsafe(translatedValue);
+            else
+                TouchReverseIndexUnsafe(translatedValue);
             return;
         }
 
-        var entryBytes = Utf8Bytes(translatedValue) + Utf8Bytes(source);
+        var entryBytes = translatedBytes + Utf8Bytes(source);
         if (!EnsureReverseCapacityUnsafe(translatedValue, entryBytes))
             return;
+
+        // Admission and node creation happen before publishing the source mapping. This keeps
+        // the retained byte metric equal to the actual source+translation strings at all times.
+        AddReverseNodeUnsafe(translatedValue, entryBytes);
         knownTranslatedValues.Add(translatedValue);
         sourceByTranslatedValue[translatedValue] = source;
-        SetReverseEntryBytesUnsafe(translatedValue, entryBytes);
-        TouchReverseIndexUnsafe(translatedValue);
     }
 
     private bool EnsureReverseCapacityUnsafe(string translatedValue, int entryBytes)
     {
-        if (entryBytes > TranslationBudget.MaxReverseUtf8Bytes)
+        if (entryBytes < 0 || entryBytes > TranslationBudget.MaxReverseUtf8Bytes)
             return false;
-        if (reverseIndexNodes.ContainsKey(translatedValue))
+
+        if (reverseIndexEntryBytes.TryGetValue(translatedValue, out var currentBytes))
+        {
+            while (reverseIndexUtf8Bytes - currentBytes + entryBytes > TranslationBudget.MaxReverseUtf8Bytes)
+            {
+                var oldest = reverseIndexLru.First;
+                while (oldest != null && string.Equals(oldest.Value, translatedValue, StringComparison.Ordinal))
+                    oldest = oldest.Next;
+                if (oldest == null)
+                    return false;
+                RemoveReverseUnsafe(oldest.Value);
+            }
             return true;
+        }
 
         while (reverseIndexNodes.Count >= TranslationBudget.MaxReverseEntries
             || reverseIndexUtf8Bytes + entryBytes > TranslationBudget.MaxReverseUtf8Bytes)
@@ -669,32 +706,50 @@ public sealed class TranslationCache
         return true;
     }
 
-    private void TouchReverseIndexUnsafe(string translatedValue)
+    private bool TryTouchReverseIndexUnsafe(string translatedValue, int entryBytes)
     {
+        if (!EnsureReverseCapacityUnsafe(translatedValue, entryBytes))
+            return false;
+
         if (reverseIndexNodes.TryGetValue(translatedValue, out var existing))
         {
+            var previousBytes = reverseIndexEntryBytes[translatedValue];
+            reverseIndexUtf8Bytes += entryBytes - previousBytes;
+            reverseIndexEntryBytes[translatedValue] = entryBytes;
             reverseIndexLru.Remove(existing);
             reverseIndexLru.AddLast(existing);
-            return;
+            return true;
         }
 
-        var entryBytes = Utf8Bytes(translatedValue);
-        if (!EnsureReverseCapacityUnsafe(translatedValue, entryBytes))
-            return;
+        AddReverseNodeUnsafe(translatedValue, entryBytes);
+        return true;
+    }
+
+    private void TouchReverseIndexUnsafe(string translatedValue)
+    {
+        var entryBytes = sourceByTranslatedValue.TryGetValue(translatedValue, out var source)
+            ? Utf8Bytes(translatedValue) + Utf8Bytes(source)
+            : Utf8Bytes(translatedValue);
+        _ = TryTouchReverseIndexUnsafe(translatedValue, entryBytes);
+    }
+
+    private bool SetReverseEntryBytesUnsafe(string translatedValue, int entryBytes)
+    {
+        if (!reverseIndexNodes.ContainsKey(translatedValue)
+            || !EnsureReverseCapacityUnsafe(translatedValue, entryBytes))
+            return false;
+        var previousBytes = reverseIndexEntryBytes[translatedValue];
+        reverseIndexUtf8Bytes += entryBytes - previousBytes;
+        reverseIndexEntryBytes[translatedValue] = entryBytes;
+        return true;
+    }
+
+    private void AddReverseNodeUnsafe(string translatedValue, int entryBytes)
+    {
         var node = reverseIndexLru.AddLast(translatedValue);
         reverseIndexNodes[translatedValue] = node;
         reverseIndexEntryBytes[translatedValue] = entryBytes;
         reverseIndexUtf8Bytes += entryBytes;
-    }
-
-    private void SetReverseEntryBytesUnsafe(string translatedValue, int entryBytes)
-    {
-        if (!reverseIndexNodes.ContainsKey(translatedValue))
-            return;
-        if (entryBytes == reverseIndexEntryBytes[translatedValue])
-            return;
-        reverseIndexUtf8Bytes += entryBytes - reverseIndexEntryBytes[translatedValue];
-        reverseIndexEntryBytes[translatedValue] = entryBytes;
     }
 
     private void RemoveReverseUnsafe(string translatedValue)
@@ -702,7 +757,10 @@ public sealed class TranslationCache
         if (reverseIndexNodes.Remove(translatedValue, out var node))
             reverseIndexLru.Remove(node);
         if (reverseIndexEntryBytes.Remove(translatedValue, out var entryBytes))
+        {
             reverseIndexUtf8Bytes -= entryBytes;
+            if (reverseIndexUtf8Bytes < 0) reverseIndexUtf8Bytes = 0;
+        }
         sourceByTranslatedValue.Remove(translatedValue);
         knownTranslatedValues.Remove(translatedValue);
         ambiguousTranslatedValues.Remove(translatedValue);

@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using Xunit;
 
@@ -165,6 +166,49 @@ public sealed class TranslationCacheTests : IDisposable
         Assert.True(cache.TryGetSourceForTranslatedValue("译-" + Suffix(0), out _));
         Assert.False(cache.TryGetSourceForTranslatedValue("译-" + Suffix(1), out _));
         Assert.False(cache.IsKnownTranslatedValue("译-" + Suffix(1)));
+    }
+
+    [Fact]
+    public void Reverse_index_accounts_the_full_pair_and_updates_ambiguity_atomically()
+    {
+        var cache = new TranslationCache(root);
+        var largeSource = new string('あ', 4000);
+        const string translated = "译";
+        var expectedPairBytes = Encoding.UTF8.GetByteCount(largeSource + translated);
+
+        cache.RememberResolution(largeSource, translated);
+        Assert.Equal(1, cache.RetainedSnapshot.ReverseCount);
+        Assert.Equal(expectedPairBytes, cache.RetainedSnapshot.ReverseUtf8Bytes);
+        Assert.True(cache.TryGetSourceForTranslatedValue(translated, out var source));
+        Assert.Equal(largeSource, source);
+
+        // Re-observing the same pair is an update/touch, not a second retained entry.
+        cache.RememberResolution(largeSource, translated);
+        Assert.Equal(expectedPairBytes, cache.RetainedSnapshot.ReverseUtf8Bytes);
+
+        // A collision removes the source identity and retains only the ambiguous value.
+        cache.RememberResolution("別の源する", translated);
+        Assert.False(cache.TryGetSourceForTranslatedValue(translated, out _));
+        Assert.Equal(Encoding.UTF8.GetByteCount(translated), cache.RetainedSnapshot.ReverseUtf8Bytes);
+        Assert.True(cache.RetainedSnapshot.ReverseUtf8Bytes <= TranslationBudget.MaxReverseUtf8Bytes);
+    }
+
+    [Fact]
+    public void Reverse_index_rejects_an_oversize_pair_and_evicts_full_pair_entries()
+    {
+        var cache = new TranslationCache(root);
+        var oversizeSource = new string('あ', TranslationBudget.MaxReverseUtf8Bytes);
+        cache.RememberResolution(oversizeSource, "译");
+        Assert.Equal(0, cache.RetainedSnapshot.ReverseCount);
+        Assert.Equal(0, cache.RetainedSnapshot.ReverseUtf8Bytes);
+
+        var largeSource = new string('あ', 4000);
+        cache.RememberResolution(largeSource, "大译");
+        for (var index = 0; index < TranslationBudget.MaxReverseEntries; index++)
+            cache.RememberResolution("源する-" + Suffix(index), "译-" + Suffix(index));
+
+        Assert.False(cache.TryGetSourceForTranslatedValue("大译", out _));
+        Assert.True(cache.RetainedSnapshot.ReverseUtf8Bytes <= TranslationBudget.MaxReverseUtf8Bytes);
     }
 
     [Fact]
