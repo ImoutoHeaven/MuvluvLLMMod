@@ -444,3 +444,20 @@ pooled-cell F2 behaviour (item 7) and glyph fallback (item 1).
 8. Cache-directory permissions and graceful application-quit behaviour in this install.
 9. Real endpoint cancellation, model format compliance, latency, and translation quality.
 10. Chinese layout, clipping, wrapping, and style suitability after the font/style removal.
+
+## Follow-up — terminal enqueue guard mutation gap
+
+The orchestrator's independent mutation testing found that removing the
+`EnqueuePriority(string, long)` terminal-shutdown guard left the original **199-test** suite
+passing. Commit `c398c6a` adds terminal rejection coverage for all four enqueue overloads,
+including absence of retained backlog/retry state. The tests also pin `Initialize`'s terminal
+rejection. In throwaway Docker copies (the repository was never mutated), the results were:
+
+- `EnqueuePriority(string)`: baseline **201 passed**, mutant **198 passed / 3 failed**, restored **201 passed**.
+- `EnqueuePriority(string, long)`: baseline **201 passed**, mutant **199 passed / 2 failed**, restored **201 passed**.
+- `EnqueueNormal(string)`: baseline **201 passed**, mutant **200 passed / 1 failed**, restored **201 passed**.
+- `EnqueueNormal(string, long)`: baseline **201 passed**, mutant **200 passed / 1 failed**, restored **201 passed**.
+- `Initialize` terminal guard: mutant **200 passed / 1 failed**, restored **201 passed**.
+
+`ReloadMachineTranslator` was checked as well; its terminal path delegates to the already-tested
+terminal `MachineTranslatorLifecycle.Reload` rejection, so no additional unpinned guard was found.
