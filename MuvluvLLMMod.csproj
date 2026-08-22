@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <GameDir Condition="'$(GameDir)' == ''">/game</GameDir>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>MuvluvLLMMod</AssemblyName>
+    <Product>MuvluvLLMMod</Product>
+    <Version>1.0.0</Version>
+    <Authors>Jitsu</Authors>
+    <RootNamespace>MuvluvLLMMod</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ProduceReferenceAssembly>true</ProduceReferenceAssembly>
+    <DebugType>none</DebugType>
+    <RestoreAdditionalProjectSources>
+      https://api.nuget.org/v3/index.json;
+      https://nuget.bepinex.dev/v3/index.json;
+      https://nuget.samboy.dev/v3/index.json
+    </RestoreAdditionalProjectSources>
+  </PropertyGroup>
+  <ItemGroup>
+    <GameDlls Include="$(GameDir)/BepInEx/interop/*.dll" />
+    <Reference Include="@(GameDlls)">
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="BepInEx.Unity.IL2CPP" Version="6.0.0-be.*" IncludeAssets="compile" />
+    <PackageReference Include="BepInEx.PluginInfoProps" Version="2.*" />
+  </ItemGroup>
+</Project>

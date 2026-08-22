@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="xunit" Version="2.6.6" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.6" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\MuvluvLLMMod\MachineTranslator.cs" Link="Source\MachineTranslator.cs" />
+    <Compile Include="..\MuvluvLLMMod\TranslationWorkQueue.cs" Link="Source\TranslationWorkQueue.cs" />
+    <Compile Include="..\MuvluvLLMMod\MachineTranslatorLifecycle.cs" Link="Source\MachineTranslatorLifecycle.cs" />
+    <Compile Include="..\MuvluvLLMMod\TranslationPriorityBacklog.cs" Link="Source\TranslationPriorityBacklog.cs" />
+    <Compile Include="..\MuvluvLLMMod\OpenAiChatClient.cs" Link="Source\OpenAiChatClient.cs" />
+    <Compile Include="..\MuvluvLLMMod\TranslationRetryPolicy.cs" Link="Source\TranslationRetryPolicy.cs" />
+    <Compile Include="..\MuvluvLLMMod\RequestRateLimiter.cs" Link="Source\RequestRateLimiter.cs" />
+    <Compile Include="..\MuvluvLLMMod\TranslationProgress.cs" Link="Source\TranslationProgress.cs" />
+    <Compile Include="..\MuvluvLLMMod\OpenAiHttpClientFactory.cs" Link="Source\OpenAiHttpClientFactory.cs" />
+    <Compile Include="..\MuvluvLLMMod\TranslationCache.cs" Link="Source\TranslationCache.cs" />
+    <Compile Include="..\MuvluvLLMMod\TextTemplate.cs" Link="Source\TextTemplate.cs" />
+    <Compile Include="..\MuvluvLLMMod\TranslationResolver.cs" Link="Source\TranslationResolver.cs" />
+    <Compile Include="..\MuvluvLLMMod\ResolverCompatibility.cs" Link="Source\ResolverCompatibility.cs" />
+  </ItemGroup>
+</Project>
