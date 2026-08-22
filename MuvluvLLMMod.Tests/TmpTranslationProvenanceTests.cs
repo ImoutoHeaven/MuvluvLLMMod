@@ -60,6 +60,29 @@ public sealed class TmpTranslationProvenanceTests
     }
 
     [Fact]
+    public void External_origin_can_never_restore_even_with_intact_provenance()
+    {
+        var provenance = new TmpTranslationProvenance();
+        var instance = new object();
+        var assignment = provenance.BeginPluginRefresh(instance, 8);
+        provenance.Record(assignment, "确定", "確認する");
+
+        var displayed = "确定";
+        if (provenance.TryRestore(
+                assignment,
+                displayed,
+                TmpTextAssignmentOrigin.ExternalSetter,
+                _ => "確認する",
+                out var source))
+        {
+            displayed = source;
+        }
+
+        Assert.Equal("确定", displayed);
+        Assert.Equal(0, provenance.Count);
+    }
+
+    [Fact]
     public void Guarded_refresh_lookup_restores_only_intact_provenance()
     {
         var provenance = new TmpTranslationProvenance();
