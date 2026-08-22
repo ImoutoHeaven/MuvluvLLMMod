@@ -625,3 +625,21 @@ Docker validation used read-only source/game mounts and did not launch the game:
 PASS — `dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release`: 222 passed, 0 failed, 0 skipped.
 PASS — `dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game`: 0 warnings, 0 errors.
 ```
+
+## N-1 follow-up — DONE (commit `541c26f`)
+
+Harmony verification now produces a structured result for every required target: target discovery
+and ownership are both required. `Patch.Initialize` logs the exact target set and throws
+`HarmonyPatchVerificationException` on any missing target or owner; `Plugin.Load` therefore enters
+its existing generation cleanup path before Hotkey, persistence, or machine resources are started.
+The three remaining targets (TMP setter plus the two scenario-priority hooks) are all required.
+`PatchVerificationPolicyTests` simulates missing target and missing owner evidence, verifies the
+structured failure, and exercises rollback intent; production surface coverage pins verification
+before runtime resource creation.
+
+Docker validation used read-only source/game mounts and did not launch the game:
+
+```text
+PASS — `dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release`: 226 passed, 0 failed, 0 skipped.
+PASS — `dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game`: 0 warnings, 0 errors.
+```
