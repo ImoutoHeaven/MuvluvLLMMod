@@ -40,6 +40,19 @@ public static class Patch
         if (translatingTmp)
             return;
 
+        translatingTmp = true;
+        try
+        {
+            ResolveTmpValue(__instance, ref value);
+        }
+        finally
+        {
+            translatingTmp = false;
+        }
+    }
+
+    private static void ResolveTmpValue(TMP_Text __instance, ref string value)
+    {
         var instanceId = __instance.GetInstanceID();
         var current = __instance.text ?? string.Empty;
         tmpProvenance.InvalidateIfTextChanged(instanceId, current);
@@ -47,40 +60,32 @@ public static class Patch
         var original = value ?? string.Empty;
         var containsKana = TextTemplate.IsTranslationCandidate(original);
         var enqueueObservation = default(EnqueueObservation);
-        translatingTmp = true;
-        try
+        if (!string.IsNullOrEmpty(original))
         {
-            if (!string.IsNullOrEmpty(original))
+            if (Config.Translation.Value)
             {
-                if (Config.Translation.Value)
+                value = Translation.ResolveAny(original, enqueue: true);
+                enqueueObservation = Translation.LastEnqueueObservation;
+                if (!string.Equals(value, original, StringComparison.Ordinal))
+                    tmpProvenance.Record(instanceId, value, original);
+            }
+            else
+            {
+                Translation.ObserveForTranslation(original, isPlayingScenario);
+                enqueueObservation = Translation.LastEnqueueObservation;
+                // HARD RULE: string equality alone is insufficient: only restore an exact value
+                // recorded for this TMP instance, and only while the cache resolves it to its source.
+                if (tmpProvenance.TryRestore(
+                    instanceId,
+                    original,
+                    translatedValue => Core.Cache.TryGetSourceForTranslatedValue(translatedValue, out var source)
+                        ? source
+                        : null,
+                    out var source))
                 {
-                    value = Translation.ResolveAny(original, enqueue: true);
-                    enqueueObservation = Translation.LastEnqueueObservation;
-                    if (!string.Equals(value, original, StringComparison.Ordinal))
-                        tmpProvenance.Record(instanceId, value, original);
-                }
-                else
-                {
-                    Translation.ObserveForTranslation(original, isPlayingScenario);
-                    enqueueObservation = Translation.LastEnqueueObservation;
-                    // HARD RULE: string equality alone is insufficient: only restore an exact value
-                    // recorded for this TMP instance, and only while the cache resolves it to its source.
-                    if (tmpProvenance.TryRestore(
-                        instanceId,
-                        original,
-                        translatedValue => Core.Cache.TryGetSourceForTranslatedValue(translatedValue, out var source)
-                            ? source
-                            : null,
-                        out var source))
-                    {
-                        value = source;
-                    }
+                    value = source;
                 }
             }
-        }
-        finally
-        {
-            translatingTmp = false;
         }
 
         LogSeenText(original, containsKana, enqueueObservation);
@@ -115,9 +120,17 @@ public static class Patch
                 continue;
 
             var value = text.text ?? string.Empty;
-            TranslateTmpSetter(text, ref value);
-            if (!string.Equals(text.text, value, StringComparison.Ordinal))
-                text.text = value;
+            translatingTmp = true;
+            try
+            {
+                ResolveTmpValue(text, ref value);
+                if (!string.Equals(text.text, value, StringComparison.Ordinal))
+                    text.text = value;
+            }
+            finally
+            {
+                translatingTmp = false;
+            }
         }
 
         var elapsedMilliseconds = (Stopwatch.GetTimestamp() - started) * 1000d / Stopwatch.Frequency;
