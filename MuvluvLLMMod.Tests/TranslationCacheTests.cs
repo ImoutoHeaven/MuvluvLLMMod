@@ -173,8 +173,8 @@ public sealed class TranslationCacheTests : IDisposable
         var generatedAttempts = 0;
         var cache = new TranslationCache(root, writeAtomic: (path, _) =>
         {
-            if (Path.GetFileName(path) == "generated.zh_Hans.json") generatedAttempts++;
-            return generatedAttempts > 1;
+            if (Path.GetFileName(path) != "generated.zh_Hans.json") return true;
+            return ++generatedAttempts > 1;
         });
         cache.ObservePriority("再試行する", "再試行する");
         using var source = new CancellationTokenSource(TimeSpan.FromSeconds(2));
@@ -212,10 +212,8 @@ public sealed class TranslationCacheTests : IDisposable
             root,
             writeAtomic: (path, _) =>
             {
-                if (Path.GetFileName(path) == "generated.zh_Hans.json")
-                {
-                    lock (attempts) attempts.Add(DateTime.UtcNow);
-                }
+                if (Path.GetFileName(path) != "generated.zh_Hans.json") return true;
+                lock (attempts) attempts.Add(DateTime.UtcNow);
                 return false;
             },
             persistenceRetryDelay: TimeSpan.FromMilliseconds(80));

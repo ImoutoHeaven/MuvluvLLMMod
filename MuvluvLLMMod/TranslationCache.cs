@@ -19,11 +19,11 @@ public sealed class TranslationCache
         int PromotedPendingCount,
         long PromotedPendingUtf8Bytes);
 
-    public const int TerminalFlushMaxAttempts = 3;
+    public const int TerminalFlushMaxAttempts = 5;
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private readonly object gate = new();
-    private readonly object writerGate = new();
+    private readonly SemaphoreSlim writerGate = new(1, 1);
     private readonly SemaphoreSlim dirtySignal = new(0);
     private readonly Action<string>? diagnostic;
     private readonly BoundedDiagnostic budgetDiagnostic;
@@ -59,6 +59,20 @@ public sealed class TranslationCache
     private long mutationVersion;
     private long nextPendingGeneration;
 
+    public sealed class DurableSnapshot
+    {
+        public int Version { get; set; }
+        public Dictionary<string, string>? Generated { get; set; }
+        public string[]? Pending { get; set; }
+        public string[]? Raw { get; set; }
+    }
+
+    private sealed record LoadedSnapshot(
+        Dictionary<string, string> Generated,
+        string[] Pending,
+        string[] Raw,
+        bool Cleaned);
+
     public TranslationCache(
         string root,
         Action<string>? diagnostic = null,
@@ -75,12 +89,18 @@ public sealed class TranslationCache
         GeneratedPath = Path.Combine(root, "generated.zh_Hans.json");
         PendingPath = Path.Combine(root, "pending.zh_Hans.json");
         RawPath = Path.Combine(root, "dump", "ui_raw.json");
+        StatePath = Path.Combine(root, "cache.state.v1.json");
+        StateTemporaryPath = StatePath + ".tmp";
+        StateBackupPath = StatePath + ".bak";
     }
 
     public string Root { get; }
     public string GeneratedPath { get; }
     public string PendingPath { get; }
     public string RawPath { get; }
+    public string StatePath { get; }
+    public string StateTemporaryPath { get; }
+    public string StateBackupPath { get; }
 
     public BudgetSnapshot RetainedSnapshot
     {
@@ -277,9 +297,33 @@ public sealed class TranslationCache
 
     public void Load()
     {
-        var loadedGenerated = LoadGenerated(out var cleaned);
-        var loadedPending = LoadPending();
-        var loadedRaw = LoadRaw();
+        var state = LoadDurableSnapshot(out var hasStateArtifacts);
+        Dictionary<string, string> loadedGenerated;
+        string[] loadedPending;
+        string[] loadedRaw;
+        var cleaned = false;
+        if (state != null)
+        {
+            loadedGenerated = state.Generated;
+            loadedPending = state.Pending;
+            loadedRaw = state.Raw;
+            cleaned = state.Cleaned;
+        }
+        else if (hasStateArtifacts)
+        {
+            loadedGenerated = new Dictionary<string, string>(StringComparer.Ordinal);
+            loadedPending = Array.Empty<string>();
+            loadedRaw = Array.Empty<string>();
+            cleaned = true;
+        }
+        else
+        {
+            loadedGenerated = LoadGenerated(out cleaned);
+            var loadedPendingCleaned = false;
+            loadedPending = LoadPending(ref loadedPendingCleaned);
+            loadedRaw = LoadRaw(ref loadedPendingCleaned);
+            cleaned |= loadedPendingCleaned;
+        }
         lock (gate)
         {
             generated.Clear();
@@ -358,38 +402,79 @@ public sealed class TranslationCache
         }
     }
 
-    public bool FlushTerminal()
+    public bool FlushTerminal(TimeSpan? budget = null)
     {
+        var totalBudget = budget is { } value && value > TimeSpan.Zero
+            ? value
+            : TranslationBudget.DefaultTerminalFlushBudget;
+        var deadline = DateTime.UtcNow + totalBudget;
+        var delay = TimeSpan.FromMilliseconds(40);
         for (var attempt = 0; attempt < TerminalFlushMaxAttempts; attempt++)
         {
-            if (Flush()) return true;
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+                break;
+            if (FlushCore(remaining)) return true;
+            if (attempt + 1 >= TerminalFlushMaxAttempts)
+                break;
+            remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+                break;
+            Thread.Sleep(remaining < delay ? remaining : delay);
+            delay = TimeSpan.FromMilliseconds(Math.Min(500, delay.TotalMilliseconds * 2));
         }
         return false;
     }
 
-    public bool Flush()
+    public bool Flush() => FlushCore(null);
+
+    private bool FlushCore(TimeSpan? writerWait)
     {
-        lock (writerGate)
+        var entered = writerWait.HasValue
+            ? writerGate.Wait(writerWait.Value)
+            : writerGate.Wait(Timeout.InfiniteTimeSpan);
+        if (!entered)
+        {
+            ReportBudget("cache-writer-gate", "cache persistence writer was still busy at the terminal deadline.");
+            return false;
+        }
+
+        try
         {
             Dictionary<string, string> generatedSnapshot;
             string[] pendingSnapshot;
-            Dictionary<string, string> rawSnapshot;
+            string[] rawSnapshot;
             long snapshotVersion;
             lock (gate)
             {
                 if (!dirty) return true;
                 generatedSnapshot = new Dictionary<string, string>(generated, StringComparer.Ordinal);
                 pendingSnapshot = pending.ToArray();
-                rawSnapshot = raw.ToDictionary(value => value, _ => string.Empty, StringComparer.Ordinal);
+                rawSnapshot = raw.ToArray();
                 snapshotVersion = mutationVersion;
             }
 
+            var stateJson = SerializeBounded(
+                new DurableSnapshot
+                {
+                    Version = 1,
+                    Generated = generatedSnapshot,
+                    Pending = pendingSnapshot,
+                    Raw = rawSnapshot
+                },
+                StatePath);
             var generatedJson = SerializeBounded(generatedSnapshot, GeneratedPath);
             var pendingJson = SerializeBounded(pendingSnapshot, PendingPath);
-            var rawJson = SerializeBounded(rawSnapshot, RawPath);
-            var succeeded = generatedJson != null
+            var rawJson = SerializeBounded(
+                rawSnapshot.ToDictionary(value => value, _ => string.Empty, StringComparer.Ordinal),
+                RawPath);
+            var succeeded = stateJson != null
+                && generatedJson != null
                 && pendingJson != null
                 && rawJson != null
+                // The single state file is authoritative. The three legacy mirrors remain for
+                // older releases, but a crash between mirrors can never create a mixed load.
+                && TryWriteAtomic(StatePath, stateJson, preserveRecovery: true)
                 && TryWriteAtomic(GeneratedPath, generatedJson)
                 && TryWriteAtomic(PendingPath, pendingJson)
                 && TryWriteAtomic(RawPath, rawJson);
@@ -404,6 +489,10 @@ public sealed class TranslationCache
                 SignalDirtyUnsafe();
                 return false;
             }
+        }
+        finally
+        {
+            writerGate.Release();
         }
     }
 
@@ -667,6 +756,130 @@ public sealed class TranslationCache
         return true;
     }
 
+    private LoadedSnapshot? LoadDurableSnapshot(out bool hasStateArtifacts)
+    {
+        hasStateArtifacts = File.Exists(StatePath)
+            || File.Exists(StateTemporaryPath)
+            || File.Exists(StateBackupPath);
+        if (!hasStateArtifacts)
+            return null;
+
+        foreach (var path in new[] { StatePath, StateTemporaryPath, StateBackupPath })
+        {
+            var cleaned = false;
+            var text = ReadBoundedText(path, ref cleaned);
+            if (text == null)
+                continue;
+            try
+            {
+                var snapshot = JsonSerializer.Deserialize<DurableSnapshot>(text);
+                if (snapshot?.Version != 1
+                    || snapshot.Generated == null
+                    || snapshot.Pending == null
+                    || snapshot.Raw == null)
+                {
+                    ReportBudget("cache-state", "cache state snapshot was incomplete; trying the next recovery epoch.");
+                    continue;
+                }
+
+                var generated = FilterGenerated(snapshot.Generated, ref cleaned);
+                var pending = FilterPending(snapshot.Pending, ref cleaned);
+                var raw = FilterRaw(snapshot.Raw, ref cleaned);
+                if (!string.Equals(path, StatePath, StringComparison.Ordinal))
+                    cleaned = true;
+                return new LoadedSnapshot(generated, pending, raw, cleaned);
+            }
+            catch (Exception exception) when (exception is JsonException or NotSupportedException)
+            {
+                SafeDiagnostic(path, exception);
+            }
+        }
+
+        // Do not combine legacy files after a state artifact was observed: that would create a
+        // generated/new-pending/raw mixed epoch. The next observable render can safely rebuild
+        // missing entries, and the next flush writes one coherent state.
+        return new LoadedSnapshot(
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            Array.Empty<string>(),
+            Array.Empty<string>(),
+            true);
+    }
+
+    private Dictionary<string, string> FilterGenerated(
+        IReadOnlyDictionary<string, string> loaded,
+        ref bool cleaned)
+    {
+        var valid = new Dictionary<string, string>(StringComparer.Ordinal);
+        var retainedBytes = 0L;
+        foreach (var entry in loaded)
+        {
+            if (!IsValidGeneratedPair(entry.Key, entry.Value))
+            {
+                cleaned = true;
+                continue;
+            }
+            var bytes = Utf8Bytes(entry.Key) + Utf8Bytes(entry.Value!);
+            if (valid.Count >= TranslationBudget.MaxGeneratedEntries
+                || retainedBytes + bytes > TranslationBudget.MaxGeneratedUtf8Bytes)
+            {
+                cleaned = true;
+                continue;
+            }
+            valid[entry.Key] = entry.Value!;
+            retainedBytes += bytes;
+        }
+        return valid;
+    }
+
+    private string[] FilterPending(IEnumerable<string?> loaded, ref bool cleaned)
+    {
+        var valid = new List<string>();
+        var bytes = 0L;
+        foreach (var template in loaded)
+        {
+            if (template == null
+                || !TextTemplate.IsTranslationCandidate(template)
+                || valid.Count >= TranslationBudget.MaxPendingEntries
+                || bytes + Utf8Bytes(template) > TranslationBudget.MaxPendingUtf8Bytes
+                || valid.Contains(template, StringComparer.Ordinal))
+            {
+                cleaned = true;
+                continue;
+            }
+            valid.Add(template);
+            bytes += Utf8Bytes(template);
+        }
+        return valid.ToArray();
+    }
+
+    private string[] FilterRaw(IEnumerable<string> loaded, ref bool cleaned)
+    {
+        var valid = new List<string>();
+        var bytes = 0L;
+        foreach (var value in loaded)
+        {
+            if (!TextTemplate.IsTranslationCandidate(value))
+            {
+                cleaned = true;
+                continue;
+            }
+            var normalized = TextTemplate.Normalize(value).Template;
+            var normalizedBytes = Utf8Bytes(normalized);
+            if (valid.Count >= TranslationBudget.MaxRawEntries
+                || bytes + normalizedBytes > TranslationBudget.MaxRawUtf8Bytes)
+            {
+                cleaned = true;
+                continue;
+            }
+            if (!valid.Contains(normalized, StringComparer.Ordinal))
+            {
+                valid.Add(normalized);
+                bytes += normalizedBytes;
+            }
+        }
+        return valid.ToArray();
+    }
+
     private Dictionary<string, string> LoadGenerated(out bool cleaned)
     {
         cleaned = false;
@@ -705,9 +918,8 @@ public sealed class TranslationCache
         }
     }
 
-    private string[] LoadPending()
+    private string[] LoadPending(ref bool cleaned)
     {
-        var cleaned = false;
         var text = ReadBoundedText(PendingPath, ref cleaned);
         if (text == null) return Array.Empty<string>();
         try
@@ -719,10 +931,12 @@ public sealed class TranslationCache
             {
                 if (!TextTemplate.IsTranslationCandidate(template)
                     || valid.Count >= TranslationBudget.MaxPendingEntries
-                    || bytes + Utf8Bytes(template) > TranslationBudget.MaxPendingUtf8Bytes)
+                    || bytes + Utf8Bytes(template) > TranslationBudget.MaxPendingUtf8Bytes
+                    || valid.Contains(template, StringComparer.Ordinal))
+                {
+                    cleaned = true;
                     continue;
-                if (valid.Contains(template, StringComparer.Ordinal))
-                    continue;
+                }
                 valid.Add(template);
                 bytes += Utf8Bytes(template);
             }
@@ -730,14 +944,14 @@ public sealed class TranslationCache
         }
         catch (Exception exception) when (exception is JsonException or NotSupportedException)
         {
+            cleaned = true;
             SafeDiagnostic(PendingPath, exception);
             return Array.Empty<string>();
         }
     }
 
-    private string[] LoadRaw()
+    private string[] LoadRaw(ref bool cleaned)
     {
-        var cleaned = false;
         var text = ReadBoundedText(RawPath, ref cleaned);
         if (text == null) return Array.Empty<string>();
         try
@@ -749,22 +963,31 @@ public sealed class TranslationCache
             foreach (var value in values.Keys)
             {
                 if (!TextTemplate.IsTranslationCandidate(value))
+                {
+                    cleaned = true;
                     continue;
+                }
                 var normalized = TextTemplate.Normalize(value).Template;
                 var normalizedBytes = Utf8Bytes(normalized);
                 if (valid.Count >= TranslationBudget.MaxRawEntries
                     || bytes + normalizedBytes > TranslationBudget.MaxRawUtf8Bytes)
+                {
+                    cleaned = true;
                     continue;
+                }
                 if (!valid.Contains(normalized, StringComparer.Ordinal))
                 {
                     valid.Add(normalized);
                     bytes += normalizedBytes;
                 }
+                else
+                    cleaned = true;
             }
             return valid.ToArray();
         }
         catch (Exception exception) when (exception is JsonException or NotSupportedException)
         {
+            cleaned = true;
             SafeDiagnostic(RawPath, exception);
             return Array.Empty<string>();
         }
@@ -798,7 +1021,8 @@ public sealed class TranslationCache
                 }
                 bytes.Write(buffer, 0, read);
             }
-            return StrictUtf8.GetString(bytes.GetBuffer(), 0, checked((int)bytes.Length));
+            var text = StrictUtf8.GetString(bytes.GetBuffer(), 0, checked((int)bytes.Length));
+            return text.Length > 0 && text[0] == '\uFEFF' ? text[1..] : text;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or DecoderFallbackException)
         {
@@ -827,8 +1051,14 @@ public sealed class TranslationCache
         }
     }
 
-    private bool TryWriteAtomic(string path, string json)
+    private bool TryWriteAtomic(string path, string json, bool preserveRecovery = false)
     {
+        if (StrictUtf8.GetByteCount(json) > TranslationBudget.MaxCacheFileBytes)
+        {
+            ReportBudget("cache-write-size", Path.GetFileName(path) + " exceeded the bounded cache file size; persistence was rejected.");
+            return false;
+        }
+
         if (writeAtomic != null)
         {
             try { return writeAtomic(path, json); }
@@ -842,6 +1072,14 @@ public sealed class TranslationCache
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            if (preserveRecovery && File.Exists(path))
+            {
+                try { File.Copy(path, path + ".bak", true); }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    SafeDiagnostic(path, exception);
+                }
+            }
             File.WriteAllText(temporary, json, StrictUtf8);
             File.Move(temporary, path, true);
             return true;
@@ -849,7 +1087,12 @@ public sealed class TranslationCache
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             SafeDiagnostic(path, exception);
-            try { if (File.Exists(temporary)) File.Delete(temporary); } catch { }
+            // Keep the canonical temp snapshot as a recoverable journal. Legacy mirrors use the
+            // old cleanup behavior because they are never selected over a valid state snapshot.
+            if (!preserveRecovery)
+            {
+                try { if (File.Exists(temporary)) File.Delete(temporary); } catch { }
+            }
             return false;
         }
     }

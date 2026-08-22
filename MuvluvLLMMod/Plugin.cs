@@ -249,8 +249,9 @@ public sealed class Plugin : BasePlugin
                 if (resources?.Cache == null || resources.Cache.FlushTerminal())
                     return;
                 SafeError(
-                    $"[LLM] Terminal cache flush failed after {TranslationCache.TerminalFlushMaxAttempts} attempts; "
-                    + "dirty cache data may be unrecoverable");
+                    $"[LLM] Terminal cache flush failed within the {TranslationBudget.DefaultTerminalFlushBudget.TotalSeconds:F0}s "
+                    + $"shutdown budget ({TranslationCache.TerminalFlushMaxAttempts} paced attempts); "
+                    + "dirty cache data may be recoverable from the state journal");
                 throw new InvalidOperationException("terminal cache flush failed");
             },
             ref succeeded);
@@ -294,11 +295,29 @@ public sealed class Plugin : BasePlugin
             return;
 
         var cancellation = resources.PersistenceCancellation;
+        var persistenceTask = resources.PersistenceTask;
         resources.PersistenceCancellation = null;
+        cancellation.Cancel();
+        if (!persistenceTask.Wait(TranslationBudget.DefaultShutdownTimeout))
+        {
+            // A writer may be in synchronous filesystem code. Do not dispose its CTS while the
+            // task can still observe it; retain an observation/cleanup continuation and let the
+            // terminal flush report the generation failure if the gate remains occupied.
+            _ = persistenceTask.ContinueWith(
+                completed =>
+                {
+                    _ = completed.Exception;
+                    cancellation.Dispose();
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+            throw new TimeoutException("cache persistence did not stop before the shutdown budget");
+        }
+
         try
         {
-            cancellation.Cancel();
-            resources.PersistenceTask.GetAwaiter().GetResult();
+            persistenceTask.GetAwaiter().GetResult();
         }
         finally
         {
