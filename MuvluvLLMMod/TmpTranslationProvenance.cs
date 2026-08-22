@@ -63,16 +63,18 @@ public sealed class TmpTranslationProvenance
 
     private sealed class Entry
     {
-        public Entry(long generation, string translatedValue, string source)
+        public Entry(long generation, string translatedValue, string source, int utf8Bytes)
         {
             Generation = generation;
             TranslatedValue = translatedValue;
             Source = source;
+            Utf8Bytes = utf8Bytes;
         }
 
         public long Generation { get; }
         public string TranslatedValue { get; }
         public string Source { get; }
+        public int Utf8Bytes { get; }
     }
 
     private sealed class ReferenceComparer : IEqualityComparer<object>
@@ -90,6 +92,7 @@ public sealed class TmpTranslationProvenance
         new(ReferenceComparer.Instance);
     private readonly LinkedList<Slot> lru = new();
     private int provenanceCount;
+    private long provenanceUtf8Bytes;
     private long nextGeneration;
     private long lifecycleEpoch = 1;
 
@@ -98,7 +101,7 @@ public sealed class TmpTranslationProvenance
         if (capacity <= 0)
             throw new ArgumentOutOfRangeException(nameof(capacity));
 
-        this.capacity = capacity;
+        this.capacity = Math.Min(capacity, TranslationBudget.MaxProvenanceEntries);
     }
 
     public int Count
@@ -119,6 +122,15 @@ public sealed class TmpTranslationProvenance
         }
     }
 
+    public long RetainedUtf8Bytes
+    {
+        get
+        {
+            lock (gate)
+                return provenanceUtf8Bytes;
+        }
+    }
+
     /// <summary>
     /// Retires every identity and assignment generation from the current plugin lifecycle.
     /// The epoch changes even if the same object and instance ID are used after a reload.
@@ -131,6 +143,7 @@ public sealed class TmpTranslationProvenance
             slots.Clear();
             lru.Clear();
             provenanceCount = 0;
+            provenanceUtf8Bytes = 0;
             nextGeneration = 0;
         }
     }
@@ -181,19 +194,37 @@ public sealed class TmpTranslationProvenance
     /// </summary>
     public void Record(TmpTextAssignment assignment, string translatedValue, string source)
     {
-        if (string.IsNullOrEmpty(translatedValue)
-            || string.IsNullOrEmpty(source)
-            || string.Equals(translatedValue, source, StringComparison.Ordinal))
-            return;
-
         lock (gate)
         {
             if (!TryGetCurrentSlotUnsafe(assignment, out var slot))
                 return;
 
+            // A failed budget check is also an invalid assignment for restoration purposes:
+            // discard any previous value before returning so an old translation cannot revive.
             ClearEntryUnsafe(slot);
-            slot.Entry = new Entry(assignment.Generation, translatedValue, source);
+            if (string.IsNullOrEmpty(translatedValue)
+                || string.IsNullOrEmpty(source)
+                || string.Equals(translatedValue, source, StringComparison.Ordinal)
+                || !TranslationBudget.TryGetPairBytes(source, translatedValue, out var entryBytes)
+                || entryBytes > TranslationBudget.MaxProvenanceUtf8Bytes)
+            {
+                TouchUnsafe(slot);
+                return;
+            }
+
+            while (provenanceUtf8Bytes + entryBytes > TranslationBudget.MaxProvenanceUtf8Bytes)
+            {
+                var oldest = lru.First;
+                while (oldest != null && oldest.Value.Entry == null)
+                    oldest = oldest.Next;
+                if (oldest == null)
+                    return;
+                ClearEntryUnsafe(oldest.Value);
+            }
+
+            slot.Entry = new Entry(assignment.Generation, translatedValue, source, entryBytes);
             provenanceCount++;
+            provenanceUtf8Bytes += entryBytes;
             TouchUnsafe(slot);
         }
     }
@@ -325,7 +356,10 @@ public sealed class TmpTranslationProvenance
         if (slot.Entry == null)
             return;
 
+        var entry = slot.Entry;
         slot.Entry = null;
         provenanceCount--;
+        provenanceUtf8Bytes -= entry.Utf8Bytes;
+        if (provenanceUtf8Bytes < 0) provenanceUtf8Bytes = 0;
     }
 }

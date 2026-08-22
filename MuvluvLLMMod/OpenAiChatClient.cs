@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -33,6 +34,7 @@ public sealed class OpenAiChatClient
     private readonly OpenAiChatSettings settings;
     private readonly RequestRateLimiter limiter;
     private readonly Action<string>? diagnostic;
+    private readonly BoundedDiagnostic budgetDiagnostic;
 
     public OpenAiChatClient(
         HttpClient client,
@@ -44,10 +46,19 @@ public sealed class OpenAiChatClient
         this.settings = settings;
         this.limiter = limiter;
         this.diagnostic = diagnostic;
+        budgetDiagnostic = new BoundedDiagnostic(diagnostic);
     }
 
     public async Task<string?> TranslateAsync(string sourceTemplate, CancellationToken token)
     {
+        if (!TranslationBudget.IsTextWithinBudget(sourceTemplate))
+        {
+            budgetDiagnostic.Report(
+                "llm-source-budget",
+                "LLM source text exceeded the bounded input budget; translation was skipped.");
+            return null;
+        }
+
         if (string.IsNullOrWhiteSpace(settings.Model) || !EndpointPolicy.TryValidate(settings.Endpoint, out var endpoint))
         {
             diagnostic?.Invoke("LLM endpoint or model is invalid; remote plaintext HTTP is not permitted.");
@@ -55,7 +66,7 @@ public sealed class OpenAiChatClient
         }
 
         var protectedText = TextTemplate.ProtectForLlm(sourceTemplate);
-        var attempts = Math.Max(1, settings.RetryCount);
+        var attempts = Math.Clamp(settings.RetryCount, 1, 8);
         for (var attempt = 1; attempt <= attempts; attempt++)
         {
             try
@@ -90,6 +101,36 @@ public sealed class OpenAiChatClient
         return null;
     }
 
+    private async Task<string> ReadContentBoundedAsync(HttpContent content, CancellationToken token)
+    {
+        if (content.Headers.ContentLength is > TranslationBudget.MaxResponseBodyBytes)
+            throw new InvalidOperationException("LLM response body exceeded the bounded response budget.");
+
+        await using var stream = await content.ReadAsStreamAsync(token).ConfigureAwait(false);
+        var buffer = ArrayPool<byte>.Shared.Rent(Math.Min(8192, TranslationBudget.MaxResponseBodyBytes));
+        try
+        {
+            using var result = new MemoryStream();
+            while (true)
+            {
+                var read = await stream.ReadAsync(
+                    buffer.AsMemory(0, Math.Min(buffer.Length, TranslationBudget.MaxResponseBodyBytes)),
+                    token).ConfigureAwait(false);
+                if (read == 0)
+                    break;
+                if (result.Length + read > TranslationBudget.MaxResponseBodyBytes)
+                    throw new InvalidOperationException("LLM response body exceeded the bounded response budget.");
+                result.Write(buffer, 0, read);
+            }
+
+            return Encoding.UTF8.GetString(result.GetBuffer(), 0, checked((int)result.Length));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
     private async Task<string?> SendAsync(Uri endpoint, string text, CancellationToken token)
     {
         var body = new
@@ -114,7 +155,7 @@ public sealed class OpenAiChatClient
 
         using var response = await limiter.StartAsync(() => client.SendAsync(request, token), token).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode) throw new HttpRequestException("LLM endpoint returned a non-success status.");
-        var json = await response.Content.ReadAsStringAsync(token).ConfigureAwait(false);
+        var json = await ReadContentBoundedAsync(response.Content, token).ConfigureAwait(false);
         using var document = JsonDocument.Parse(json);
         return document.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
     }

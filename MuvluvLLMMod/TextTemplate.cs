@@ -28,6 +28,9 @@ public static class TextTemplate
 
     public static (string Template, string[] Values, int NumericPlaceholderStart) Normalize(string text)
     {
+        if (!TranslationBudget.IsTextWithinBudget(text))
+            return (text, Array.Empty<string>(), -1);
+
         var placeholders = Placeholder.Matches(text);
         if (!TryGetPlaceholderIndices(placeholders, out var indices)) return (text, Array.Empty<string>(), -1);
         var values = new List<string>();
@@ -52,13 +55,18 @@ public static class TextTemplate
 
     public static string? Fill(string translatedTemplate, string[] values)
     {
+        if (!TranslationBudget.IsTextWithinBudget(translatedTemplate)
+            || values.Any(value => !TranslationBudget.IsTextWithinBudget(value)))
+            return null;
         if (values.Length == 0) return translatedTemplate;
         return Fill(translatedTemplate, values, 0);
     }
 
     public static string? Fill(string translatedTemplate, string[] values, int numericPlaceholderStart)
     {
-        if (numericPlaceholderStart < 0) return null;
+        if (!TranslationBudget.IsTextWithinBudget(translatedTemplate)
+            || values.Any(value => !TranslationBudget.IsTextWithinBudget(value))
+            || numericPlaceholderStart < 0) return null;
         var matches = Placeholder.Matches(translatedTemplate);
         if (!TryGetPlaceholderIndices(matches, out var indices)) return null;
         if (values.Length > 0
@@ -75,6 +83,10 @@ public static class TextTemplate
 
     public static bool HasSamePlaceholders(string sourceTemplate, string translatedTemplate)
     {
+        if (!TranslationBudget.IsTextWithinBudget(sourceTemplate)
+            || !TranslationBudget.IsTextWithinBudget(translatedTemplate))
+            return false;
+
         var source = Placeholder.Matches(sourceTemplate);
         var translated = Placeholder.Matches(translatedTemplate);
         return TryGetPlaceholderIndices(source, out _)
@@ -85,6 +97,10 @@ public static class TextTemplate
 
     public static bool HasSameMarkup(string source, string translated)
     {
+        if (!TranslationBudget.IsTextWithinBudget(source)
+            || !TranslationBudget.IsTextWithinBudget(translated))
+            return false;
+
         if (!Tag.Matches(source).Select(match => match.Value)
             .SequenceEqual(Tag.Matches(translated).Select(match => match.Value), StringComparer.Ordinal)) return false;
         if (!LineBreak.Matches(source).Select(match => match.Value)
@@ -102,7 +118,7 @@ public static class TextTemplate
 
     public static bool IsTranslationCandidate(string text)
     {
-        if (string.IsNullOrWhiteSpace(text)) return false;
+        if (!TranslationBudget.IsTextWithinBudget(text) || string.IsNullOrWhiteSpace(text)) return false;
         foreach (var character in text)
         {
             if ((character >= '\u3041' && character <= '\u3096')
@@ -116,6 +132,9 @@ public static class TextTemplate
 
     public static LlmProtectedText ProtectForLlm(string text)
     {
+        if (!TranslationBudget.IsTextWithinBudget(text))
+            return new LlmProtectedText(string.Empty, Array.Empty<string>(), Array.Empty<string>());
+
         var tokens = new List<string>();
         var originals = new List<string>();
         var prompt = FormatToken.Replace(text, match =>
@@ -131,7 +150,9 @@ public static class TextTemplate
     public static bool TryRestoreLlm(string response, LlmProtectedText protectedText, out string restored)
     {
         restored = string.Empty;
-        if (FormatToken.IsMatch(response)) return false;
+        if (!TranslationBudget.IsTextWithinBudget(response)
+            || !TranslationBudget.IsTextWithinBudget(protectedText.Prompt)
+            || FormatToken.IsMatch(response)) return false;
         if (!protectedText.Tokens.SequenceEqual(
                 ProtectedToken.Matches(response).Select(match => match.Value),
                 StringComparer.Ordinal)) return false;
@@ -141,7 +162,7 @@ public static class TextTemplate
         {
             restored = restored.Replace(protectedText.Tokens[index], protectedText.Originals[index], StringComparison.Ordinal);
         }
-        return true;
+        return TranslationBudget.IsTextWithinBudget(restored);
     }
 
     private static bool TryGetPlaceholderIndices(MatchCollection matches, out int[] indices)

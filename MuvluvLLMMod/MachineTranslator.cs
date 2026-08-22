@@ -29,7 +29,7 @@ public sealed class MachineTranslator : IDisposable
     {
         this.cache = cache;
         this.translate = translate;
-        this.maxInFlight = Math.Max(1, maxInFlight);
+        this.maxInFlight = TranslationBudget.ClampMaxInFlight(maxInFlight);
         this.translatePeriod = translatePeriod > TimeSpan.Zero ? translatePeriod : TimeSpan.FromMilliseconds(100);
         this.priorityBacklog = priorityBacklog ?? new TranslationPriorityBacklog();
         this.diagnostic = diagnostic;

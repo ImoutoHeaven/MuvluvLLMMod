@@ -8,6 +8,9 @@ public sealed class TranslationRetryPolicy
 
     private readonly object gate = new();
     private readonly Dictionary<string, State> states = new(StringComparer.Ordinal);
+    private readonly LinkedList<string> stateLru = new();
+    private readonly Dictionary<string, LinkedListNode<string>> stateNodes = new(StringComparer.Ordinal);
+    private long retainedUtf8Bytes;
     private readonly int maxFailures;
     private readonly TimeSpan initialDelay;
     private readonly TimeSpan maximumDelay;
@@ -34,10 +37,22 @@ public sealed class TranslationRetryPolicy
         }
     }
 
+    public int StateCount
+    {
+        get { lock (gate) return states.Count; }
+    }
+
+    public long RetainedUtf8Bytes
+    {
+        get { lock (gate) return retainedUtf8Bytes; }
+    }
+
     public bool CanAttempt(string template)
     {
+        if (!TranslationBudget.IsTextWithinBudget(template)) return false;
         lock (gate)
         {
+            TouchUnsafe(template);
             return CanAttemptUnsafe(template);
         }
     }
@@ -49,6 +64,11 @@ public sealed class TranslationRetryPolicy
 
     public bool TrySchedule(string template, Func<bool> schedule, out bool retryLater)
     {
+        if (!TranslationBudget.IsTextWithinBudget(template))
+        {
+            retryLater = false;
+            return false;
+        }
         lock (gate)
         {
             if (!states.TryGetValue(template, out var state))
@@ -56,6 +76,7 @@ public sealed class TranslationRetryPolicy
                 retryLater = false;
                 return schedule();
             }
+            TouchUnsafe(template);
             if (state.Blocked)
             {
                 retryLater = false;
@@ -73,9 +94,15 @@ public sealed class TranslationRetryPolicy
 
     public bool TryRetain(string template, Func<bool> retain)
     {
+        if (!TranslationBudget.IsTextWithinBudget(template)) return false;
         lock (gate)
         {
-            return (!states.TryGetValue(template, out var state) || !state.Blocked) && retain();
+            if (states.TryGetValue(template, out var state))
+            {
+                TouchUnsafe(template);
+                if (state.Blocked) return false;
+            }
+            return retain();
         }
     }
 
@@ -86,7 +113,13 @@ public sealed class TranslationRetryPolicy
             var failures = states.TryGetValue(template, out var previous) ? previous.Failures + 1 : 1;
             var blocked = failures >= maxFailures;
             var delay = blocked ? TimeSpan.Zero : BackoffDelay(failures);
-            states[template] = new State(failures, utcNow() + delay, blocked);
+            if (TranslationBudget.IsTextWithinBudget(template)
+                && TranslationBudget.TryGetTextBytes(template, out var bytes)
+                && EnsureCapacityUnsafe(bytes, template))
+            {
+                states[template] = new State(failures, utcNow() + delay, blocked);
+                TouchUnsafe(template);
+            }
             return new TranslationRetryDecision(failures, delay, blocked);
         }
     }
@@ -95,7 +128,8 @@ public sealed class TranslationRetryPolicy
     {
         lock (gate)
         {
-            if (states.TryGetValue(template, out var state) && !state.Blocked) states.Remove(template);
+            if (states.TryGetValue(template, out var state) && !state.Blocked)
+                RemoveUnsafe(template);
         }
     }
 
@@ -111,4 +145,47 @@ public sealed class TranslationRetryPolicy
     private bool CanAttemptUnsafe(string template) =>
         !states.TryGetValue(template, out var state)
         || (!state.Blocked && utcNow() >= state.RetryAfter);
+
+    private bool EnsureCapacityUnsafe(int bytes, string template)
+    {
+        if (bytes > TranslationBudget.MaxRetryStateUtf8Bytes)
+            return false;
+        if (stateNodes.ContainsKey(template))
+            return true;
+        while (stateNodes.Count >= TranslationBudget.MaxRetryStates
+            || retainedUtf8Bytes + bytes > TranslationBudget.MaxRetryStateUtf8Bytes)
+        {
+            if (stateLru.First == null)
+                return false;
+            RemoveUnsafe(stateLru.First.Value);
+        }
+        return true;
+    }
+
+    private void TouchUnsafe(string template)
+    {
+        if (stateNodes.TryGetValue(template, out var node))
+        {
+            stateLru.Remove(node);
+            stateLru.AddLast(node);
+            return;
+        }
+
+        if (!states.ContainsKey(template)
+            || !TranslationBudget.TryGetTextBytes(template, out var bytes)
+            || !EnsureCapacityUnsafe(bytes, template))
+            return;
+        var added = stateLru.AddLast(template);
+        stateNodes[template] = added;
+        retainedUtf8Bytes += bytes;
+    }
+
+    private void RemoveUnsafe(string template)
+    {
+        states.Remove(template);
+        if (stateNodes.Remove(template, out var node))
+            stateLru.Remove(node);
+        if (TranslationBudget.TryGetTextBytes(template, out var bytes))
+            retainedUtf8Bytes = Math.Max(0, retainedUtf8Bytes - bytes);
+    }
 }

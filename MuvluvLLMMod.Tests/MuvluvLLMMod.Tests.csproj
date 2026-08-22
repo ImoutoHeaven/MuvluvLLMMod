@@ -24,6 +24,7 @@
     <Compile Include="..\MuvluvLLMMod\RequestRateLimiter.cs" Link="Source\RequestRateLimiter.cs" />
     <Compile Include="..\MuvluvLLMMod\TranslationProgress.cs" Link="Source\TranslationProgress.cs" />
     <Compile Include="..\MuvluvLLMMod\OpenAiHttpClientFactory.cs" Link="Source\OpenAiHttpClientFactory.cs" />
+    <Compile Include="..\MuvluvLLMMod\TranslationBudget.cs" Link="Source\TranslationBudget.cs" />
     <Compile Include="..\MuvluvLLMMod\TranslationCache.cs" Link="Source\TranslationCache.cs" />
     <Compile Include="..\MuvluvLLMMod\TextTemplate.cs" Link="Source\TextTemplate.cs" />
     <Compile Include="..\MuvluvLLMMod\TranslationResolver.cs" Link="Source\TranslationResolver.cs" />

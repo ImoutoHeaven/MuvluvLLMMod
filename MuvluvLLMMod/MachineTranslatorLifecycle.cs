@@ -5,6 +5,9 @@ public sealed class MachineTranslatorLifecycle
     private readonly object gate = new();
     private readonly TranslationPriorityBacklog priorityBacklog = new();
     private readonly Dictionary<string, (long Backlog, long Pending)> transitionCancellationCutoffs = new(StringComparer.Ordinal);
+    private readonly LinkedList<string> transitionCancellationOrder = new();
+    private readonly Dictionary<string, LinkedListNode<string>> transitionCancellationNodes = new(StringComparer.Ordinal);
+    private long transitionCancellationUtf8Bytes;
     private readonly Action<Exception>? diagnostic;
     private TranslationRetryPolicy? retryPolicy;
     private MachineTranslator? current;
@@ -33,6 +36,11 @@ public sealed class MachineTranslatorLifecycle
     public bool IsShutdown
     {
         get { lock (gate) return shutdown; }
+    }
+
+    public long RetainedCancellationUtf8Bytes
+    {
+        get { lock (gate) return transitionCancellationUtf8Bytes; }
     }
 
     public (int Completed, int InFlight, int Failed) ProgressSnapshot
@@ -97,7 +105,7 @@ public sealed class MachineTranslatorLifecycle
     {
         lock (gate)
         {
-            if (shutdown || !initialized)
+            if (shutdown || !initialized || transitionsInFlight >= TranslationBudget.MaxTransitions)
                 return false;
 
             if (nextRetryPolicy != null)
@@ -174,11 +182,18 @@ public sealed class MachineTranslatorLifecycle
             if (transitionsInFlight == 0)
                 return canceled;
             if (!transitionCancellationCutoffs.TryGetValue(template, out var existing))
-                transitionCancellationCutoffs[template] = (backlogCancellation.Cutoff, pendingGeneration);
+            {
+                AddTransitionCancellationUnsafe(
+                    template,
+                    (backlogCancellation.Cutoff, pendingGeneration));
+            }
             else
+            {
                 transitionCancellationCutoffs[template] = (
                     Math.Max(existing.Backlog, backlogCancellation.Cutoff),
                     Math.Max(existing.Pending, pendingGeneration));
+                TouchTransitionCancellationUnsafe(template);
+            }
             return true;
         }
     }
@@ -236,7 +251,7 @@ public sealed class MachineTranslatorLifecycle
             current = null;
             stopping = null;
             limiter = null;
-            transitionCancellationCutoffs.Clear();
+            ClearTransitionCancellationsUnsafe();
         }
 
         if (failure != null)
@@ -312,7 +327,7 @@ public sealed class MachineTranslatorLifecycle
                 FilterTransitionCancellationsUnsafe();
                 transitionsInFlight--;
                 if (transitionsInFlight == 0)
-                    transitionCancellationCutoffs.Clear();
+                    ClearTransitionCancellationsUnsafe();
             }
         }
     }
@@ -338,6 +353,46 @@ public sealed class MachineTranslatorLifecycle
     {
         foreach (var entry in transitionCancellationCutoffs)
             priorityBacklog.CancelThrough(entry.Key, entry.Value.Backlog, entry.Value.Pending);
+    }
+
+    private void AddTransitionCancellationUnsafe(
+        string template,
+        (long Backlog, long Pending) cutoff)
+    {
+        if (!TextTemplate.IsTranslationCandidate(template)
+            || !TranslationBudget.TryGetTextBytes(template, out var bytes))
+            return;
+        while (transitionCancellationCutoffs.Count >= TranslationBudget.MaxCancellationEntries
+            || transitionCancellationUtf8Bytes + bytes > TranslationBudget.MaxCancellationUtf8Bytes)
+        {
+            if (transitionCancellationOrder.First == null)
+                return;
+            var oldest = transitionCancellationOrder.First.Value;
+            transitionCancellationOrder.RemoveFirst();
+            transitionCancellationNodes.Remove(oldest);
+            transitionCancellationCutoffs.Remove(oldest);
+            transitionCancellationUtf8Bytes -= TranslationBudget.TryGetTextBytes(oldest, out var oldBytes)
+                ? oldBytes
+                : 0;
+        }
+        transitionCancellationCutoffs[template] = cutoff;
+        transitionCancellationNodes[template] = transitionCancellationOrder.AddLast(template);
+        transitionCancellationUtf8Bytes += bytes;
+    }
+
+    private void TouchTransitionCancellationUnsafe(string template)
+    {
+        if (!transitionCancellationNodes.TryGetValue(template, out var node)) return;
+        transitionCancellationOrder.Remove(node);
+        transitionCancellationOrder.AddLast(node);
+    }
+
+    private void ClearTransitionCancellationsUnsafe()
+    {
+        transitionCancellationCutoffs.Clear();
+        transitionCancellationOrder.Clear();
+        transitionCancellationNodes.Clear();
+        transitionCancellationUtf8Bytes = 0;
     }
 
     private static void Observe(Task task)
