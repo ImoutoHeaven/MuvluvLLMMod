@@ -524,7 +524,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
 PASS — build succeeded, 0 warnings, 0 errors.
 ```
 
-## B-2 / M-1 follow-up — DONE (commit `4474896`)
+## B-2 / M-1 follow-up — DONE (commits `4474896`, `a45f1f6`)
 
 This batch closes only the outer generation/lifecycle and IL2CPP quit-delegate findings from the
 final review. `FINAL-REVIEW.md` is unchanged.
@@ -572,7 +572,7 @@ remove/register interleaving with exact delegate identity. Production surface te
 actual Plugin coordinator/lease wiring; they are supplemental to the loader-free behavior tests,
 not a replacement for them.
 
-### Docker validation for `4474896`
+### Docker validation for `4474896` + `a45f1f6`
 
 Both commands copied a read-only repository mount into a throwaway container. The game directory
 was mounted read-only for the build, and no game process was launched.
@@ -583,7 +583,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
   -w / mcr.microsoft.com/dotnet/sdk:8.0 \
   bash -lc 'cp -a /src /work && cd /work && dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release'
 
-PASS — 219 passed, 0 failed, 0 skipped.
+PASS — 220 passed, 0 failed, 0 skipped.
 
 MSYS_NO_PATHCONV=1 docker run --rm \
   --mount type=bind,src=C:/Users/Eden/Muv-Luv/MuvluvLLMMod,dst=/src,readonly \
