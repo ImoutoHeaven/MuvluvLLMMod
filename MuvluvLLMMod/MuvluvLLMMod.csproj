@@ -27,7 +27,7 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="BepInEx.Unity.IL2CPP" Version="6.0.0-be.*" IncludeAssets="compile" />
-    <PackageReference Include="BepInEx.PluginInfoProps" Version="2.*" />
+    <PackageReference Include="BepInEx.Unity.IL2CPP" Version="6.0.0-be.785" IncludeAssets="compile" />
+    <PackageReference Include="BepInEx.PluginInfoProps" Version="2.1.0" />
   </ItemGroup>
 </Project>
