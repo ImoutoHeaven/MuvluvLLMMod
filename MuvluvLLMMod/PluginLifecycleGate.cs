@@ -30,11 +30,21 @@ public sealed class PluginLifecycleGate
     private static readonly Task<bool> SuccessfulNoop = Task.FromResult(true);
 
     private readonly object gate = new();
+    private readonly TimeSpan quiescenceTimeout;
     private PluginGeneration? current;
     private PluginLifecycleState state = PluginLifecycleState.NotLoaded;
     private long nextGeneration;
     private TaskCompletionSource<bool>? cleanupCompletion;
     private bool lastCleanupSucceeded = true;
+
+    public PluginLifecycleGate(TimeSpan? quiescenceTimeout = null)
+    {
+        this.quiescenceTimeout = quiescenceTimeout is { } value && value > TimeSpan.Zero
+            ? (value < TranslationBudget.MaxLifecycleQuiescenceTimeout
+                ? value
+                : TranslationBudget.MaxLifecycleQuiescenceTimeout)
+            : TranslationBudget.DefaultLifecycleQuiescenceTimeout;
+    }
 
     public PluginLifecycleState State
     {
@@ -62,6 +72,13 @@ public sealed class PluginLifecycleGate
     public long? CurrentGenerationId
     {
         get { lock (gate) return current?.Id; }
+    }
+
+    public TimeSpan QuiescenceTimeout => quiescenceTimeout;
+
+    public Exception? Failure
+    {
+        get { lock (gate) return current?.FailureUnsafe; }
     }
 
     public bool TryBeginLoad() => TryBeginLoad(out _);
@@ -122,6 +139,39 @@ public sealed class PluginLifecycleGate
     }
 
     /// <summary>
+    /// Records an asynchronous resource fault without recursively entering teardown. The owning
+    /// transition calls this notification after releasing its own lock; cleanup remains the only
+    /// place that performs Unity/filesystem teardown. A failed generation is quarantined
+    /// immediately and cannot be followed by a new load, even before its cleanup callback runs.
+    /// </summary>
+    public bool RecordFailure(PluginGeneration generation, Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(generation);
+        ArgumentNullException.ThrowIfNull(exception);
+        lock (gate)
+        {
+            if (!ReferenceEquals(current, generation))
+                return false;
+
+            generation.RecordFailureUnsafe(exception);
+            if (!generation.CleanupCompleteUnsafe)
+            {
+                generation.RequestStopUnsafe();
+                state = PluginLifecycleState.Failed;
+            }
+            else
+            {
+                // A late notification for this same stale generation must still prevent a
+                // replacement load. A newer generation would have replaced current and returned
+                // false above.
+                state = PluginLifecycleState.Failed;
+                lastCleanupSucceeded = false;
+            }
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Performs the supplied teardown exactly once. If another caller is already cleaning up,
     /// this call waits for that caller's result rather than returning a default value.
     /// </summary>
@@ -174,13 +224,15 @@ public sealed class PluginLifecycleGate
         {
             if (state == PluginLifecycleState.NotLoaded)
                 return true;
-            if (state == PluginLifecycleState.Stopped || state == PluginLifecycleState.Failed)
-                return lastCleanupSucceeded;
-
             if (cleanupCompletion != null)
             {
                 completion = cleanupCompletion.Task;
                 generation = null;
+            }
+            else if ((state == PluginLifecycleState.Stopped || state == PluginLifecycleState.Failed)
+                && current?.CleanupCompleteUnsafe == true)
+            {
+                return lastCleanupSucceeded;
             }
             else
             {
@@ -188,7 +240,10 @@ public sealed class PluginLifecycleGate
                 if (generation == null)
                     return false;
 
-                state = PluginLifecycleState.Stopping;
+                if (!generation.IsFaultedUnsafe)
+                    state = PluginLifecycleState.Stopping;
+                else
+                    state = PluginLifecycleState.Failed;
                 generation.RequestStopUnsafe();
                 cleanupCompletion = new TaskCompletionSource<bool>(
                     TaskCreationOptions.RunContinuationsAsynchronously);
@@ -200,43 +255,49 @@ public sealed class PluginLifecycleGate
             return completion!.GetAwaiter().GetResult();
 
         var succeeded = true;
+        var deadline = DateTime.UtcNow + quiescenceTimeout;
         try
         {
-            // All resources created by a stage are now visible to the owner. A stage that is
-            // still in progress cannot be missed by cleanup and is not followed by a new load
-            // stage because the state is already Stopping.
-            generation.WaitForStages();
-            generation.WaitForCallbacks();
+            // All resources created by a stage are normally visible to the owner before
+            // teardown. A non-cooperative boundary cannot be allowed to hold up independent
+            // freeze/flush/unpatch work forever, so the same injectable deadline covers both
+            // admitted stages and config callbacks.
+            if (!generation.WaitForStages(Remaining(deadline)))
+            {
+                succeeded = false;
+                RecordQuiescenceTimeout(
+                    generation,
+                    "load stages",
+                    diagnostic);
+            }
+            if (!generation.WaitForCallbacks(Remaining(deadline)))
+            {
+                succeeded = false;
+                RecordQuiescenceTimeout(
+                    generation,
+                    "configuration callbacks",
+                    diagnostic);
+            }
+
             try
             {
-                succeeded = teardown(generation);
+                succeeded = teardown(generation) && succeeded;
             }
             catch (Exception exception)
             {
                 succeeded = false;
-                try
-                {
-                    diagnostic?.Invoke(exception);
-                }
-                catch
-                {
-                }
+                Report(diagnostic, exception);
             }
         }
         catch (Exception exception)
         {
             succeeded = false;
-            try
-            {
-                diagnostic?.Invoke(exception);
-            }
-            catch
-            {
-            }
+            Report(diagnostic, exception);
         }
 
         lock (gate)
         {
+            succeeded = succeeded && generation.FailureUnsafe == null;
             lastCleanupSucceeded = succeeded;
             state = succeeded ? PluginLifecycleState.Stopped : PluginLifecycleState.Failed;
             generation.MarkCleanupCompleteUnsafe();
@@ -244,6 +305,70 @@ public sealed class PluginLifecycleGate
         }
 
         return completion!.GetAwaiter().GetResult();
+    }
+
+    private void RecordQuiescenceTimeout(
+        PluginGeneration generation,
+        string operation,
+        Action<Exception>? diagnostic)
+    {
+        var exception = new TimeoutException(
+            operation + " did not quiesce before the plugin cleanup deadline");
+        lock (gate)
+        {
+            if (ReferenceEquals(current, generation))
+                generation.QuiescenceTimedOutUnsafe = true;
+        }
+        RecordFailure(generation, exception);
+        Report(diagnostic, exception);
+    }
+
+    private static void Report(Action<Exception>? diagnostic, Exception exception)
+    {
+        try
+        {
+            diagnostic?.Invoke(exception);
+        }
+        catch
+        {
+        }
+    }
+
+    private static TimeSpan Remaining(DateTime deadline)
+    {
+        var remaining = deadline - DateTime.UtcNow;
+        return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+    }
+
+    private static bool WaitBounded(Task task, TimeSpan timeout)
+    {
+        if (task.IsCompleted)
+        {
+            task.GetAwaiter().GetResult();
+            return true;
+        }
+
+        var boundedTimeout = timeout < TimeSpan.Zero ? TimeSpan.Zero : timeout;
+        var completed = Task.WhenAny(task, Task.Delay(boundedTimeout))
+            .GetAwaiter()
+            .GetResult();
+        if (!ReferenceEquals(completed, task))
+        {
+            Observe(task);
+            return false;
+        }
+
+        task.GetAwaiter().GetResult();
+        return true;
+    }
+
+    private static void Observe(Task task)
+    {
+        _ = task.ContinueWith(
+            completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     /// <summary>
@@ -341,6 +466,7 @@ public sealed class PluginLifecycleGate
     internal void DisposeLease(PluginGenerationLease lease)
     {
         Task? completion;
+        bool waitForCompletion;
         lock (gate)
         {
             lease.DeactivatedUnsafe = true;
@@ -348,9 +474,18 @@ public sealed class PluginLifecycleGate
                 ? null
                 : (lease.CallbacksDrainedUnsafe ??= new TaskCompletionSource<bool>(
                     TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+            waitForCompletion = completion != null
+                && !lease.Generation.QuiescenceTimedOutUnsafe;
         }
 
-        completion?.GetAwaiter().GetResult();
+        if (completion == null || !waitForCompletion)
+            return;
+        if (!WaitBounded(completion, quiescenceTimeout))
+        {
+            var exception = new TimeoutException(
+                "configuration callback did not quiesce before the plugin cleanup deadline");
+            RecordFailure(lease.Generation, exception);
+        }
     }
 
     internal void ExitCallback(PluginGenerationLease lease)
@@ -379,25 +514,31 @@ public sealed class PluginLifecycleGate
     {
         internal readonly PluginLifecycleGate owner;
         private readonly CancellationTokenSource cancellation = new();
+        private readonly CancellationToken cancellationToken;
 
         internal PluginGeneration(PluginLifecycleGate owner, long id)
         {
             this.owner = owner;
             Id = id;
+            cancellationToken = cancellation.Token;
             StagesDrainedUnsafe = new TaskCompletionSource<bool>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             StagesDrainedUnsafe.TrySetResult(true);
         }
 
         public long Id { get; }
-        public CancellationToken CancellationToken => cancellation.Token;
-        public bool IsCancellationRequested => cancellation.IsCancellationRequested;
+        public CancellationToken CancellationToken => cancellationToken;
+        public bool IsCancellationRequested => cancellationToken.IsCancellationRequested;
 
         internal object? Owner { get; set; }
         internal int ActiveStagesUnsafe { get; set; }
         internal List<PluginGenerationLease> LeasesUnsafe { get; } = new();
         internal TaskCompletionSource<bool>? StagesDrainedUnsafe { get; set; }
-        internal bool IsCancellationRequestedUnsafe => cancellation.IsCancellationRequested;
+        internal Exception? FailureUnsafe { get; set; }
+        internal bool QuiescenceTimedOutUnsafe { get; set; }
+        internal bool CleanupCompleteUnsafe { get; set; }
+        internal bool IsFaultedUnsafe => FailureUnsafe != null;
+        internal bool IsCancellationRequestedUnsafe => cancellationToken.IsCancellationRequested;
 
         public bool AttachOwner(object owner) => this.owner.TryAttachOwner(this, owner);
 
@@ -417,11 +558,18 @@ public sealed class PluginLifecycleGate
 
         internal void RequestStopUnsafe()
         {
+            if (CleanupCompleteUnsafe)
+                return;
             if (!cancellation.IsCancellationRequested)
                 cancellation.Cancel();
         }
 
-        internal void WaitForStages()
+        internal void RecordFailureUnsafe(Exception exception)
+        {
+            FailureUnsafe ??= exception;
+        }
+
+        internal bool WaitForStages(TimeSpan timeout)
         {
             Task wait;
             lock (owner.gate)
@@ -431,20 +579,27 @@ public sealed class PluginLifecycleGate
                     : (StagesDrainedUnsafe ??= new TaskCompletionSource<bool>(
                         TaskCreationOptions.RunContinuationsAsynchronously)).Task;
             }
-            wait.GetAwaiter().GetResult();
+            return WaitBounded(wait, timeout);
         }
 
-        internal void WaitForCallbacks()
+        internal bool WaitForCallbacks(TimeSpan timeout)
         {
-            PluginGenerationLease[] leases;
+            Task[] waits;
             lock (owner.gate)
-                leases = LeasesUnsafe.ToArray();
-            foreach (var lease in leases)
-                lease.WaitForCallbacks();
+            {
+                waits = LeasesUnsafe
+                    .Select(static lease => lease.CallbackCompletionTask())
+                    .Where(static task => !task.IsCompleted)
+                    .ToArray();
+            }
+            return WaitBounded(
+                waits.Length == 0 ? Task.CompletedTask : Task.WhenAll(waits),
+                timeout);
         }
 
         internal void MarkCleanupCompleteUnsafe()
         {
+            CleanupCompleteUnsafe = true;
             // Keep the owner on the stale token for cleanup diagnostics, but it is no longer
             // reachable from CurrentOwner because the gate state is Stopped/Failed.
             try
@@ -498,17 +653,15 @@ public sealed class PluginLifecycleGate
         public T? GetOwner<T>() where T : class =>
             IsActive ? Generation.GetOwner<T>() : null;
 
-        internal void WaitForCallbacks()
+        internal Task CallbackCompletionTask()
         {
-            Task? completion;
             lock (owner.gate)
             {
-                completion = ActiveCallbacksUnsafe == 0
-                    ? null
+                return ActiveCallbacksUnsafe == 0
+                    ? Task.CompletedTask
                     : (CallbacksDrainedUnsafe ??= new TaskCompletionSource<bool>(
                         TaskCreationOptions.RunContinuationsAsynchronously)).Task;
             }
-            completion?.GetAwaiter().GetResult();
         }
 
         public void Dispose()

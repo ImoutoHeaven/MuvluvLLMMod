@@ -87,7 +87,7 @@ public sealed class Plugin : BasePlugin
                 TrySetUtf8Console();
                 Logger.Info($"Plugin {PluginGuid} is loading (generation {generation.Id})");
                 MuvluvLLMMod.Config.Initialize(base.Config);
-                resources.MachineLifecycle = CreateMachineLifecycle();
+                resources.MachineLifecycle = CreateMachineLifecycle(generation);
             }
 
             using (RequireLoadStage(generation))
@@ -457,9 +457,15 @@ public sealed class Plugin : BasePlugin
         PluginLifecycleGate.PluginGeneration generation) =>
         generation.IsRunning ? generation.GetOwner<GenerationResources>() : null;
 
-    private static MachineTranslatorLifecycle CreateMachineLifecycle() => new(
+    private static MachineTranslatorLifecycle CreateMachineLifecycle(
+        PluginLifecycleGate.PluginGeneration generation) => new(
         exception => SafeError("[LLM] Lifecycle failure: " + exception.GetType().Name),
-        shutdownTimeout: TranslationBudget.DefaultShutdownTimeout);
+        shutdownTimeout: TranslationBudget.DefaultShutdownTimeout,
+        terminalFailure: exception =>
+        {
+            SafeError("[LLM] Machine translator generation faulted: " + exception.GetType().Name);
+            lifecycleGate.RecordFailure(generation, exception);
+        });
 
     private static MachineSettings CaptureMachineSettings() => new(
         MuvluvLLMMod.Config.LlmEnable.Value,

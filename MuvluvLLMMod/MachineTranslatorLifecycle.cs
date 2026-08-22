@@ -9,10 +9,11 @@ public sealed class MachineTranslatorLifecycle
     private readonly Dictionary<string, LinkedListNode<string>> transitionCancellationNodes = new(StringComparer.Ordinal);
     private long transitionCancellationUtf8Bytes;
     private readonly Action<Exception>? diagnostic;
+    private readonly Action<Exception>? terminalFailure;
     private readonly TimeSpan shutdownTimeout;
     private TranslationRetryPolicy? retryPolicy;
+    private readonly HashSet<MachineTranslator> stoppingWorkers = new();
     private MachineTranslator? current;
-    private MachineTranslator? stopping;
     private RequestRateLimiter? limiter;
     private Task transition = Task.CompletedTask;
     private Task? shutdownTask;
@@ -21,13 +22,17 @@ public sealed class MachineTranslatorLifecycle
     private bool initialized;
     private bool shutdown;
     private bool shutdownTimedOut;
+    private Exception? terminalException;
+    private bool terminalFailureNotified;
 
     public MachineTranslatorLifecycle(
         Action<Exception>? diagnostic = null,
         TranslationRetryPolicy? retryPolicy = null,
-        TimeSpan? shutdownTimeout = null)
+        TimeSpan? shutdownTimeout = null,
+        Action<Exception>? terminalFailure = null)
     {
         this.diagnostic = diagnostic;
+        this.terminalFailure = terminalFailure;
         this.retryPolicy = retryPolicy;
         this.shutdownTimeout = shutdownTimeout is { } value && value > TimeSpan.Zero
             ? (value < TranslationBudget.MaxShutdownTimeout
@@ -56,6 +61,21 @@ public sealed class MachineTranslatorLifecycle
         get { lock (gate) return shutdownTimedOut; }
     }
 
+    public bool IsFaulted
+    {
+        get { lock (gate) return terminalException != null; }
+    }
+
+    public Exception? TerminalFailure
+    {
+        get { lock (gate) return terminalException; }
+    }
+
+    public int TrackedStoppingWorkerCount
+    {
+        get { lock (gate) return stoppingWorkers.Count; }
+    }
+
     public (int Completed, int InFlight, int Failed) ProgressSnapshot
     {
         get
@@ -78,7 +98,12 @@ public sealed class MachineTranslatorLifecycle
     {
         lock (gate)
         {
-            if (shutdown || initialized || current != null || stopping != null || transitionsInFlight != 0)
+            if (shutdown
+                || terminalException != null
+                || initialized
+                || current != null
+                || stoppingWorkers.Count != 0
+                || transitionsInFlight != 0)
                 return false;
 
             initialized = true;
@@ -118,7 +143,10 @@ public sealed class MachineTranslatorLifecycle
     {
         lock (gate)
         {
-            if (shutdown || !initialized || transitionsInFlight >= TranslationBudget.MaxTransitions)
+            if (shutdown
+                || terminalException != null
+                || !initialized
+                || transitionsInFlight >= TranslationBudget.MaxTransitions)
                 return false;
 
             if (nextRetryPolicy != null)
@@ -140,7 +168,7 @@ public sealed class MachineTranslatorLifecycle
     {
         lock (gate)
         {
-            if (shutdown)
+            if (shutdown || terminalException != null)
                 return false;
             return current?.EnqueuePriority(template)
                 ?? retryPolicy?.TryRetain(template, () => priorityBacklog.Enqueue(template))
@@ -152,7 +180,7 @@ public sealed class MachineTranslatorLifecycle
     {
         lock (gate)
         {
-            if (shutdown)
+            if (shutdown || terminalException != null)
                 return false;
             return current?.EnqueuePriority(template, pendingGeneration)
                 ?? retryPolicy?.TryRetain(template, () => priorityBacklog.Enqueue(template, pendingGeneration))
@@ -164,7 +192,9 @@ public sealed class MachineTranslatorLifecycle
     {
         lock (gate)
         {
-            return !shutdown && (current?.EnqueueNormal(template) ?? false);
+            return !shutdown
+                && terminalException == null
+                && (current?.EnqueueNormal(template) ?? false);
         }
     }
 
@@ -172,7 +202,9 @@ public sealed class MachineTranslatorLifecycle
     {
         lock (gate)
         {
-            return !shutdown && (current?.EnqueueNormal(template, pendingGeneration) ?? false);
+            return !shutdown
+                && terminalException == null
+                && (current?.EnqueueNormal(template, pendingGeneration) ?? false);
         }
     }
 
@@ -185,11 +217,12 @@ public sealed class MachineTranslatorLifecycle
     {
         lock (gate)
         {
-            if (shutdown)
+            if (shutdown || terminalException != null)
                 return false;
 
-            var canceled = (current?.Cancel(template, pendingGeneration) ?? false)
-                | (stopping?.Cancel(template, pendingGeneration) ?? false);
+            var canceled = (current?.Cancel(template, pendingGeneration) ?? false);
+            foreach (var worker in stoppingWorkers.ToArray())
+                canceled |= worker.Cancel(template, pendingGeneration);
             var backlogCancellation = priorityBacklog.CancelAndGetCutoff(template, pendingGeneration);
             canceled |= backlogCancellation.Removed;
             if (transitionsInFlight == 0)
@@ -226,10 +259,10 @@ public sealed class MachineTranslatorLifecycle
             shutdown = true;
             ++version;
             var active = current;
-            var stoppingMachine = stopping;
+            var stoppingMachines = stoppingWorkers.ToArray();
             current = null;
             var pendingTransition = transition;
-            shutdownTask = CompleteShutdownAsync(active, stoppingMachine, pendingTransition);
+            shutdownTask = CompleteShutdownAsync(active, stoppingMachines, pendingTransition);
             Observe(shutdownTask);
             return shutdownTask;
         }
@@ -237,7 +270,7 @@ public sealed class MachineTranslatorLifecycle
 
     private async Task CompleteShutdownAsync(
         MachineTranslator? active,
-        MachineTranslator? stoppingMachine,
+        MachineTranslator[] stoppingMachines,
         Task pendingTransition)
     {
         var deadline = DateTime.UtcNow + shutdownTimeout;
@@ -246,20 +279,28 @@ public sealed class MachineTranslatorLifecycle
             Remaining(deadline),
             "machine transition shutdown").ConfigureAwait(false);
 
-        var activeFailure = await StopSafelyAsync(active, Remaining(deadline)).ConfigureAwait(false);
-        failure ??= activeFailure;
-        if (stoppingMachine != null && !ReferenceEquals(stoppingMachine, active))
+        var machines = new HashSet<MachineTranslator>();
+        if (active != null)
+            machines.Add(active);
+        foreach (var machine in stoppingMachines)
+            machines.Add(machine);
+        lock (gate)
         {
-            var stoppingFailure = await StopSafelyAsync(
-                stoppingMachine,
+            foreach (var machine in stoppingWorkers)
+                machines.Add(machine);
+        }
+
+        foreach (var machine in machines)
+        {
+            var machineFailure = await StopSafelyAsync(
+                machine,
                 Remaining(deadline)).ConfigureAwait(false);
-            failure ??= stoppingFailure;
+            failure ??= machineFailure;
         }
 
         lock (gate)
         {
             current = null;
-            stopping = null;
             limiter = null;
             shutdownTimedOut = failure is TimeoutException
                 || failure?.InnerException is TimeoutException;
@@ -267,7 +308,10 @@ public sealed class MachineTranslatorLifecycle
         }
 
         if (failure != null)
+        {
+            Fault(failure);
             throw new InvalidOperationException("machine translator shutdown failed", failure);
+        }
     }
 
     private async Task RunTransitionAsync(
@@ -288,26 +332,29 @@ public sealed class MachineTranslatorLifecycle
             lock (gate)
             {
                 // A stale transition must not take ownership of a worker from a newer load.
-                if (shutdown || generation != version)
+                if (shutdown || terminalException != null || generation != version)
                     return;
                 old = current;
                 current = null;
-                stopping = old;
+                if (old != null)
+                    stoppingWorkers.Add(old);
             }
 
-            if (old != null
-                && !await old.StopAsync(shutdownTimeout).ConfigureAwait(false))
-                throw new TimeoutException("old machine translator did not stop before the transition budget");
-            lock (gate)
+            if (old != null)
             {
-                if (ReferenceEquals(stopping, old))
-                    stopping = null;
+                var stopFailure = await StopSafelyAsync(old, shutdownTimeout).ConfigureAwait(false);
+                if (stopFailure != null)
+                {
+                    throw new TerminalTransitionException(
+                        "old machine translator did not stop before the transition budget",
+                        stopFailure);
+                }
             }
 
             RequestRateLimiter nextLimiter;
             lock (gate)
             {
-                if (shutdown || generation != version || !enabled || factory == null)
+                if (shutdown || terminalException != null || generation != version || !enabled || factory == null)
                     return;
                 nextLimiter = new RequestRateLimiter(Math.Max(1, requestsPerSecond), limiter?.NextStart ?? default);
                 limiter = nextLimiter;
@@ -317,17 +364,35 @@ public sealed class MachineTranslatorLifecycle
             var accepted = false;
             lock (gate)
             {
-                if (!shutdown && generation == version)
+                if (!shutdown && terminalException == null && generation == version)
                 {
                     FilterTransitionCancellationsUnsafe();
                     current = next;
                     next.Start();
                     accepted = true;
                 }
+                else
+                {
+                    stoppingWorkers.Add(next);
+                }
             }
 
             if (!accepted)
-                _ = await StopSafelyAsync(next, shutdownTimeout).ConfigureAwait(false);
+            {
+                var stopFailure = await StopSafelyAsync(next, shutdownTimeout).ConfigureAwait(false);
+                if (stopFailure != null)
+                {
+                    throw new TerminalTransitionException(
+                        "machine translator replacement did not stop before the transition budget",
+                        stopFailure);
+                }
+            }
+        }
+        catch (TerminalTransitionException exception)
+        {
+            Fault(exception);
+            Diagnose(exception);
+            throw;
         }
         catch (Exception exception)
         {
@@ -359,14 +424,84 @@ public sealed class MachineTranslatorLifecycle
                 var timeoutException = new TimeoutException(
                     "machine translator worker did not stop before the shutdown deadline");
                 Diagnose(timeoutException);
+                ObserveStoppedWorker(machine);
                 return timeoutException;
             }
+            RemoveStoppingWorker(machine);
             return null;
         }
         catch (Exception exception)
         {
             Diagnose(exception);
+            ObserveStoppedWorker(machine);
             return exception;
+        }
+    }
+
+    private void ObserveStoppedWorker(MachineTranslator machine)
+    {
+        Task completion;
+        lock (gate)
+        {
+            stoppingWorkers.Add(machine);
+            completion = machine.StopCompletion;
+        }
+
+        _ = completion.ContinueWith(
+            completed =>
+            {
+                _ = completed.Exception;
+                RemoveStoppingWorker(machine);
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private void RemoveStoppingWorker(MachineTranslator machine)
+    {
+        lock (gate)
+            stoppingWorkers.Remove(machine);
+    }
+
+    private sealed class TerminalTransitionException : InvalidOperationException
+    {
+        public TerminalTransitionException(string message, Exception innerException)
+            : base(message, innerException)
+        {
+        }
+    }
+
+    private void Fault(Exception exception)
+    {
+        Action<Exception>? notification = null;
+        lock (gate)
+        {
+            if (terminalException == null)
+            {
+                terminalException = exception;
+                ++version;
+                if (!terminalFailureNotified)
+                {
+                    terminalFailureNotified = true;
+                    notification = terminalFailure;
+                }
+            }
+        }
+
+        if (notification == null)
+            return;
+
+        try
+        {
+            // The notification is deliberately only a state signal.  In particular, the
+            // production recipient records the owning plugin generation as failed; it must not
+            // synchronously call back into Cleanup while this transition is unwinding.
+            notification(exception);
+        }
+        catch (Exception notificationFailure)
+        {
+            Diagnose(notificationFailure);
         }
     }
 

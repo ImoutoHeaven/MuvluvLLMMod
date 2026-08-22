@@ -41,8 +41,8 @@ baseline_output=$(run_tests "$ROOT" 2>&1) || {
     exit 1
 }
 printf '%s\n' "$baseline_output"
-if ! grep -Eq 'Passed:[[:space:]]+13' <<<"$baseline_output" || ! grep -Eq 'Failed:[[:space:]]+0' <<<"$baseline_output"; then
-    echo "baseline did not report the expected 13 integration tests" >&2
+if ! grep -Eq 'Passed:[[:space:]]+16' <<<"$baseline_output" || ! grep -Eq 'Failed:[[:space:]]+0' <<<"$baseline_output"; then
+    echo "baseline did not report the expected 16 integration tests" >&2
     exit 1
 fi
 
@@ -84,6 +84,20 @@ gate_mutant() {
                 'for (var attempt = 0; attempt < TerminalFlushMaxAttempts; attempt++)' \
                 'for (var attempt = 0; attempt < 1; attempt++)'
             ;;
+        M5-PF1-single-stopping-owner)
+            replace_once "$copy/MuvluvLLMMod/MachineTranslatorLifecycle.cs" \
+                $'            if (shutdown\n                || terminalException != null\n                || !initialized\n                || transitionsInFlight >= TranslationBudget.MaxTransitions)' \
+                $'            if (shutdown\n                || !initialized\n                || transitionsInFlight >= TranslationBudget.MaxTransitions)'
+            replace_once "$copy/MuvluvLLMMod/MachineTranslatorLifecycle.cs" \
+                $'                if (shutdown || terminalException != null || generation != version)\n                    return;\n                old = current;\n                current = null;\n                if (old != null)\n                    stoppingWorkers.Add(old);' \
+                $'                if (shutdown || generation != version)\n                    return;\n                old = current;\n                current = null;\n                stoppingWorkers.Clear();\n                if (old != null)\n                    stoppingWorkers.Add(old);'
+            replace_once "$copy/MuvluvLLMMod/MachineTranslatorLifecycle.cs" \
+                '                if (shutdown || terminalException != null || generation != version || !enabled || factory == null)' \
+                '                if (shutdown || generation != version || !enabled || factory == null)'
+            replace_once "$copy/MuvluvLLMMod/MachineTranslatorLifecycle.cs" \
+                '                if (!shutdown && terminalException == null && generation == version)' \
+                '                if (!shutdown && generation == version)'
+            ;;
         *)
             echo "unknown mutant $id" >&2
             return 1
@@ -119,5 +133,7 @@ gate_mutant M5-M3-disable-budget-gate \
     ProductionBudgetAndShutdownIntegrationTests.Oversized_render_input_is_rejected_fail_closed_and_not_retained
 gate_mutant M5-M4-remove-terminal-retry-guard \
     ProductionBudgetAndShutdownIntegrationTests.Terminal_flush_recovers_from_one_transient_write_failure
+gate_mutant M5-PF1-single-stopping-owner \
+    ProductionBudgetAndShutdownIntegrationTests.Timed_out_reload_is_terminal_and_retains_the_old_worker_for_cleanup
 
-echo "M-5 mutation gate: all 6 compile-valid mutants killed"
+echo "M-5/PF-1 mutation gate: all 7 compile-valid mutants killed"

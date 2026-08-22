@@ -17,6 +17,7 @@ public sealed class MachineTranslator : IDisposable
     private TranslationWorkQueue? stoppingQueue;
     private Task[] tasks = Array.Empty<Task>();
     private Task<bool>? stopTask;
+    private Task? eventualStopTask;
     private int stopFinalized;
 
     public MachineTranslator(
@@ -108,6 +109,20 @@ public sealed class MachineTranslator : IDisposable
         }
     }
 
+    /// <summary>
+    /// Completes only when every worker task has actually ended.  <see cref="StopAsync"/> may
+    /// return a bounded false result first; lifecycle owners retain this task to observe the
+    /// eventual end rather than treating a timed-out worker as gone.
+    /// </summary>
+    public Task StopCompletion
+    {
+        get
+        {
+            lock (lifecycleGate)
+                return eventualStopTask ?? Task.CompletedTask;
+        }
+    }
+
     public Task<bool> StopAsync(TimeSpan? timeout = null)
     {
         CancellationTokenSource? source;
@@ -133,7 +148,8 @@ public sealed class MachineTranslator : IDisposable
             tasks = Array.Empty<Task>();
             source.Cancel();
             Volatile.Write(ref stopFinalized, 0);
-            stopTask = StopCoreAsync(source, workQueue, running, timeout);
+            eventualStopTask = Task.WhenAll(running);
+            stopTask = StopCoreAsync(source, workQueue, running, eventualStopTask, timeout);
             return stopTask;
         }
     }
@@ -142,9 +158,9 @@ public sealed class MachineTranslator : IDisposable
         CancellationTokenSource source,
         TranslationWorkQueue? workQueue,
         Task[] running,
+        Task all,
         TimeSpan? timeout)
     {
-        var all = Task.WhenAll(running);
         try
         {
             if (timeout.HasValue)

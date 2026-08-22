@@ -44,6 +44,8 @@ public static class TranslationBudget
     public const int MaxCacheSnapshotBytes = 8 * 1024 * 1024;
     public static readonly TimeSpan DefaultShutdownTimeout = TimeSpan.FromSeconds(5);
     public static readonly TimeSpan MaxShutdownTimeout = TimeSpan.FromSeconds(60);
+    public static readonly TimeSpan DefaultLifecycleQuiescenceTimeout = TimeSpan.FromSeconds(5);
+    public static readonly TimeSpan MaxLifecycleQuiescenceTimeout = TimeSpan.FromSeconds(60);
     public static readonly TimeSpan DefaultTerminalFlushBudget = TimeSpan.FromSeconds(5);
 
     public static bool TryGetTextBytes(string? text, out int bytes)

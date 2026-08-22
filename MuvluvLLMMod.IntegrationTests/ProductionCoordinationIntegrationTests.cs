@@ -105,6 +105,73 @@ public sealed class ProductionCoordinationIntegrationTests
     }
 
     [Fact]
+    public async Task Cleanup_stage_wait_deadline_quarantines_and_continues_later_teardown()
+    {
+        var gate = new PluginLifecycleGate(TimeSpan.FromMilliseconds(40));
+        Assert.True(gate.TryBeginLoad(out var generation));
+        using var blockedStage = generation.TryEnterStage();
+        Assert.NotNull(blockedStage);
+        var later = new List<string>();
+
+        var first = Task.Run(() => gate.Cleanup(_ =>
+        {
+            later.Add("freeze");
+            later.Add("flush");
+            later.Add("unpatch");
+            return true;
+        }));
+        await WaitUntilAsync(() => gate.State == PluginLifecycleState.Stopping);
+        var second = Task.Run(() => gate.Cleanup(_ => true));
+
+        Assert.False(await first.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.False(await second.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(new[] { "freeze", "flush", "unpatch" }, later);
+        Assert.Equal(PluginLifecycleState.Failed, gate.State);
+
+        // The admitted stage may finish late, but the failed generation cannot publish or reopen.
+        blockedStage!.Dispose();
+        Assert.False(gate.TryPublishRunning(generation));
+        Assert.False(generation.TryEnterStage() is not null);
+        Assert.False(gate.TryBeginLoad(out _));
+    }
+
+    [Fact]
+    public async Task Cleanup_callback_wait_deadline_has_shared_failure_and_late_callback_is_inert()
+    {
+        var gate = new PluginLifecycleGate(TimeSpan.FromMilliseconds(40));
+        Assert.True(gate.TryBeginLoad(out var generation));
+        Assert.True(generation.AttachOwner(new object()));
+        Assert.True(gate.TryPublishRunning(generation));
+        var lease = generation.TryAcquireRunningLease();
+        Assert.NotNull(lease);
+        Assert.True(lease!.TryEnter(out var blockedCallback));
+        var later = new List<string>();
+
+        var first = Task.Run(() => gate.Cleanup(_ =>
+        {
+            later.Add("flush");
+            later.Add("unpatch");
+            return true;
+        }));
+        await WaitUntilAsync(() => gate.State == PluginLifecycleState.Stopping);
+        var second = Task.Run(() => gate.Cleanup(_ => true));
+
+        Assert.False(await first.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.False(await second.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(new[] { "flush", "unpatch" }, later);
+        Assert.Equal(PluginLifecycleState.Failed, gate.State);
+        Assert.False(lease.IsActive);
+        Assert.False(lease.TryEnter(out _));
+
+        // Releasing the late callback only drains its retained lease; it cannot revive the
+        // generation or obtain a resource stage after quarantine.
+        blockedCallback!.Dispose();
+        lease.Dispose();
+        Assert.False(generation.TryEnterRunningStage() is not null);
+        Assert.False(gate.TryBeginLoad(out _));
+    }
+
+    [Fact]
     public void Stale_config_event_snapshot_cannot_reload_a_new_generation()
     {
         var configFile = new ConfigFile();
