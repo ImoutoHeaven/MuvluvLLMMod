@@ -62,6 +62,7 @@ public sealed class PatchSurfaceTests
         Assert.Contains("BeginPluginRefresh", patch, StringComparison.Ordinal);
         Assert.Contains("TmpTextAssignmentOrigin.ExternalSetter", patch, StringComparison.Ordinal);
         Assert.Contains("TmpTextAssignmentOrigin.PluginRefresh", patch, StringComparison.Ordinal);
+        Assert.Contains("TmpRestoreDecision.Resolve", patch, StringComparison.Ordinal);
         Assert.DoesNotContain("InvalidateIfTextChanged", patch, StringComparison.Ordinal);
     }
 

@@ -79,18 +79,14 @@ public static class Patch
                 // including byte-identical values. Only the guarded refresh path may restore, and
                 // only after identity/generation and reverse-source validation succeed. Any
                 // uncertainty leaves the incoming text unchanged.
-                if (origin == TmpTextAssignmentOrigin.PluginRefresh
-                    && tmpProvenance.TryRestore(
-                        assignment,
-                        original,
-                        origin,
-                        translatedValue => Core.Cache.TryGetSourceForTranslatedValue(translatedValue, out var source)
-                            ? source
-                            : null,
-                        out var source))
-                {
-                    value = source;
-                }
+                value = TmpRestoreDecision.Resolve(
+                    tmpProvenance,
+                    assignment,
+                    original,
+                    origin,
+                    translatedValue => Core.Cache.TryGetSourceForTranslatedValue(translatedValue, out var source)
+                        ? source
+                        : null);
             }
         }
 
