@@ -38,10 +38,27 @@ public sealed class Plugin : BasePlugin
         public TranslationResolver? Resolver { get; set; }
         public MachineTranslatorLifecycle? MachineLifecycle { get; set; }
         public Harmony? Harmony { get; set; }
+        public Harmony? PendingHarmony { get; set; }
         public Hotkey? Hotkey { get; set; }
         public CancellationTokenSource? PersistenceCancellation { get; set; }
         public Task PersistenceTask { get; set; } = Task.CompletedTask;
         public PluginLifecycleGate.PluginGenerationLease? ConfigLease { get; set; }
+
+        public PluginLifecycleGate.PluginGenerationResource? ConfigurationResource { get; set; }
+        public PluginLifecycleGate.PluginGenerationResource? MachineOwnerResource { get; set; }
+        public PluginLifecycleGate.PluginGenerationResource? CacheResource { get; set; }
+        public PluginLifecycleGate.PluginGenerationResource? HarmonyResource { get; set; }
+        public PluginLifecycleGate.PluginGenerationResource? HotkeyResource { get; set; }
+        public PluginLifecycleGate.PluginGenerationResource? QuittingResource { get; set; }
+        public PluginLifecycleGate.PluginGenerationResource? PersistenceResource { get; set; }
+        public PluginLifecycleGate.PluginGenerationResource? MachineStartupResource { get; set; }
+        public PluginLifecycleGate.PluginGenerationResource? ActivationResource { get; set; }
+    }
+
+    private sealed class PersistenceHandle
+    {
+        public CancellationTokenSource? Cancellation { get; set; }
+        public Task Task { get; set; } = Task.CompletedTask;
     }
 
     private sealed record MachineSettings(
@@ -82,22 +99,49 @@ public sealed class Plugin : BasePlugin
             if (!generation.AttachOwner(resources))
                 throw new InvalidOperationException("plugin generation lost ownership before load started");
 
-            using (RequireLoadStage(generation))
+            using (var stage = RequireLoadStage(generation))
             {
+                using var configurationResource = stage.RegisterResource(
+                    "configuration initialization",
+                    () => MuvluvLLMMod.Config.Shutdown(),
+                    deferWhileAnotherBoundaryPending: true);
+                resources.ConfigurationResource = configurationResource;
+
                 TrySetUtf8Console();
                 Logger.Info($"Plugin {PluginGuid} is loading (generation {generation.Id})");
                 MuvluvLLMMod.Config.Initialize(base.Config);
-                resources.MachineLifecycle = CreateMachineLifecycle(generation);
+                if (!configurationResource.Commit())
+                    throw CanceledGeneration(generation, "configuration initialization");
+
+                var machineLifecycle = CreateMachineLifecycle(generation);
+                using var machineOwnerResource = stage.RegisterResource(
+                    "machine lifecycle owner",
+                    () =>
+                    {
+                        if (ReferenceEquals(resources.MachineLifecycle, machineLifecycle))
+                            resources.MachineLifecycle = null;
+                    });
+                resources.MachineOwnerResource = machineOwnerResource;
+                if (!machineOwnerResource.Commit(
+                        () => resources.MachineLifecycle = machineLifecycle))
+                {
+                    throw CanceledGeneration(generation, "machine lifecycle owner");
+                }
             }
 
-            using (RequireLoadStage(generation))
+            using (var stage = RequireLoadStage(generation))
             {
-                var cache = new TranslationCache(
+                TranslationCache? cache = null;
+                using var cacheResource = stage.RegisterResource(
+                    "translation cache",
+                    () => cache?.FreezeMutations());
+                resources.CacheResource = cacheResource;
+
+                cache = new TranslationCache(
                     ResolvePluginPath(MuvluvLLMMod.Config.CacheDirectory.Value),
                     message => SafeWarn("Translation cache " + message));
-                resources.Cache = cache;
                 cache.Load();
-                resources.Resolver = new TranslationResolver(
+                var resolver = new TranslationResolver(
                     cache,
                     (template, pendingGeneration) => EnqueuePriority(
                         generation,
@@ -111,40 +155,114 @@ public sealed class Plugin : BasePlugin
                         generation,
                         template,
                         pendingGeneration));
+                if (!cacheResource.Commit(
+                        () =>
+                        {
+                            resources.Cache = cache;
+                            resources.Resolver = resolver;
+                        }))
+                {
+                    throw CanceledGeneration(generation, "translation cache");
+                }
             }
 
-            using (RequireLoadStage(generation))
+            using (var stage = RequireLoadStage(generation))
             {
-                resources.Harmony = new Harmony(PluginGuid);
-                Patch.Initialize(resources.Harmony);
+                var harmony = new Harmony(PluginGuid);
+                using var harmonyResource = stage.RegisterResource(
+                    "Harmony patches",
+                    () =>
+                    {
+                        // Retire before and after the external unpatch. PatchAll may have
+                        // published hooks on another thread immediately before this disposer
+                        // runs; either ordering must leave the static body inert.
+                        Patch.Retire();
+                        try
+                        {
+                            harmony.UnpatchSelf();
+                        }
+                        finally
+                        {
+                            Patch.Retire();
+                            if (ReferenceEquals(resources.Harmony, harmony))
+                                resources.Harmony = null;
+                            if (ReferenceEquals(resources.PendingHarmony, harmony))
+                                resources.PendingHarmony = null;
+                        }
+                    });
+                resources.PendingHarmony = harmony;
+                resources.HarmonyResource = harmonyResource;
+                Patch.Initialize(harmony);
+                if (!harmonyResource.Commit(
+                        () =>
+                        {
+                            resources.Harmony = harmony;
+                            resources.PendingHarmony = null;
+                        }))
+                    throw CanceledGeneration(generation, "Harmony patches");
             }
 
-            using (RequireLoadStage(generation))
+            using (var stage = RequireLoadStage(generation))
             {
-                resources.Hotkey = AddComponent<Hotkey>();
-                if (resources.Hotkey == null)
+                Hotkey? hotkey = null;
+                using var hotkeyResource = stage.RegisterResource(
+                    "injected Hotkey component",
+                    () => DestroyHotkey(hotkey, resources));
+                resources.HotkeyResource = hotkeyResource;
+                hotkey = AddComponent<Hotkey>();
+                if (hotkey == null)
                     throw new InvalidOperationException("Hotkey component injection returned null");
+                if (!hotkeyResource.Commit(() => resources.Hotkey = hotkey))
+                    throw CanceledGeneration(generation, "injected Hotkey component");
             }
 
-            using (RequireLoadStage(generation))
+            using (var stage = RequireLoadStage(generation))
+            {
+                using var quittingResource = stage.RegisterResource(
+                    "application-quit delegate",
+                    () => RemoveApplicationQuittingHandler(generation.Id));
+                resources.QuittingResource = quittingResource;
                 RegisterApplicationQuittingHandler(generation.Id);
+                if (!quittingResource.Commit())
+                    throw CanceledGeneration(generation, "application-quit delegate");
+            }
 
-            using (RequireLoadStage(generation))
+            using (var stage = RequireLoadStage(generation))
             {
                 var cache = resources.Cache
                     ?? throw new InvalidOperationException("cache was not initialized");
-                var cancellation = new CancellationTokenSource();
-                resources.PersistenceCancellation = cancellation;
-                resources.PersistenceTask = cache.RunPersistenceLoopAsync(cancellation.Token);
-                ObserveBackgroundTask(resources.PersistenceTask, "cache persistence");
+                var persistence = new PersistenceHandle
+                {
+                    Cancellation = new CancellationTokenSource()
+                };
+                using var persistenceResource = stage.RegisterResource(
+                    "cache persistence task",
+                    () => StopPersistence(persistence));
+                resources.PersistenceResource = persistenceResource;
+                persistence.Task = cache.RunPersistenceLoopAsync(
+                    persistence.Cancellation.Token);
+                ObserveBackgroundTask(persistence.Task, "cache persistence");
+                if (!persistenceResource.Commit(
+                        () =>
+                        {
+                            resources.PersistenceCancellation = persistence.Cancellation;
+                            resources.PersistenceTask = persistence.Task;
+                        }))
+                {
+                    throw CanceledGeneration(generation, "cache persistence task");
+                }
             }
 
-            using (RequireLoadStage(generation))
+            using (var stage = RequireLoadStage(generation))
             {
                 var settings = CaptureMachineSettings();
                 var retryPolicy = new TranslationRetryPolicy();
                 var machineLifecycle = resources.MachineLifecycle
                     ?? throw new InvalidOperationException("machine lifecycle was not initialized");
+                using var machineStartupResource = stage.RegisterResource(
+                    "machine worker startup",
+                    machineLifecycle.Shutdown);
+                resources.MachineStartupResource = machineStartupResource;
                 if (!machineLifecycle.Initialize(
                         settings.Enabled,
                         settings.RequestsPerSecond,
@@ -158,23 +276,44 @@ public sealed class Plugin : BasePlugin
                 {
                     throw new InvalidOperationException("machine lifecycle duplicate initialization");
                 }
+                if (!machineStartupResource.Commit())
+                    throw CanceledGeneration(generation, "machine worker startup");
             }
 
             if (!lifecycleGate.TryPublishRunning(generation))
-                throw new OperationCanceledException(
-                    "plugin load was canceled before the generation could become Running",
-                    generation.CancellationToken);
+                throw CanceledGeneration(generation, "generation activation");
 
-            using (RequireRunningStage(generation))
+            using (var stage = RequireRunningStage(generation))
             {
+                PluginLifecycleGate.PluginGenerationLease? lease = null;
+                using var activationResource = stage.RegisterResource(
+                    "runtime/config activation",
+                    () =>
+                    {
+                        // Config.Activate can publish its event handler before returning. The
+                        // ordinary configuration rollback may already have run while this
+                        // stage was blocked, so late rollback must revoke activation itself.
+                        try
+                        {
+                            MuvluvLLMMod.Config.Shutdown();
+                        }
+                        finally
+                        {
+                            lease?.Dispose();
+                            Patch.Retire();
+                            if (ReferenceEquals(resources.ConfigLease, lease))
+                                resources.ConfigLease = null;
+                        }
+                    },
+                    deferWhileAnotherBoundaryPending: true);
+                resources.ActivationResource = activationResource;
                 Patch.Activate();
-                var lease = generation.TryAcquireRunningLease()
-                    ?? throw new OperationCanceledException(
-                        "plugin load was canceled during activation",
-                        generation.CancellationToken);
-                resources.ConfigLease = lease;
+                lease = generation.TryAcquireRunningLease()
+                    ?? throw CanceledGeneration(generation, "configuration lease");
                 if (!MuvluvLLMMod.Config.Activate(lease, ReloadMachineTranslator))
                     throw new InvalidOperationException("configuration activation was rejected");
+                if (!activationResource.Commit(() => resources.ConfigLease = lease))
+                    throw CanceledGeneration(generation, "runtime/config activation");
             }
 
             if (!generation.IsRunning)
@@ -204,42 +343,47 @@ public sealed class Plugin : BasePlugin
         var resources = generation.GetOwner<GenerationResources>();
         var succeeded = true;
 
-        // Stop event producers first. Config.Shutdown revokes its generation lease and waits for
-        // a handler that was already inside the callback; removing the event delegate alone is
-        // not enough to prevent a stale reload.
-        RunCleanupStep("shutdown configuration", MuvluvLLMMod.Config.Shutdown, ref succeeded);
-        RunCleanupStep(
+        // Stop event producers first. Resource requests are deliberately non-blocking while an
+        // admitted external boundary is still pending; that boundary will commit-or-rollback
+        // its local resource when it finally returns.
+        RunCleanupResource(
+            "shutdown configuration",
+            resources?.ConfigurationResource,
+            MuvluvLLMMod.Config.Shutdown,
+            ref succeeded);
+        RunCleanupResource(
             "remove application-quit handler",
+            resources?.QuittingResource,
             () => RemoveApplicationQuittingHandler(generation.Id),
             ref succeeded);
-        RunCleanupStep(
+        RunCleanupResource(
             "disable Hotkey",
-            () =>
-            {
-                if (resources == null)
-                    return;
-                var hotkey = resources.Hotkey;
-                resources.Hotkey = null;
-                if (hotkey == null)
-                    return;
-                hotkey.enabled = false;
-                UnityEngine.Object.Destroy(hotkey);
-            },
+            resources?.HotkeyResource,
+            () => DestroyHotkey(resources?.Hotkey, resources),
+            ref succeeded);
+        RunCleanupResource(
+            "retire runtime/config activation",
+            resources?.ActivationResource,
+            static () => Patch.Retire(),
             ref succeeded);
         RunCleanupStep("retire TMP translation state", Patch.Retire, ref succeeded);
 
         // Keep this semantic order: config stop -> patch/component retirement -> freeze ->
-        // machine stop -> persistence cancellation -> terminal flush -> unpatch.
-        RunCleanupStep(
+        // machine stop -> persistence cancellation -> terminal flush -> unpatch. Each resource
+        // callback is idempotent and remains retained if a late boundary has not returned.
+        RunCleanupResource(
             "freeze cache mutations",
+            resources?.CacheResource,
             () => resources?.Cache?.FreezeMutations(),
             ref succeeded);
-        RunCleanupStep(
+        RunCleanupResource(
             "shutdown machine translator",
+            resources?.MachineStartupResource,
             () => resources?.MachineLifecycle?.Shutdown(),
             ref succeeded);
-        RunCleanupStep(
+        RunCleanupResource(
             "cancel cache persistence",
+            resources?.PersistenceResource,
             () => StopPersistence(resources),
             ref succeeded);
         RunCleanupStep(
@@ -255,25 +399,68 @@ public sealed class Plugin : BasePlugin
                 throw new InvalidOperationException("terminal cache flush failed");
             },
             ref succeeded);
-        RunCleanupStep(
+        RunCleanupResource(
             "unpatch Harmony",
-            () =>
-            {
-                if (resources == null)
-                    return;
-                var harmony = resources.Harmony;
-                if (harmony == null)
-                    return;
-                harmony.UnpatchSelf();
-                resources.Harmony = null;
-            },
-            ref succeeded);
+            resources?.HarmonyResource,
+            () => UnpatchHarmony(resources),
+            ref succeeded,
+            runFallbackWhenPending: true);
+
+        if (resources != null)
+        {
+            resources.Cache = null;
+            resources.Resolver = null;
+            resources.MachineLifecycle = null;
+            resources.Harmony = null;
+            resources.PendingHarmony = null;
+            resources.Hotkey = null;
+            resources.PersistenceCancellation = null;
+            resources.ConfigLease = null;
+        }
 
         if (succeeded)
             SafeInfo($"Plugin {PluginGuid} unloaded (generation {generation.Id})");
         else
             SafeError($"Plugin {PluginGuid} generation {generation.Id} is quarantined after cleanup errors");
         return succeeded;
+    }
+
+    private static void RunCleanupResource(
+        string name,
+        PluginLifecycleGate.PluginGenerationResource? resource,
+        Action fallback,
+        ref bool succeeded,
+        bool runFallbackWhenPending = false)
+    {
+        if (resource != null)
+        {
+            var pending = resource.IsPending;
+            if (!resource.RequestRollback())
+                succeeded = false;
+            if (runFallbackWhenPending && pending)
+                RunCleanupStep(name + " pending boundary", fallback, ref succeeded);
+            return;
+        }
+
+        RunCleanupStep(name, fallback, ref succeeded);
+    }
+
+    private static void UnpatchHarmony(GenerationResources? resources)
+    {
+        var harmony = resources?.PendingHarmony ?? resources?.Harmony;
+        if (harmony == null)
+            return;
+        try
+        {
+            harmony.UnpatchSelf();
+        }
+        finally
+        {
+            if (ReferenceEquals(resources?.PendingHarmony, harmony))
+                resources.PendingHarmony = null;
+            if (ReferenceEquals(resources?.Harmony, harmony))
+                resources.Harmony = null;
+        }
     }
 
     private static void RunCleanupStep(string name, Action action, ref bool succeeded)
@@ -294,9 +481,25 @@ public sealed class Plugin : BasePlugin
         if (resources?.PersistenceCancellation == null)
             return;
 
-        var cancellation = resources.PersistenceCancellation;
-        var persistenceTask = resources.PersistenceTask;
+        var handle = new PersistenceHandle
+        {
+            Cancellation = resources.PersistenceCancellation,
+            Task = resources.PersistenceTask
+        };
         resources.PersistenceCancellation = null;
+        StopPersistence(handle);
+    }
+
+    private static void StopPersistence(PersistenceHandle handle)
+    {
+        var cancellation = handle.Cancellation;
+        if (cancellation == null)
+            return;
+
+        // Clear the handle before waiting. A late retry then observes that the continuation owns
+        // disposal after a timeout instead of disposing a CTS from underneath its task.
+        handle.Cancellation = null;
+        var persistenceTask = handle.Task;
         cancellation.Cancel();
         if (!persistenceTask.Wait(TranslationBudget.DefaultShutdownTimeout))
         {
@@ -494,16 +697,28 @@ public sealed class Plugin : BasePlugin
     private static PluginLifecycleGate.PluginStage RequireLoadStage(
         PluginLifecycleGate.PluginGeneration generation) =>
         generation.TryEnterStage()
-        ?? throw new OperationCanceledException(
-            "plugin generation is no longer Loading",
-            generation.CancellationToken);
+        ?? throw CanceledGeneration(generation, "load stage admission");
 
     private static PluginLifecycleGate.PluginStage RequireRunningStage(
         PluginLifecycleGate.PluginGeneration generation) =>
         generation.TryEnterRunningStage()
-        ?? throw new OperationCanceledException(
-            "plugin generation is no longer Running",
-            generation.CancellationToken);
+        ?? throw CanceledGeneration(generation, "running stage admission");
+
+    private static OperationCanceledException CanceledGeneration(
+        PluginLifecycleGate.PluginGeneration generation,
+        string operation) => new(
+        "plugin generation was canceled during " + operation,
+        generation.CancellationToken);
+
+    private static void DestroyHotkey(Hotkey? hotkey, GenerationResources? resources)
+    {
+        if (hotkey == null)
+            return;
+        hotkey.enabled = false;
+        UnityEngine.Object.Destroy(hotkey);
+        if (ReferenceEquals(resources?.Hotkey, hotkey))
+            resources.Hotkey = null;
+    }
 
     private static void TrySetUtf8Console()
     {

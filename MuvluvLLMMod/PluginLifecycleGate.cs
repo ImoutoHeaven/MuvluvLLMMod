@@ -20,10 +20,10 @@ public readonly record struct PluginCleanupStep(string Name, Action Action);
 /// Loader-free owner of one plugin generation.
 ///
 /// A generation has a cancellation boundary and counts load/activation stages. Cleanup moves
-/// the generation to Stopping before waiting for those stages, so a stage that was paused by a
-/// concurrent cleanup cannot publish a later resource. Cleanup callers all wait on the same
-/// completion source. A failed teardown is terminal (Failed) and cannot be covered by a later
-/// load.
+/// the generation to Stopping before waiting for those stages. Every external side effect is
+/// reserved by its stage before entry, committed only after the boundary returns, and retained
+/// for rollback if the boundary returns late. Cleanup callers all wait on the same completion
+/// source. A failed teardown is terminal (Failed) and cannot be covered by a later load.
 /// </summary>
 public sealed class PluginLifecycleGate
 {
@@ -35,6 +35,8 @@ public sealed class PluginLifecycleGate
     private PluginLifecycleState state = PluginLifecycleState.NotLoaded;
     private long nextGeneration;
     private TaskCompletionSource<bool>? cleanupCompletion;
+    private TaskCompletionSource<bool>? resourceRetryCompletion;
+    private Action<Exception>? resourceDiagnostic;
     private bool lastCleanupSucceeded = true;
 
     public PluginLifecycleGate(TimeSpan? quiescenceTimeout = null)
@@ -96,6 +98,8 @@ public sealed class PluginLifecycleGate
             generation = new PluginGeneration(this, ++nextGeneration);
             current = generation;
             cleanupCompletion = null;
+            resourceRetryCompletion = null;
+            resourceDiagnostic = null;
             lastCleanupSucceeded = true;
             state = PluginLifecycleState.Loading;
             return true;
@@ -173,7 +177,9 @@ public sealed class PluginLifecycleGate
 
     /// <summary>
     /// Performs the supplied teardown exactly once. If another caller is already cleaning up,
-    /// this call waits for that caller's result rather than returning a default value.
+    /// this call waits for that caller's result rather than returning a default value. A failed
+    /// generation may subsequently run only retained resource rollbacks; the teardown graph is
+    /// never repeated.
     /// </summary>
     public bool Cleanup(
         IReadOnlyList<PluginCleanupStep> steps,
@@ -220,14 +226,38 @@ public sealed class PluginLifecycleGate
 
         Task<bool>? completion;
         PluginGeneration? generation;
+        var retryResources = false;
         lock (gate)
         {
+            resourceDiagnostic ??= diagnostic;
             if (state == PluginLifecycleState.NotLoaded)
                 return true;
             if (cleanupCompletion != null)
             {
-                completion = cleanupCompletion.Task;
-                generation = null;
+                var completedGeneration = current;
+                if (state == PluginLifecycleState.Failed
+                    && completedGeneration?.CleanupCompleteUnsafe == true
+                    && completedGeneration.HasOutstandingResourcesUnsafe)
+                {
+                    if (resourceRetryCompletion != null)
+                    {
+                        completion = resourceRetryCompletion.Task;
+                        generation = null;
+                    }
+                    else
+                    {
+                        resourceRetryCompletion = new TaskCompletionSource<bool>(
+                            TaskCreationOptions.RunContinuationsAsynchronously);
+                        completion = resourceRetryCompletion.Task;
+                        generation = completedGeneration;
+                        retryResources = true;
+                    }
+                }
+                else
+                {
+                    completion = cleanupCompletion.Task;
+                    generation = null;
+                }
             }
             else if ((state == PluginLifecycleState.Stopped || state == PluginLifecycleState.Failed)
                 && current?.CleanupCompleteUnsafe == true)
@@ -245,6 +275,7 @@ public sealed class PluginLifecycleGate
                 else
                     state = PluginLifecycleState.Failed;
                 generation.RequestStopUnsafe();
+                generation.MarkResourcesForRollbackUnsafe();
                 cleanupCompletion = new TaskCompletionSource<bool>(
                     TaskCreationOptions.RunContinuationsAsynchronously);
                 completion = cleanupCompletion.Task;
@@ -253,6 +284,22 @@ public sealed class PluginLifecycleGate
 
         if (generation == null)
             return completion!.GetAwaiter().GetResult();
+
+        if (retryResources)
+        {
+            // A late resource may have failed after the shared cleanup result was published.
+            // Retry only those callbacks; never re-run the whole teardown graph or wait for a
+            // stage that is still executing its external boundary.
+            var drained = generation.owner.DrainResourceRollbacks(generation);
+            lock (gate)
+            {
+                if (!drained)
+                    lastCleanupSucceeded = false;
+                resourceRetryCompletion!.TrySetResult(false);
+                resourceRetryCompletion = null;
+            }
+            return completion!.GetAwaiter().GetResult();
+        }
 
         var succeeded = true;
         var deadline = DateTime.UtcNow + quiescenceTimeout;
@@ -288,6 +335,12 @@ public sealed class PluginLifecycleGate
                 succeeded = false;
                 Report(diagnostic, exception);
             }
+
+            // Explicit teardown normally releases resources at its semantic ordering points.
+            // This final drain is the safety net for a newly added stage, and leaves a pending
+            // boundary retained for its late completion rather than pretending cleanup is done.
+            if (!generation.owner.EnableAndDrainResourceRollbacks(generation))
+                succeeded = false;
         }
         catch (Exception exception)
         {
@@ -297,7 +350,11 @@ public sealed class PluginLifecycleGate
 
         lock (gate)
         {
-            succeeded = succeeded && generation.FailureUnsafe == null;
+            // A pending reservation is itself a cleanup failure. In particular, no cleanup path
+            // may report Stopped while a non-cooperative stage can still publish a resource.
+            succeeded = succeeded
+                && generation.FailureUnsafe == null
+                && !generation.HasOutstandingResourcesUnsafe;
             lastCleanupSucceeded = succeeded;
             state = succeeded ? PluginLifecycleState.Stopped : PluginLifecycleState.Failed;
             generation.MarkCleanupCompleteUnsafe();
@@ -417,8 +474,74 @@ public sealed class PluginLifecycleGate
                     TaskCreationOptions.RunContinuationsAsynchronously);
             }
             generation.ActiveStagesUnsafe++;
-            return new PluginStage(generation);
+            return new PluginStage(generation, allowRunning);
         }
+    }
+
+    internal PluginGenerationResource? TryRegisterResource(
+        PluginStage stage,
+        string name,
+        Action rollback,
+        bool deferWhileAnotherBoundaryPending)
+    {
+        ArgumentNullException.ThrowIfNull(stage);
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("resource name is required", nameof(name));
+        ArgumentNullException.ThrowIfNull(rollback);
+        lock (gate)
+        {
+            if (!ReferenceEquals(current, stage.Generation)
+                || stage.IsDisposedUnsafe
+                || stage.Generation.CleanupCompleteUnsafe
+                || stage.Generation.CleanupRequestedUnsafe)
+                return null;
+
+            var resource = new PluginGenerationResource(
+                this,
+                stage.Generation,
+                stage,
+                name,
+                rollback,
+                deferWhileAnotherBoundaryPending);
+            stage.Generation.ResourcesUnsafe.Add(resource);
+            return resource;
+        }
+    }
+
+    internal void ReportResourceFailure(
+        PluginGeneration generation,
+        string name,
+        Exception exception)
+    {
+        var wrapped = new InvalidOperationException(
+            "generation resource '" + name + "' rollback failed",
+            exception);
+        RecordFailure(generation, wrapped);
+        Action<Exception>? diagnostic;
+        lock (gate)
+            diagnostic = resourceDiagnostic;
+        Report(diagnostic, wrapped);
+    }
+
+    internal bool DrainResourceRollbacks(PluginGeneration generation)
+    {
+        PluginGenerationResource[] resources;
+        lock (gate)
+        {
+            resources = generation.ResourcesUnsafe.ToArray();
+        }
+
+        var succeeded = true;
+        foreach (var resource in resources)
+            succeeded = resource.RequestRollback() && succeeded;
+        return succeeded;
+    }
+
+    internal bool EnableAndDrainResourceRollbacks(PluginGeneration generation)
+    {
+        lock (gate)
+            generation.ResourceDrainEnabledUnsafe = true;
+        return DrainResourceRollbacks(generation);
     }
 
     internal bool IsGenerationRunning(PluginGeneration generation)
@@ -501,13 +624,23 @@ public sealed class PluginLifecycleGate
 
     internal void ExitStage(PluginGeneration generation)
     {
+        var drain = false;
         lock (gate)
         {
             if (generation.ActiveStagesUnsafe > 0)
                 generation.ActiveStagesUnsafe--;
             if (generation.ActiveStagesUnsafe == 0)
+            {
                 generation.StagesDrainedUnsafe?.TrySetResult(true);
+                drain = generation.ResourceDrainEnabledUnsafe;
+            }
         }
+
+        // A timed-out stage can complete after the shared cleanup result was published. Its
+        // completion is the safe point for any resource whose boundary never returned; do not
+        // make the cleanup caller wait for this path.
+        if (drain)
+            _ = DrainResourceRollbacks(generation);
     }
 
     public sealed class PluginGeneration
@@ -533,12 +666,27 @@ public sealed class PluginLifecycleGate
         internal object? Owner { get; set; }
         internal int ActiveStagesUnsafe { get; set; }
         internal List<PluginGenerationLease> LeasesUnsafe { get; } = new();
+        internal List<PluginGenerationResource> ResourcesUnsafe { get; } = new();
         internal TaskCompletionSource<bool>? StagesDrainedUnsafe { get; set; }
         internal Exception? FailureUnsafe { get; set; }
         internal bool QuiescenceTimedOutUnsafe { get; set; }
         internal bool CleanupCompleteUnsafe { get; set; }
+        internal bool CleanupRequestedUnsafe { get; set; }
+        internal bool ResourceDrainEnabledUnsafe { get; set; }
         internal bool IsFaultedUnsafe => FailureUnsafe != null;
         internal bool IsCancellationRequestedUnsafe => cancellationToken.IsCancellationRequested;
+        internal bool HasOutstandingResourcesUnsafe => ResourcesUnsafe.Count != 0;
+        internal bool HasPendingResourceUnsafe => ResourcesUnsafe.Any(
+            static resource => resource.IsPendingUnsafe);
+
+        public int OutstandingResourceCount
+        {
+            get
+            {
+                lock (owner.gate)
+                    return ResourcesUnsafe.Count;
+            }
+        }
 
         public bool AttachOwner(object owner) => this.owner.TryAttachOwner(this, owner);
 
@@ -555,6 +703,23 @@ public sealed class PluginLifecycleGate
         public PluginGenerationLease? TryAcquireRunningLease() => owner.TryAcquireLease(this);
 
         public bool IsRunning => owner.IsGenerationRunning(this);
+
+        internal bool CanCommitResourceUnsafe(PluginGenerationResource resource)
+        {
+            if (!ReferenceEquals(owner.current, this)
+                || CleanupCompleteUnsafe
+                || IsFaultedUnsafe
+                || IsCancellationRequestedUnsafe
+                || CleanupRequestedUnsafe
+                || resource.Stage.IsDisposedUnsafe)
+                return false;
+
+            return resource.Stage.AllowRunning
+                ? owner.state == PluginLifecycleState.Running
+                : owner.state == PluginLifecycleState.Loading;
+        }
+
+        internal void MarkResourcesForRollbackUnsafe() => CleanupRequestedUnsafe = true;
 
         internal void RequestStopUnsafe()
         {
@@ -612,12 +777,227 @@ public sealed class PluginLifecycleGate
         }
     }
 
+    /// <summary>
+    /// A reservation for one external side effect. The reservation is installed before entering
+    /// the boundary. Commit publishes ownership only after the boundary returns and the
+    /// generation is still admissible; otherwise the local rollback runs immediately. Cleanup
+    /// can request rollback without waiting for a non-cooperative boundary, and the reservation
+    /// remains retained until its late completion settles.
+    /// </summary>
+    public sealed class PluginGenerationResource : IDisposable
+    {
+        private readonly PluginLifecycleGate owner;
+        private readonly PluginGeneration generation;
+        private readonly Action rollback;
+        private readonly string name;
+        private readonly bool deferWhileAnotherBoundaryPending;
+        private bool completed;
+        private bool committed;
+        private bool rollbackInProgress;
+        private bool rolledBack;
+        private int disposed;
+
+        internal PluginGenerationResource(
+            PluginLifecycleGate owner,
+            PluginGeneration generation,
+            PluginStage stage,
+            string name,
+            Action rollback,
+            bool deferWhileAnotherBoundaryPending)
+        {
+            this.owner = owner;
+            this.generation = generation;
+            Stage = stage;
+            this.name = name;
+            this.rollback = rollback;
+            this.deferWhileAnotherBoundaryPending = deferWhileAnotherBoundaryPending;
+        }
+
+        internal PluginStage Stage { get; }
+
+        public string Name => name;
+
+        public bool IsCommitted
+        {
+            get { lock (owner.gate) return committed; }
+        }
+
+        public bool IsRolledBack
+        {
+            get { lock (owner.gate) return rolledBack; }
+        }
+
+        internal bool IsPendingUnsafe => !completed;
+
+        public bool IsPending
+        {
+            get
+            {
+                lock (owner.gate)
+                    return IsPendingUnsafe;
+            }
+        }
+
+        /// <summary>
+        /// Completes the external boundary and conditionally publishes its owner. A false
+        /// result means the side effect returned after cancellation/failure; its rollback has
+        /// already been attempted and the caller must not publish the local object elsewhere.
+        /// </summary>
+        public bool Commit(Action? publish = null)
+        {
+            var executeRollback = false;
+            Exception? publicationFailure = null;
+            lock (owner.gate)
+            {
+                if (completed)
+                    return committed;
+
+                completed = true;
+                if (generation.CanCommitResourceUnsafe(this))
+                {
+                    try
+                    {
+                        publish?.Invoke();
+                        committed = true;
+                    }
+                    catch (Exception exception)
+                    {
+                        publicationFailure = exception;
+                    }
+                }
+
+                if (!committed)
+                    executeRollback = true;
+            }
+
+            if (publicationFailure != null)
+                owner.ReportResourceFailure(generation, name, publicationFailure);
+            if (executeRollback)
+                _ = ExecuteRollback();
+            return committed;
+        }
+
+        /// <summary>
+        /// Requests the owned resource's idempotent teardown. If the external boundary has not
+        /// returned yet this only records the request; Commit or Dispose performs the callback
+        /// after the boundary is known to be complete.
+        /// </summary>
+        public bool RequestRollback()
+        {
+            var executeRollback = false;
+            lock (owner.gate)
+            {
+                generation.CleanupRequestedUnsafe = true;
+                if (!completed
+                    || rolledBack
+                    || rollbackInProgress
+                    || (deferWhileAnotherBoundaryPending
+                        && generation.ResourcesUnsafe.Any(
+                            resource => !ReferenceEquals(resource, this)
+                                && resource.IsPendingUnsafe)))
+                    return true;
+                executeRollback = true;
+            }
+
+            return !executeRollback || ExecuteRollback();
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0)
+                return;
+
+            var executeRollback = false;
+            lock (owner.gate)
+            {
+                if (!completed)
+                {
+                    // The stage is leaving after the boundary returned or threw. There is no
+                    // safe reason to retain an uncommitted local resource.
+                    completed = true;
+                    executeRollback = true;
+                }
+            }
+
+            if (executeRollback)
+                _ = ExecuteRollback();
+        }
+
+        private bool ExecuteRollback()
+        {
+            lock (owner.gate)
+            {
+                if (rolledBack || rollbackInProgress || !completed)
+                    return true;
+                rollbackInProgress = true;
+            }
+
+            Exception? failure = null;
+            try
+            {
+                rollback();
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+
+            lock (owner.gate)
+            {
+                rollbackInProgress = false;
+                if (failure == null)
+                {
+                    rolledBack = true;
+                    generation.ResourcesUnsafe.Remove(this);
+                }
+            }
+
+            if (failure != null)
+            {
+                owner.ReportResourceFailure(generation, name, failure);
+                return false;
+            }
+
+            bool drain;
+            lock (owner.gate)
+                drain = generation.ResourceDrainEnabledUnsafe
+                    && generation.CleanupRequestedUnsafe;
+            if (drain)
+                _ = owner.DrainResourceRollbacks(generation);
+            return true;
+        }
+    }
+
     public sealed class PluginStage : IDisposable
     {
         private readonly PluginGeneration generation;
         private int disposed;
 
-        internal PluginStage(PluginGeneration generation) => this.generation = generation;
+        internal PluginStage(PluginGeneration generation, bool allowRunning)
+        {
+            this.generation = generation;
+            AllowRunning = allowRunning;
+        }
+
+        internal PluginGeneration Generation => generation;
+        internal bool AllowRunning { get; }
+        internal bool IsDisposedUnsafe => Volatile.Read(ref disposed) != 0;
+
+        public PluginGenerationResource RegisterResource(string name, Action rollback) =>
+            RegisterResource(name, rollback, deferWhileAnotherBoundaryPending: false);
+
+        public PluginGenerationResource RegisterResource(
+            string name,
+            Action rollback,
+            bool deferWhileAnotherBoundaryPending) =>
+            generation.owner.TryRegisterResource(
+                this,
+                name,
+                rollback,
+                deferWhileAnotherBoundaryPending)
+            ?? throw new OperationCanceledException(
+                "plugin generation cannot register a resource after cleanup",
+                generation.CancellationToken);
 
         public void Dispose()
         {
