@@ -954,3 +954,116 @@ and adds one concrete mutant for each PF-2 through PF-5 behavior. The actual thr
 **11/11** configured compile-valid mutants (the prior M-5/PF-1 seven plus PF-2, PF-3, PF-4, and
 PF-5). This is recorded as coverage evidence only; PF-6 remains the next independent audit.
 Remaining requested PF IDs: **PF-6 and PF-7**.
+
+## PF-6/PF-7 follow-up — DONE (commits `af6294e`, `40d41a1`, and this context update)
+
+This is the independent final mutation/test-assurance audit. `docs/POST-FIX-REVIEW.md` was not
+edited. No production runtime source was changed in this batch; the PF-1..PF-5 fixes remain
+linked and exercised at the current checkout.
+
+### Independent audit and gate hardening
+
+Before changing the gate, I ran the then-current script from a Docker container whose repository
+mount was read-only. Its exact-source baseline was **20 passed, 0 failed, 0 skipped**, and all
+**11/11** configured mutants were killed. That green result was insufficient: the old gate had no
+preserve-recovery, checksum/epoch, stage/callback-boundary, or exact patch-surface mutant, and its
+focused runner accepted any non-zero result without proving that the selected test failed.
+
+Commit `af6294e` closes those assurance gaps:
+
+- `ProductionBudgetAndShutdownIntegrationTests` now uses the real linked cache and HTTP classes
+  to assert unknown-length response production stops at **131,072..139,264 bytes** (the 8 KiB
+  reader slack), exact reverse source-plus-translation retention of **12,003 UTF-8 bytes** and
+  source lookup, newest valid journal recovery, preserved `.bak` recovery, corrupt-checksum
+  rejection, negative-epoch rejection with a matching checksum, final expanded-render refusal,
+  timed-out reload quarantine, and terminal flush behavior.
+- The stage and callback integration tests assert that cleanup completes within the injected
+  deadline, continues later teardown, and returns a shared failed/quarantined result. A deliberate
+  hours-long wait mutant therefore fails with the explicit bounded-deadline assertion rather than
+  merely relying on a test-run timeout.
+- `ProductionSourceLinkIntegrationTests` checks the integration project’s wildcard link to
+  `../MuvluvLLMMod/*.cs`, rejects a local copied `Production` compile path, executes the linked
+  final-fill budget behavior, and records the exact three applied production patches. The latter
+  plus the existing render test covers the no-pre-TMP skill route and the final TMP assignment;
+  source-surface checks remain supplementary.
+- `RuntimeStubs.Harmony` records patch applications, while the fake TMP setter, fake config event,
+  fake native application event, and fake Unity objects continue to invoke the actual linked
+  production paths. The stubs do not claim native Harmony detours, IL2CPP delegate conversion,
+  Unity object pooling, input delivery, font/layout behavior, or complete game UI coverage.
+- `scripts/mutation-gate.sh` still copies the read-only source into a base temporary directory and
+  creates a separate temporary copy for every mutation. It now requires the exact baseline count,
+  confirms the mutant compiled into an `IntegrationTests.dll`, and requires the named focused test
+  to appear in the failing output. A generic compile/setup failure cannot count as a kill.
+
+### Complete PF-6 mutation matrix
+
+Every row was run in its own Docker throwaway copy from the read-only source mount. “1/0” means
+`Failed: 1, Passed: 0, Total: 1` for the exact focused test; all rows compiled successfully. The
+single expected compiler warning was the deliberate unreachable branch in `M5-B2`; it had zero
+errors and its focused behavioral assertion still failed.
+
+| Mutation | Exact test target | Expected failure/invariant | Actual Docker output/count |
+|---|---|---|---|
+| `M5-B1-broad-tmp-token` — accept every TMP setter while a token exists | `ProductionRenderIntegrationTests.Real_prefix_and_fake_setter_fail_closed_for_nested_external_and_stale_lifecycle_writes` | Nested same/other-TMP external setters must invalidate provenance; no wrong F2 restore | Compile-valid; **1/0**, nested external value restored incorrectly; killed |
+| `M5-B2-reopen-generation-gate` — admit a load after failed cleanup | `ProductionCoordinationIntegrationTests.Failed_cleanup_quarantines_the_generation_and_blocks_reopen` | Failed teardown must remain terminal and reject replacement load | Compile-valid with CS0162 only; **1/0**, reopen assertion failed; killed |
+| `M5-M1-reconvert-quit-delegate` — convert a fresh native quit delegate for add | `ProductionCoordinationIntegrationTests.Real_plugin_registers_and_removes_the_same_native_quit_delegate` | Removal must pass the exact retained native delegate identity | Compile-valid; **1/0**, fake native callback remained registered; killed |
+| `M5-N1-open-required-patch-verification` — skip the required verification failure | `ProductionRenderIntegrationTests.Missing_required_patch_verification_rolls_back_before_hotkey_persistence_or_worker_start` | Missing required target must throw and roll back before later resources | Compile-valid; **1/0**, expected verification exception was absent; killed |
+| `M5-M3-disable-budget-gate` — make text budget always accept | `ProductionBudgetAndShutdownIntegrationTests.Oversized_render_input_is_rejected_fail_closed_and_not_retained` | Oversized render input remains original and is not pending/retained | Compile-valid; **1/0**, oversized input entered pending state; killed |
+| `M5-M4-remove-terminal-retry-guard` — allow one terminal flush attempt | `ProductionBudgetAndShutdownIntegrationTests.Terminal_flush_recovers_from_one_transient_write_failure` | One transient final write failure must be recovered by a later bounded attempt | Compile-valid; **1/0**, terminal flush returned false; killed |
+| `M5-PF1-single-stopping-owner` — remove terminal-fault checks and clear the stopping set on handoff | `ProductionBudgetAndShutdownIntegrationTests.Timed_out_reload_is_terminal_and_retains_the_old_worker_for_cleanup` | Timeout → second reload must reject and retain worker A for terminal cleanup/quarantine | Compile-valid; **1/0**, lifecycle did not remain terminal/retained; killed |
+| `PF2-fixed-filename-priority` — choose path priority before epoch | `ProductionBudgetAndShutdownIntegrationTests.Durable_cache_recovery_chooses_the_newest_valid_journal_epoch` | Newer valid temporary epoch must beat an older valid canonical epoch | Compile-valid; **1/0**, new generated entry was lost; killed |
+| `PF3-response-content-read` — use default buffering `SendAsync` | `ProductionBudgetAndShutdownIntegrationTests.Response_body_budget_stops_unknown_length_producer_before_full_buffer` | Unknown-length producer must stop near the 128 KiB ceiling, not buffer all 512 KiB | Compile-valid; **1/0**, actual producer count **524,288** vs expected 131,072..139,264; killed |
+| `PF4-translated-only-reverse-bytes` — omit source bytes from reverse entry cost | `ProductionBudgetAndShutdownIntegrationTests.Reverse_index_retains_source_and_translation_bytes_for_admission` | Retained metric must include exact source plus translation bytes and remain source-resolvable | Compile-valid; **1/0**, actual **3** vs expected **12,003**; killed |
+| `PF5-unbounded-filled-output` — return expanded template without final budget check | `ProductionRenderIntegrationTests.Over_budget_generated_expansion_stays_source_even_when_f2_is_off` | Over-budget render must stay original, remove invalid generated output, and never strand F2 provenance | Compile-valid; **1/0**, expanded Chinese output was displayed; killed |
+| `PF2-preserve-recovery-false` — do not preserve the prior canonical state as `.bak` | `ProductionBudgetAndShutdownIntegrationTests.Authoritative_write_preserves_the_previous_epoch_for_backup_recovery` | Previous coherent epoch must remain recoverable when the current canonical/mirrors disappear | Compile-valid; **1/0**, backup was absent; killed |
+| `PF2-ignore-checksum` — accept a checksum mismatch | `ProductionBudgetAndShutdownIntegrationTests.Newer_invalid_checksum_is_rejected_in_favor_of_a_valid_canonical_epoch` | A newer corrupt journal must not outrank a valid canonical epoch | Compile-valid; **1/0**, valid canonical entry was not recovered; killed |
+| `PF2-accept-invalid-epoch` — remove the negative-epoch validation | `ProductionBudgetAndShutdownIntegrationTests.Negative_epoch_journal_is_rejected_even_when_its_checksum_matches_its_payload` | A checksum-valid but invalid epoch must not be loaded or promoted | Compile-valid; **1/0**, invalid journal entry was loaded; killed |
+| `PF1-unbounded-stage-wait` — replace the stage deadline with a one-hour wait | `ProductionCoordinationIntegrationTests.Cleanup_stage_wait_deadline_quarantines_and_continues_later_teardown` | Blocked load stage must be bounded, later teardown must run, and generation must quarantine | Compile-valid; **1/0** with explicit “load-stage cleanup exceeded its bounded quiescence deadline”; killed |
+| `PF1-unbounded-callback-wait` — replace the callback deadline with a one-hour wait | `ProductionCoordinationIntegrationTests.Cleanup_callback_wait_deadline_has_shared_failure_and_late_callback_is_inert` | Blocked config callback must be bounded and late callback must remain inert | Compile-valid; **1/0** with explicit “configuration-callback cleanup exceeded its bounded quiescence deadline”; killed |
+| `M2-extra-nonrender-hook` — add an extra non-render Harmony route | `ProductionSourceLinkIntegrationTests.Exact_source_harness_applies_only_final_tmp_and_scenario_priority_patches` | Exact source must apply only TMP setter plus the two approved scenario-priority prefixes; skill text has one final TMP route | Compile-valid; **1/0**, applied patch count was 4 instead of 3; killed |
+
+Final gate result: **25/25 exact-source integration tests passed**, and **17/17 compile-valid
+mutants were killed**. The current exact-source tests cover B1 token acceptance/nested external
+setters, M1 delegate identity, N1 verification rollback, M2 no pre-TMP route, PF1 worker tracking
+and bounded waits, PF2 selection/recovery/integrity, PF3 streaming, PF4 source accounting, and
+PF5 final render/F2 behavior. No PF-6 assurance gap remains at this source/test boundary.
+
+### PF-7 README correction
+
+Commit `40d41a1` changes only the affected README claims and their surface assertions:
+
+- queue/pipeline eligibility now requires kana **and** accepted bounded input and normalized
+  template admission; generated/filled output must pass its own output budget, so the old
+  kana-only “if and only if” wording is gone;
+- F2 is described as restoring only successfully provenance-recorded render-layer translations;
+  out-of-budget/invalid values remain original and ambiguity or validation failure is a no-op;
+- the text remains standalone and upstream-neutral, with no named internal methods or hotkey
+  assumptions; and
+- build/test instructions retain Docker-only, read-only game/source handling and no longer embed
+  a stale integration-test count.
+
+### Final Docker results and boundaries
+
+The final commands were all `docker run --rm` with `mcr.microsoft.com/dotnet/sdk:8.0`; the source
+was mounted read-only and copied into a disposable writable container directory. The game install
+was mounted `readonly`, never launched, and never written:
+
+```text
+dotnet test MuvluvLLMMod.sln -c Release
+  MuvluvLLMMod.Tests: 250 passed, 0 failed, 0 skipped
+  MuvluvLLMMod.IntegrationTests: 25 passed, 0 failed, 0 skipped
+  Total: 275 passed, 0 failed, 0 skipped
+
+dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game
+  0 warnings, 0 errors
+
+bash scripts/mutation-gate.sh
+  exact-source baseline: 25 passed, 0 failed, 0 skipped
+  17/17 compile-valid mutants killed
+```
+
+The integration project links current production files directly; its BepInEx, Harmony, Unity, TMP,
+scenario, and native-event implementations are deterministic net8 stubs. They prove production
+policy, ownership, lifecycle, cache, HTTP, and patch-wiring behavior at that boundary, not real
+IL2CPP detours, native delegate conversion, Unity pooling/input, fonts/layout, or complete in-game
+UI coverage. Those remain game-only handoff checks, not unresolved PF-6/PF-7 source defects.
