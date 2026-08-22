@@ -37,8 +37,9 @@ public sealed class PluginLifecycleGateTests
     }
 
     [Fact]
-    public void Concurrent_cleanup_invocation_executes_each_step_at_most_once()
+    public async Task Concurrent_cleanup_invocation_executes_each_step_at_most_once()
     {
+        const int callerCount = 16;
         var gate = new PluginLifecycleGate();
         Assert.True(gate.TryBeginLoad());
         var counts = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
@@ -51,10 +52,50 @@ public sealed class PluginLifecycleGateTests
             new PluginCleanupStep("flush", () => Increment(counts, "flush")),
             new PluginCleanupStep("unpatch", () => Increment(counts, "unpatch"))
         };
+        using var barrier = new Barrier(callerCount);
 
-        Parallel.For(0, 128, _ => gate.Cleanup(steps));
+        var callers = Enumerable.Range(0, callerCount).Select(_ =>
+            Task.Factory.StartNew(() =>
+            {
+                Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(5)));
+                gate.Cleanup(steps);
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
 
+        await Task.WhenAll(callers);
         Assert.All(steps, step => Assert.Equal(1, counts[step.Name]));
+    }
+
+    [Fact]
+    public async Task A_late_setting_change_after_machine_shutdown_cannot_start_a_worker()
+    {
+        var lifecycle = new MachineTranslatorLifecycle();
+        var gate = new PluginLifecycleGate();
+        var configSubscribed = true;
+        var factoryCalls = 0;
+        Assert.True(gate.TryBeginLoad());
+
+        Assert.True(gate.Cleanup(new[]
+        {
+            new PluginCleanupStep("config unsubscribe", () => configSubscribed = false),
+            new PluginCleanupStep("freeze", static () => { }),
+            new PluginCleanupStep("machine shutdown", lifecycle.Shutdown),
+            new PluginCleanupStep("late setting change", () =>
+            {
+                Assert.False(configSubscribed);
+                Assert.False(lifecycle.Reload(
+                    true,
+                    1,
+                    (_, _) =>
+                    {
+                        Interlocked.Increment(ref factoryCalls);
+                        return null!;
+                    }));
+            })
+        }));
+        await lifecycle.TransitionTask;
+
+        Assert.Equal(0, factoryCalls);
+        Assert.True(lifecycle.IsShutdown);
     }
 
     [Fact]
