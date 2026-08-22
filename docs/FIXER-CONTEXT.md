@@ -886,3 +886,70 @@ strict read-only mount; no game launch or host dependency change was performed:
 - `dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game`: **0 warnings,
   0 errors**; and
 - `bash scripts/mutation-gate.sh`: **16/16 baseline, all 7 compile-valid mutants killed**.
+
+## PF-2..PF-5 follow-up — implemented; PF-6/PF-7 remain deferred
+
+This batch changes only PF-2 through PF-5. PF-1 lifecycle/quarantine semantics remain as-is. The
+post-fix review document was not edited, and this note does not declare the PF-6 mutation/test
+audit or PF-7 final documentation wording closed.
+
+### PF-2 authoritative cache journal
+
+Commits `8a62ccf` (`fix: recover newest authoritative cache epoch`) and `d32b9e3` (the mutation
+gate update) add an epoch-bearing, checksummed state journal. New `cache.state.v1.json` snapshots
+carry a monotonic `Epoch`, `TransactionId`, and SHA-256 `Checksum` over the version, epoch,
+transaction metadata, and sorted/generated plus ordered pending/raw payload. Pre-journal V1 files
+without metadata are accepted deterministically as epoch zero and marked for safe migration.
+
+Startup reads canonical, temporary, and backup state artifacts with the existing bounded file
+reader, validates each schema/checksum, and chooses the greatest valid epoch; path order is only
+the equal-epoch tie-breaker. A recovered temp or backup is promoted with the prior valid canonical
+preserved as backup, while stale/corrupt temporary recovery files are removed deterministically.
+No legacy mirror is mixed with any observed state artifact. The canonical state write is the sole
+commit decision: generated/pending/raw legacy files are migration mirrors, and a mirror failure
+is diagnosed without making a successful authoritative epoch dirty or lost.
+
+### PF-3 response streaming
+
+Commit `0761479` (`fix: stream bounded LLM response bodies`) sends through the existing rate
+limiter with `HttpCompletionOption.ResponseHeadersRead`, preserving status, retry, and
+cancellation handling. The existing bounded reader therefore sees the response stream before
+`HttpClient` buffers it and rejects bodies over `TranslationBudget.MaxResponseBodyBytes`.
+Unknown-length 512 KiB producer tests allow only the 8 KiB reader-buffer slack and stop before the
+producer completes.
+
+### PF-4 reverse-index accounting
+
+Commit `aae00b2` (`fix: account reverse index source bytes`) admits and updates reverse entries
+with the UTF-8 cost of both retained source and translated strings. Unique mappings retain the
+full pair; same-pair touches repair/update the same accounted node; ambiguity drops the source
+identity and retains only the translated ambiguity marker; removal and LRU eviction subtract the
+same recorded cost. Admission is atomic and remains below the configured byte/entry caps. Tests
+assert the exact 12,003-byte cost of a 4,000-character Japanese source plus a short translation,
+then cover ambiguity and eviction.
+
+### PF-5 final fill budget and provenance
+
+Commit `139ec4f` (`fix: bound final placeholder expansion`) validates the final `TextTemplate.Fill`
+result against both UTF-16 and UTF-8 budgets after replacement. A failed fill returns null, so
+`TranslationResolver` removes the invalid generated template and leaves the original text while
+re-queueing normal production work. The exact render path covers a 4,080-Chinese-template plus
+100-character numeric expansion: it never displays the over-budget plugin output, including with
+F2 display disabled, and does not loosen provenance recording.
+
+### Regression and mutation results
+
+The checkpoints used `docker run --rm`; the game was mounted strictly read-only for production
+builds and was never launched or written:
+
+- PF-2 checkpoint: legacy tests **245 passed**, exact-source integration **17 passed**, plugin
+  build **0 warnings / 0 errors**.
+- PF-3 checkpoint: legacy tests **246 passed**, integration **18 passed**, plugin build **0/0**.
+- PF-4 checkpoint: legacy tests **248 passed**, integration **19 passed**, plugin build **0/0**.
+- PF-5 checkpoint: legacy tests **250 passed**, integration **20 passed**, plugin build **0/0**.
+
+The Docker-only `scripts/mutation-gate.sh` now requires the exact-source baseline **20 passed**
+and adds one concrete mutant for each PF-2 through PF-5 behavior. The actual throwaway run killed all
+**11/11** configured compile-valid mutants (the prior M-5/PF-1 seven plus PF-2, PF-3, PF-4, and
+PF-5). This is recorded as coverage evidence only; PF-6 remains the next independent audit.
+Remaining requested PF IDs: **PF-6 and PF-7**.
