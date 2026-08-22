@@ -60,15 +60,18 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
             var cache = new TranslationCache(root);
             const int pairCount = 4096;
             var accepted = 0;
+            var rejected = 0;
             for (var index = 0; index < pairCount; index++)
             {
                 var source = CjkPairPart(0x4e00 + index, 170, '字');
                 var translation = CjkPairPart(0x6000 + index, 171, '译');
-                if (!cache.StoreGenerated(source, translation))
-                    break;
-                accepted++;
+                if (cache.StoreGenerated(source, translation))
+                    accepted++;
+                else
+                    rejected++;
             }
 
+            Assert.Equal(pairCount, accepted + rejected);
             Assert.InRange(accepted, 1, pairCount);
             if (accepted < pairCount)
             {
