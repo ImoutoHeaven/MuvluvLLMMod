@@ -104,6 +104,196 @@ public sealed class ProductionCoordinationIntegrationTests
         Assert.Equal(PluginLifecycleState.Stopped, gate.State);
     }
 
+    [Theory]
+    [InlineData("configuration initialization")]
+    [InlineData("Harmony patches")]
+    [InlineData("injected Hotkey component")]
+    [InlineData("application-quit delegate")]
+    [InlineData("cache persistence task")]
+    [InlineData("machine worker startup")]
+    public async Task Every_late_stage_resource_rolls_back_without_publishing(
+        string resourceName)
+    {
+        var gate = new PluginLifecycleGate(TimeSpan.FromMilliseconds(40));
+        Assert.True(gate.TryBeginLoad(out var generation));
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var rollbackCalls = 0;
+        var published = false;
+
+        var stageTask = Task.Run(() =>
+        {
+            using var stage = generation.TryEnterStage();
+            Assert.NotNull(stage);
+            using var resource = stage!.RegisterResource(
+                resourceName,
+                () =>
+                {
+                    Interlocked.Increment(ref rollbackCalls);
+                    published = false;
+                });
+            entered.TrySetResult(true);
+            release.Task.GetAwaiter().GetResult();
+            Assert.False(resource.Commit(() => published = true));
+        });
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var cleanup = Task.Run(() => gate.Cleanup(_ => true));
+        Assert.Same(cleanup, await Task.WhenAny(cleanup, Task.Delay(500)));
+        Assert.False(await cleanup);
+        Assert.False(published);
+        Assert.Null(generation.TryEnterStage());
+
+        // The stage is allowed to finish after the cleanup response. Its local resource is still
+        // retained by the generation and must be rolled back at the post-side-effect commit.
+        release.TrySetResult(true);
+        await stageTask.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(1, rollbackCalls);
+        Assert.False(published);
+        Assert.Equal(0, generation.OutstandingResourceCount);
+
+        // The failed generation remains quarantined and a repeated cleanup cannot reopen it.
+        Assert.False(gate.Cleanup(_ => true));
+        Assert.False(gate.TryBeginLoad(out _));
+    }
+
+    [Fact]
+    public async Task Late_persistence_resource_cancels_the_task_after_cleanup_timeout()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "MuvluvLLMMod.late-persistence." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var cache = new TranslationCache(root);
+            var cancellation = new CancellationTokenSource();
+            var persistenceTask = Task.CompletedTask;
+            var gate = new PluginLifecycleGate(TimeSpan.FromMilliseconds(40));
+            Assert.True(gate.TryBeginLoad(out var generation));
+            var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            var stageTask = Task.Run(() =>
+            {
+                using var stage = generation.TryEnterStage();
+                Assert.NotNull(stage);
+                using var resource = stage!.RegisterResource(
+                    "cache persistence task",
+                    () =>
+                    {
+                        cancellation.Cancel();
+                        persistenceTask.GetAwaiter().GetResult();
+                        cancellation.Dispose();
+                    });
+                entered.TrySetResult(true);
+                release.Task.GetAwaiter().GetResult();
+                persistenceTask = cache.RunPersistenceLoopAsync(cancellation.Token);
+                Assert.False(resource.Commit());
+            });
+
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            var cleanup = Task.Run(() => gate.Cleanup(_ => true));
+            await WaitUntilAsync(() => gate.State == PluginLifecycleState.Stopping);
+            Assert.False(await cleanup.WaitAsync(TimeSpan.FromSeconds(2)));
+
+            release.TrySetResult(true);
+            await stageTask.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.True(persistenceTask.IsCompleted);
+            Assert.Equal(0, generation.OutstandingResourceCount);
+            Assert.False(gate.Cleanup(_ => true));
+            Assert.False(gate.TryBeginLoad(out _));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Late_machine_resource_stops_the_worker_after_cleanup_timeout()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "MuvluvLLMMod.late-machine." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var cache = new TranslationCache(root);
+            var lifecycle = new MachineTranslatorLifecycle(shutdownTimeout: TimeSpan.FromSeconds(1));
+            var gate = new PluginLifecycleGate(TimeSpan.FromMilliseconds(40));
+            Assert.True(gate.TryBeginLoad(out var generation));
+            var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            var stageTask = Task.Run(() =>
+            {
+                using var stage = generation.TryEnterStage();
+                Assert.NotNull(stage);
+                using var resource = stage!.RegisterResource(
+                    "machine worker startup",
+                    lifecycle.Shutdown);
+                entered.TrySetResult(true);
+                release.Task.GetAwaiter().GetResult();
+                Assert.True(lifecycle.Initialize(
+                    true,
+                    1,
+                    (limiter, backlog) => new MachineTranslator(
+                        cache,
+                        static (_, _) => Task.FromResult<string?>("worker"),
+                        1,
+                        TimeSpan.FromSeconds(1),
+                        backlog),
+                    new TranslationRetryPolicy()));
+                Assert.False(resource.Commit());
+            });
+
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            var cleanup = Task.Run(() => gate.Cleanup(_ => true));
+            await WaitUntilAsync(() => gate.State == PluginLifecycleState.Stopping);
+            Assert.False(await cleanup.WaitAsync(TimeSpan.FromSeconds(2)));
+
+            release.TrySetResult(true);
+            await stageTask.WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.True(lifecycle.IsShutdown);
+            Assert.Equal(0, generation.OutstandingResourceCount);
+            Assert.False(gate.Cleanup(_ => true));
+            Assert.False(gate.TryBeginLoad(out _));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Late_resource_rollback_failure_is_quarantined_and_retryable()
+    {
+        var gate = new PluginLifecycleGate(TimeSpan.FromMilliseconds(40));
+        Assert.True(gate.TryBeginLoad(out var generation));
+        using var stage = generation.TryEnterStage();
+        Assert.NotNull(stage);
+        var rollbackCalls = 0;
+        var resource = stage!.RegisterResource(
+            "late rollback failure",
+            () =>
+            {
+                if (Interlocked.Increment(ref rollbackCalls) == 1)
+                    throw new InvalidOperationException("simulated late rollback failure");
+            });
+        var cleanup = Task.Run(() => gate.Cleanup(_ => true));
+        await WaitUntilAsync(() => gate.State == PluginLifecycleState.Stopping);
+        Assert.False(await cleanup.WaitAsync(TimeSpan.FromSeconds(2)));
+
+        Assert.False(resource.Commit());
+        Assert.True(generation.OutstandingResourceCount > 0);
+        Assert.NotNull(gate.Failure);
+        Assert.False(gate.Cleanup(_ => true));
+        Assert.Equal(2, rollbackCalls);
+        Assert.Equal(0, generation.OutstandingResourceCount);
+        Assert.False(gate.TryBeginLoad(out _));
+    }
+
     [Fact]
     public async Task Cleanup_stage_wait_deadline_quarantines_and_continues_later_teardown()
     {

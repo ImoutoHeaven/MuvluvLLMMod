@@ -1,4 +1,5 @@
 using BepInEx;
+using BepInEx.Unity.IL2CPP;
 using HarmonyLib;
 using TMPro;
 using UnityEngine;
@@ -12,6 +13,7 @@ internal static class ProductionHarness
     {
         Harmony.Reset();
         Application.Reset();
+        BasePlugin.ResetBoundaries();
         UnityEngine.Object.ResetObjects();
         TMP_Text.ResetCounters();
         Keyboard.current = null;
@@ -31,6 +33,7 @@ internal static class ProductionHarness
     {
         Harmony.Reset();
         Application.Reset();
+        BasePlugin.ResetBoundaries();
         UnityEngine.Object.ResetObjects();
         TMP_Text.ResetCounters();
         Keyboard.current = null;

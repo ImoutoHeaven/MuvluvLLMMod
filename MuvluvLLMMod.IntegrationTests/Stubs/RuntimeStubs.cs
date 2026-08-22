@@ -178,6 +178,16 @@ namespace HarmonyLib
 
         public string Id { get; }
         public static string? SkipPatchTarget { get; set; }
+        public static bool BlockPatchAll { get; set; }
+        public static TaskCompletionSource<bool> PatchAllEntered { get; private set; } =
+            NewSignal();
+        public static TaskCompletionSource<bool> PatchAllRelease { get; private set; } =
+            NewSignal();
+        public static bool BlockAfterPatchAllPublication { get; set; }
+        public static TaskCompletionSource<bool> PatchAllPublished { get; private set; } =
+            NewSignal();
+        public static TaskCompletionSource<bool> PatchAllPostPublishRelease { get; private set; } =
+            NewSignal();
         public static int UnpatchSelfCalls { get; private set; }
 
         public static IReadOnlyList<PatchApplication> SnapshotApplications()
@@ -193,12 +203,27 @@ namespace HarmonyLib
                 owners.Clear();
                 applications.Clear();
                 SkipPatchTarget = null;
+                BlockPatchAll = false;
+                PatchAllEntered = NewSignal();
+                PatchAllRelease = NewSignal();
+                BlockAfterPatchAllPublication = false;
+                PatchAllPublished = NewSignal();
+                PatchAllPostPublishRelease = NewSignal();
                 UnpatchSelfCalls = 0;
             }
         }
 
+        private static TaskCompletionSource<bool> NewSignal() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         public void PatchAll(Type type)
         {
+            if (BlockPatchAll)
+            {
+                PatchAllEntered.TrySetResult(true);
+                PatchAllRelease.Task.GetAwaiter().GetResult();
+            }
+
             foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
             {
                 foreach (var patch in method.GetCustomAttributes<HarmonyPatch>(inherit: false))
@@ -219,6 +244,12 @@ namespace HarmonyLib
                         applications.Add(new PatchApplication(Id, method.Name, shortLabel));
                     }
                 }
+            }
+
+            if (BlockAfterPatchAllPublication)
+            {
+                PatchAllPublished.TrySetResult(true);
+                PatchAllPostPublishRelease.Task.GetAwaiter().GetResult();
             }
         }
 
@@ -264,6 +295,12 @@ namespace BepInEx.Unity.IL2CPP
 
     public abstract class BasePlugin
     {
+        public static bool BlockAddComponent { get; set; }
+        public static TaskCompletionSource<bool> AddComponentEntered { get; private set; } =
+            NewSignal();
+        public static TaskCompletionSource<bool> AddComponentRelease { get; private set; } =
+            NewSignal();
+
         protected BasePlugin()
         {
             Config = new ConfigFile();
@@ -274,6 +311,13 @@ namespace BepInEx.Unity.IL2CPP
         public ManualLogSource Log { get; }
         public int AddComponentCalls { get; private set; }
 
+        public static void ResetBoundaries()
+        {
+            BlockAddComponent = false;
+            AddComponentEntered = NewSignal();
+            AddComponentRelease = NewSignal();
+        }
+
         public virtual void Load()
         {
         }
@@ -283,8 +327,16 @@ namespace BepInEx.Unity.IL2CPP
         protected T AddComponent<T>() where T : MonoBehaviour, new()
         {
             AddComponentCalls++;
+            if (BlockAddComponent)
+            {
+                AddComponentEntered.TrySetResult(true);
+                AddComponentRelease.Task.GetAwaiter().GetResult();
+            }
             return UnityEngine.Object.AddComponent<T>();
         }
+
+        private static TaskCompletionSource<bool> NewSignal() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 }
 
@@ -374,6 +426,11 @@ namespace UnityEngine
         private static readonly List<Il2CppSystem.Action> handlers = new();
 
         public static bool ThrowOnRemove { get; set; }
+        public static bool BlockAddQuitting { get; set; }
+        public static TaskCompletionSource<bool> AddQuittingEntered { get; private set; } =
+            NewSignal();
+        public static TaskCompletionSource<bool> AddQuittingRelease { get; private set; } =
+            NewSignal();
         public static int AddCalls { get; private set; }
         public static int RemoveCalls { get; private set; }
         public static int CallbackCount
@@ -383,6 +440,12 @@ namespace UnityEngine
 
         public static void add_quitting(Il2CppSystem.Action handler)
         {
+            if (BlockAddQuitting)
+            {
+                AddQuittingEntered.TrySetResult(true);
+                AddQuittingRelease.Task.GetAwaiter().GetResult();
+            }
+
             lock (gate)
             {
                 handlers.Add(handler);
@@ -423,10 +486,16 @@ namespace UnityEngine
             {
                 handlers.Clear();
                 ThrowOnRemove = false;
+                BlockAddQuitting = false;
+                AddQuittingEntered = NewSignal();
+                AddQuittingRelease = NewSignal();
                 AddCalls = 0;
                 RemoveCalls = 0;
             }
         }
+
+        private static TaskCompletionSource<bool> NewSignal() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 }
 

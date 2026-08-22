@@ -133,8 +133,8 @@ public sealed class PatchSurfaceTests
         var throwFailure = patch.IndexOf("throw new HarmonyPatchVerificationException(verification)", failure, StringComparison.Ordinal);
 
         var plugin = ReadProductionSource("Plugin.cs");
-        var patchCall = plugin.IndexOf("Patch.Initialize(resources.Harmony)", StringComparison.Ordinal);
-        var hotkey = plugin.IndexOf("resources.Hotkey = AddComponent<Hotkey>()", patchCall, StringComparison.Ordinal);
+        var patchCall = plugin.IndexOf("Patch.Initialize(harmony)", StringComparison.Ordinal);
+        var hotkey = plugin.IndexOf("hotkey = AddComponent<Hotkey>()", patchCall, StringComparison.Ordinal);
         var persistence = plugin.IndexOf("RunPersistenceLoopAsync", patchCall, StringComparison.Ordinal);
         var machine = plugin.IndexOf("machineLifecycle.Initialize", patchCall, StringComparison.Ordinal);
 

@@ -29,7 +29,7 @@ public sealed class PluginSurfaceTests
     {
         var plugin = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "MuvluvLLMMod", "Plugin.cs"));
         var configurationShutdown = plugin.IndexOf(
-            "RunCleanupStep(\"shutdown configuration\"",
+            "\"shutdown configuration\"",
             StringComparison.Ordinal);
         var retire = plugin.IndexOf(
             "RunCleanupStep(\"retire TMP translation state\"",
