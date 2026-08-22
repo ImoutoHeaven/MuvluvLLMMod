@@ -823,3 +823,66 @@ into the container writable layer and the game was never launched. The game path
 
 The game directory `C:/Users/Eden/Muv-Luv/muv_luv_girlsgarden_cl` was read-only on the build
 mount and was not written or started. No host `dotnet` or dependency installation was used.
+
+---
+
+## PF-1 follow-up — terminal reload-worker quarantine and bounded generation quiescence
+
+Implementation and exact-source regression coverage are in commit `37c718d` (`fix: quarantine
+timed-out reload workers and bound teardown waits`). This batch changes only PF-1 and the
+related lifecycle/shutdown audit note; PF-2 through PF-7 remain deferred.
+
+### Fault and ownership model
+
+`MachineTranslatorLifecycle` no longer has an overwriteable stopping slot. Every worker handed
+off for stopping is retained in a reference-identity `HashSet<MachineTranslator>`. A worker's
+bounded `StopAsync` result is separate from its `StopCompletion` task: a timeout/failure records
+a terminal lifecycle exception, retains the worker, and observes `StopCompletion` until the worker
+really ends. The eventual observer removes only that worker after completion and observes any late
+exception. Shutdown captures the active worker plus the complete stopping set, and all callers
+receive the same shared shutdown task/result.
+
+A reload stop timeout/failure faults the lifecycle before replacement creation. The lifecycle then
+rejects reload, initialization, enqueue, and cancellation paths; queued transitions also check the
+fault before taking ownership or starting a replacement. Request-rate carryover and ordinary
+successful reload handoff remain unchanged. The worker's cancellation/generation checks continue
+to reject late cache publication.
+
+The lifecycle sends a terminal-fault notification to the owning `PluginLifecycleGate`. The
+production recipient only records the generation fault/quarantine; it does not recursively invoke
+synchronous cleanup from the transition. Cleanup remains the owner of freeze, machine shutdown,
+flush, and unpatch. A faulted generation is rejected by `TryBeginLoad`, and its later cleanup
+observes the same machine failure rather than reporting success over worker A. A timed-out worker
+remains retained/observed even after terminal cleanup; only its eventual completion releases the
+reference.
+
+### Bounded stage/callback teardown
+
+`PluginLifecycleGate` now accepts an injectable quiescence deadline, defaulting to five seconds and
+capped at 60 seconds for production configuration. One deadline covers both admitted load stages
+and generation config callbacks. Cleanup revokes the generation first, waits each boundary only
+within the remaining budget, and on timeout records a `TimeoutException`/generation failure while
+continuing independent teardown steps. The shared cleanup completion means concurrent callers see
+the same Failed result. Lease disposal is also bounded and becomes non-blocking after quiescence
+timeout, so `Config.Shutdown` cannot reintroduce an unbounded callback wait.
+
+Stage and callback completion sources, leases, and stale generation tokens remain retained for
+late completion. Their late `Dispose`/exit is safe, but state admission, running publication,
+lease entry, and a replacement load remain rejected after quarantine. The generation token caches
+its cancellation token so late code can observe cancellation after the CTS is disposed.
+
+### Regression and Docker validation
+
+The exact-source integration target now has 16 tests (including the A-ignores-cancellation reload
+1 timeout → reload 2 rejection → terminal cleanup case, retained-worker observation, blocked-stage
+and blocked-callback deadline cases). `scripts/mutation-gate.sh` adds the compile-valid
+`M5-PF1-single-stopping-owner` mutation; the current gate baseline is 16/16 and all 7 focused
+mutants are killed, including the deliberate single-owner overwrite mutation.
+
+Validation for commit `37c718d` used `docker run --rm`, read-only source copies, and the game as a
+strict read-only mount; no game launch or host dependency change was performed:
+
+- `dotnet test MuvluvLLMMod.sln -c Release`: **241 + 16 = 257 passed, 0 failed, 0 skipped**;
+- `dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game`: **0 warnings,
+  0 errors**; and
+- `bash scripts/mutation-gate.sh`: **16/16 baseline, all 7 compile-valid mutants killed**.
