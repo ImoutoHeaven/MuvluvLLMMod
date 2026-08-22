@@ -482,7 +482,7 @@ public sealed class PluginLifecycleGate
         PluginStage stage,
         string name,
         Action rollback,
-        bool deferWhileAnotherBoundaryPending)
+        Func<bool>? deferRollback)
     {
         ArgumentNullException.ThrowIfNull(stage);
         if (string.IsNullOrWhiteSpace(name))
@@ -502,7 +502,7 @@ public sealed class PluginLifecycleGate
                 stage,
                 name,
                 rollback,
-                deferWhileAnotherBoundaryPending);
+                deferRollback);
             stage.Generation.ResourcesUnsafe.Add(resource);
             return resource;
         }
@@ -790,7 +790,7 @@ public sealed class PluginLifecycleGate
         private readonly PluginGeneration generation;
         private readonly Action rollback;
         private readonly string name;
-        private readonly bool deferWhileAnotherBoundaryPending;
+        private readonly Func<bool>? deferRollback;
         private bool completed;
         private bool committed;
         private bool rollbackInProgress;
@@ -803,14 +803,14 @@ public sealed class PluginLifecycleGate
             PluginStage stage,
             string name,
             Action rollback,
-            bool deferWhileAnotherBoundaryPending)
+            Func<bool>? deferRollback)
         {
             this.owner = owner;
             this.generation = generation;
             Stage = stage;
             this.name = name;
             this.rollback = rollback;
-            this.deferWhileAnotherBoundaryPending = deferWhileAnotherBoundaryPending;
+            this.deferRollback = deferRollback;
         }
 
         internal PluginStage Stage { get; }
@@ -891,10 +891,7 @@ public sealed class PluginLifecycleGate
                 if (!completed
                     || rolledBack
                     || rollbackInProgress
-                    || (deferWhileAnotherBoundaryPending
-                        && generation.ResourcesUnsafe.Any(
-                            resource => !ReferenceEquals(resource, this)
-                                && resource.IsPendingUnsafe)))
+                    || deferRollback?.Invoke() == true)
                     return true;
                 executeRollback = true;
             }
@@ -984,8 +981,38 @@ public sealed class PluginLifecycleGate
         internal bool IsDisposedUnsafe => Volatile.Read(ref disposed) != 0;
 
         public PluginGenerationResource RegisterResource(string name, Action rollback) =>
-            RegisterResource(name, rollback, deferWhileAnotherBoundaryPending: false);
+            generation.owner.TryRegisterResource(
+                this,
+                name,
+                rollback,
+                deferRollback: null)
+            ?? throw new OperationCanceledException(
+                "plugin generation cannot register a resource after cleanup",
+                generation.CancellationToken);
 
+        /// <summary>
+        /// Registers a rollback dependency. The predicate is evaluated only after the external
+        /// boundary has completed; while it is true cleanup leaves this resource retained for a
+        /// dependent late completion. Production uses this only to keep configuration shutdown
+        /// behind a concurrently running activation boundary.
+        /// </summary>
+        internal PluginGenerationResource RegisterResource(
+            string name,
+            Action rollback,
+            Func<bool> deferRollback) =>
+            generation.owner.TryRegisterResource(
+                this,
+                name,
+                rollback,
+                deferRollback)
+            ?? throw new OperationCanceledException(
+                "plugin generation cannot register a resource after cleanup",
+                generation.CancellationToken);
+
+        /// <summary>
+        /// Compatibility overload for callers that need to defer a rollback while any other
+        /// reservation is still pending.
+        /// </summary>
         public PluginGenerationResource RegisterResource(
             string name,
             Action rollback,
@@ -994,7 +1021,9 @@ public sealed class PluginLifecycleGate
                 this,
                 name,
                 rollback,
-                deferWhileAnotherBoundaryPending)
+                deferWhileAnotherBoundaryPending
+                    ? () => generation.HasPendingResourceUnsafe
+                    : null)
             ?? throw new OperationCanceledException(
                 "plugin generation cannot register a resource after cleanup",
                 generation.CancellationToken);

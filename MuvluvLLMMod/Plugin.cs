@@ -104,7 +104,7 @@ public sealed class Plugin : BasePlugin
                 using var configurationResource = stage.RegisterResource(
                     "configuration initialization",
                     () => MuvluvLLMMod.Config.Shutdown(),
-                    deferWhileAnotherBoundaryPending: true);
+                    () => resources.ActivationResource?.IsPendingUnsafe == true);
                 resources.ConfigurationResource = configurationResource;
 
                 TrySetUtf8Console();
@@ -304,8 +304,7 @@ public sealed class Plugin : BasePlugin
                             if (ReferenceEquals(resources.ConfigLease, lease))
                                 resources.ConfigLease = null;
                         }
-                    },
-                    deferWhileAnotherBoundaryPending: true);
+                    });
                 resources.ActivationResource = activationResource;
                 Patch.Activate();
                 lease = generation.TryAcquireRunningLease()
