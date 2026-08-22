@@ -203,7 +203,7 @@ Fix: impose explicit retention limits — LRU-bound the runtime reverse indexes;
 > byte-copy rule is waived **for this item only**. Keep the diff minimal and surgical; do not
 > reformat or restructure. Note the exception in the commit message.
 
-## ITEM 8 — `TODO` — MAJOR: terminal flush can silently lose data
+## ITEM 8 — `DONE` (commit `835aa23`) — MAJOR: terminal flush can silently lose data
 
 `Plugin.cs` ~90-106, `TranslationCache.cs` ~251-275 / ~403-427. After the persistence CTS is
 cancelled, shutdown calls `Flush()` once. On a failed atomic write `Flush()` only re-signals
@@ -214,7 +214,7 @@ Fix: terminal flush must report success/failure, retry synchronously a bounded n
 after mutations are frozen, and log clearly if data is unrecoverable. Add a test injecting one
 failed final write followed by a success.
 
-## ITEM 9 — `TODO` — MAJOR: `Load()` has no rollback
+## ITEM 9 — `DONE` (commit `a0b0c5e`) — MAJOR: `Load()` has no rollback
 
 `Plugin.cs` ~52-80. Persistence and machine workers start *before* Harmony patching and component
 injection. If `Patch.Initialize` or `AddComponent` throws, BepInEx drops the plugin without calling
@@ -256,7 +256,7 @@ pure classes, link them into the test project, and unit-test them. Highest-value
 - material config change resets blocked templates; F2/debug/refresh changes do not
 - terminal flush recovers from one transient write failure
 
-## ITEM 12 — `TODO` — MINOR: verify all four patch targets
+## ITEM 12 — `DONE` (commit `ae3ee97`) — MINOR: verify all four patch targets
 
 `Patch.cs` ~138-155. `VerifyPatches` checks only the TMP and skill-description targets while four
 are applied, so a missing `Refresh`/`Leave` hook would silently break priority routing yet still
