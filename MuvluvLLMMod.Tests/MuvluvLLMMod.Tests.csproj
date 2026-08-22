@@ -27,5 +27,6 @@
     <Compile Include="..\MuvluvLLMMod\TranslationResolver.cs" Link="Source\TranslationResolver.cs" />
     <Compile Include="..\MuvluvLLMMod\TmpTranslationProvenance.cs" Link="Source\TmpTranslationProvenance.cs" />
     <Compile Include="..\MuvluvLLMMod\DebugTextLogPolicy.cs" Link="Source\DebugTextLogPolicy.cs" />
+    <Compile Include="..\MuvluvLLMMod\ConfigReloadPolicy.cs" Link="Source\ConfigReloadPolicy.cs" />
   </ItemGroup>
 </Project>

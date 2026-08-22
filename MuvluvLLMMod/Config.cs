@@ -112,16 +112,9 @@ public static class Config
         else
             Logger.Info($"[{setting.Definition.Section}] {setting.Definition.Key} => {setting.BoxedValue}");
 
-        var machineAffecting = ReferenceEquals(setting, LlmEnable)
-            || ReferenceEquals(setting, LlmEndpoint)
-            || ReferenceEquals(setting, LlmModel)
-            || ReferenceEquals(setting, LlmApiKey)
-            || ReferenceEquals(setting, LlmTimeoutSeconds)
-            || ReferenceEquals(setting, LlmRetryCount)
-            || ReferenceEquals(setting, LlmRequestsPerSecond)
-            || ReferenceEquals(setting, LlmMaxInFlight)
-            || ReferenceEquals(setting, LlmTranslatePeriodSeconds);
-        if (machineAffecting)
+        if (ConfigReloadPolicy.RequiresMachineTranslatorReload(
+                setting.Definition.Section,
+                setting.Definition.Key))
             Core.ReloadMachineTranslator();
     }
 }
