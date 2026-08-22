@@ -173,7 +173,7 @@ public sealed class TranslationCacheTests : IDisposable
         var generatedAttempts = 0;
         var cache = new TranslationCache(root, writeAtomic: (path, _) =>
         {
-            if (Path.GetFileName(path) != "generated.zh_Hans.json") return true;
+            if (Path.GetFileName(path) != "cache.state.v1.json") return true;
             return ++generatedAttempts > 1;
         });
         cache.ObservePriority("再試行する", "再試行する");
@@ -193,7 +193,7 @@ public sealed class TranslationCacheTests : IDisposable
         var generatedAttempts = 0;
         var cache = new TranslationCache(root, writeAtomic: (path, _) =>
         {
-            if (Path.GetFileName(path) == "generated.zh_Hans.json")
+            if (Path.GetFileName(path) == "cache.state.v1.json")
                 return ++generatedAttempts > 1;
             return true;
         });
@@ -212,7 +212,7 @@ public sealed class TranslationCacheTests : IDisposable
             root,
             writeAtomic: (path, _) =>
             {
-                if (Path.GetFileName(path) != "generated.zh_Hans.json") return true;
+                if (Path.GetFileName(path) != "cache.state.v1.json") return true;
                 lock (attempts) attempts.Add(DateTime.UtcNow);
                 return false;
             },

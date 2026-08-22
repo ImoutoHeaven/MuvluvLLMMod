@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using Xunit;
 
 namespace MuvluvLLMMod.Tests;
@@ -75,12 +76,137 @@ public sealed class CachePersistenceProtocolTests : IDisposable
     }
 
     [Fact]
+    public void Newer_valid_temporary_epoch_wins_over_old_canonical_and_restart_stays_coherent()
+    {
+        var cache = new TranslationCache(root);
+        Assert.True(cache.StoreGenerated("古いする", "旧译"));
+        Assert.True(cache.Flush());
+        var oldState = File.ReadAllText(cache.StatePath);
+        var oldSnapshot = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(oldState);
+
+        cache.RemoveGenerated("古いする");
+        Assert.True(cache.StoreGenerated("新しいする", "新译"));
+        Assert.True(cache.Flush());
+        var newerState = File.ReadAllText(cache.StatePath);
+        var newerSnapshot = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(newerState);
+        Assert.True(newerSnapshot!.Epoch > oldSnapshot!.Epoch);
+
+        // Reproduce a successful journal write followed by a locked canonical replacement.
+        File.WriteAllText(cache.StatePath, oldState, new UTF8Encoding(false));
+        File.WriteAllText(cache.StateTemporaryPath, newerState, new UTF8Encoding(false));
+
+        var recovered = new TranslationCache(root);
+        recovered.Load();
+        Assert.True(recovered.TryGetGenerated("新しいする", out var translated));
+        Assert.Equal("新译", translated);
+        Assert.False(recovered.TryGetGenerated("古いする", out _));
+        Assert.False(File.Exists(recovered.StateTemporaryPath));
+        Assert.Equal(
+            newerSnapshot.Epoch,
+            JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(File.ReadAllText(recovered.StatePath))!.Epoch);
+        Assert.Equal(
+            oldSnapshot.Epoch,
+            JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(File.ReadAllText(recovered.StateBackupPath))!.Epoch);
+
+        var restarted = new TranslationCache(root);
+        restarted.Load();
+        Assert.True(restarted.TryGetGenerated("新しいする", out var restartedTranslation));
+        Assert.Equal("新译", restartedTranslation);
+        Assert.False(restarted.TryGetGenerated("古いする", out _));
+    }
+
+    [Fact]
+    public void Newer_valid_backup_wins_when_canonical_is_missing()
+    {
+        var cache = new TranslationCache(root);
+        Assert.True(cache.StoreGenerated("旧する", "旧译"));
+        Assert.True(cache.Flush());
+        var oldState = File.ReadAllText(cache.StatePath);
+        var oldSnapshot = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(oldState);
+
+        cache.RemoveGenerated("旧する");
+        Assert.True(cache.StoreGenerated("备份新する", "备份新译"));
+        Assert.True(cache.Flush());
+        var newerState = File.ReadAllText(cache.StatePath);
+        var newerSnapshot = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(newerState);
+        File.Copy(cache.StatePath, cache.StateBackupPath, true);
+        File.WriteAllText(cache.StatePath, oldState, new UTF8Encoding(false));
+        File.Delete(cache.StateTemporaryPath);
+
+        var loaded = new TranslationCache(root);
+        loaded.Load();
+        Assert.True(loaded.TryGetGenerated("备份新する", out var translated));
+        Assert.Equal("备份新译", translated);
+        Assert.False(loaded.TryGetGenerated("旧する", out _));
+        Assert.Equal(
+            newerSnapshot!.Epoch,
+            JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(File.ReadAllText(cache.StatePath))!.Epoch);
+        Assert.True(newerSnapshot.Epoch > oldSnapshot!.Epoch);
+    }
+
+    [Fact]
+    public void Corrupt_newer_temporary_epoch_is_ignored_in_favor_of_valid_canonical()
+    {
+        var cache = new TranslationCache(root);
+        Assert.True(cache.StoreGenerated("稳定する", "稳定译"));
+        Assert.True(cache.Flush());
+        var oldState = File.ReadAllText(cache.StatePath);
+
+        cache.RemoveGenerated("稳定する");
+        Assert.True(cache.StoreGenerated("损坏する", "损坏译"));
+        Assert.True(cache.Flush());
+        var newerState = File.ReadAllText(cache.StatePath);
+        var newer = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(newerState)!;
+        var corrupted = newerState.Replace(newer.Checksum![0], newer.Checksum[0] == '0' ? '1' : '0');
+        File.WriteAllText(cache.StatePath, oldState, new UTF8Encoding(false));
+        File.WriteAllText(cache.StateTemporaryPath, corrupted, new UTF8Encoding(false));
+
+        var loaded = new TranslationCache(root);
+        loaded.Load();
+        Assert.True(loaded.TryGetGenerated("稳定する", out var translated));
+        Assert.Equal("稳定译", translated);
+        Assert.False(loaded.TryGetGenerated("损坏する", out _));
+        Assert.False(File.Exists(loaded.StateTemporaryPath));
+    }
+
+    [Fact]
+    public void Authoritative_epoch_survives_an_interrupted_legacy_mirror_write()
+    {
+        Directory.CreateDirectory(Path.Combine(root, "dump"));
+        File.WriteAllText(
+            Path.Combine(root, "generated.zh_Hans.json"),
+            "{\"旧镜像する\":\"旧镜像译\"}",
+            new UTF8Encoding(false));
+        var diagnostics = new List<string>();
+        var cache = new TranslationCache(
+            root,
+            diagnostics.Add,
+            writeAtomic: (path, json) =>
+            {
+                if (Path.GetFileName(path) == "generated.zh_Hans.json")
+                    return false;
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.WriteAllText(path, json, new UTF8Encoding(false));
+                return true;
+            });
+        Assert.True(cache.StoreGenerated("权威する", "权威译"));
+        Assert.True(cache.Flush());
+        Assert.Contains(diagnostics, value => value.Contains("legacy mirrors failed", StringComparison.Ordinal));
+
+        var restarted = new TranslationCache(root);
+        restarted.Load();
+        Assert.True(restarted.TryGetGenerated("权威する", out var translated));
+        Assert.Equal("权威译", translated);
+        Assert.False(restarted.TryGetGenerated("旧镜像する", out _));
+    }
+
+    [Fact]
     public void Terminal_retries_are_paced_and_complete_before_the_budget()
     {
         var attempts = new List<DateTime>();
         var cache = new TranslationCache(root, writeAtomic: (path, _) =>
         {
-            if (Path.GetFileName(path) != "generated.zh_Hans.json") return true;
+            if (Path.GetFileName(path) != "cache.state.v1.json") return true;
             lock (attempts) attempts.Add(DateTime.UtcNow);
             return attempts.Count >= 3;
         });
@@ -104,7 +230,7 @@ public sealed class CachePersistenceProtocolTests : IDisposable
         var attempts = 0;
         var cache = new TranslationCache(root, writeAtomic: (path, _) =>
         {
-            if (Path.GetFileName(path) == "generated.zh_Hans.json")
+            if (Path.GetFileName(path) == "cache.state.v1.json")
             {
                 attempts++;
                 return writable;
@@ -128,7 +254,7 @@ public sealed class CachePersistenceProtocolTests : IDisposable
         Assert.True(gate.TryBeginLoad());
         var cache = new TranslationCache(
             root,
-            writeAtomic: (path, _) => Path.GetFileName(path) != "generated.zh_Hans.json");
+            writeAtomic: (path, _) => Path.GetFileName(path) != "cache.state.v1.json");
         cache.ObserveNormal("隔离する", "隔离する");
         cache.FreezeMutations();
 

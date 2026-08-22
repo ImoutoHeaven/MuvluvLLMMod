@@ -1,9 +1,52 @@
+using System.Text;
+using System.Text.Json;
 using Xunit;
 
 namespace MuvluvLLMMod.IntegrationTests;
 
 public sealed class ProductionBudgetAndShutdownIntegrationTests
 {
+    [Fact]
+    public void Durable_cache_recovery_chooses_the_newest_valid_journal_epoch()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.journal." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var cache = new TranslationCache(root);
+            Assert.True(cache.StoreGenerated("旧する", "旧译"));
+            Assert.True(cache.Flush());
+            var oldState = File.ReadAllText(cache.StatePath);
+
+            cache.RemoveGenerated("旧する");
+            Assert.True(cache.StoreGenerated("新する", "新译"));
+            Assert.True(cache.Flush());
+            var newState = File.ReadAllText(cache.StatePath);
+            Assert.True(
+                JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(newState)!.Epoch
+                > JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(oldState)!.Epoch);
+
+            File.WriteAllText(cache.StatePath, oldState, new UTF8Encoding(false));
+            File.WriteAllText(cache.StateTemporaryPath, newState, new UTF8Encoding(false));
+
+            var recovered = new TranslationCache(root);
+            recovered.Load();
+            Assert.True(recovered.TryGetGenerated("新する", out var translated));
+            Assert.Equal("新译", translated);
+            Assert.False(recovered.TryGetGenerated("旧する", out _));
+            Assert.False(File.Exists(recovered.StateTemporaryPath));
+
+            var restarted = new TranslationCache(root);
+            restarted.Load();
+            Assert.True(restarted.TryGetGenerated("新する", out var restartedTranslation));
+            Assert.Equal("新译", restartedTranslation);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
     [Fact]
     public void Oversized_render_input_is_rejected_fail_closed_and_not_retained()
     {

@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -21,6 +22,7 @@ public sealed class TranslationCache
 
     public const int TerminalFlushMaxAttempts = 5;
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private static readonly JsonSerializerOptions IntegrityJsonOptions = new();
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private readonly object gate = new();
     private readonly SemaphoreSlim writerGate = new(1, 1);
@@ -58,20 +60,40 @@ public sealed class TranslationCache
     private bool acceptingMutations = true;
     private long mutationVersion;
     private long nextPendingGeneration;
+    private long nextSnapshotEpoch;
 
     public sealed class DurableSnapshot
     {
         public int Version { get; set; }
+        public long Epoch { get; set; }
+        public string? TransactionId { get; set; }
+        public string? Checksum { get; set; }
         public Dictionary<string, string>? Generated { get; set; }
         public string[]? Pending { get; set; }
         public string[]? Raw { get; set; }
+    }
+
+    private sealed class SnapshotIntegrityPayload
+    {
+        public int Version { get; set; }
+        public long Epoch { get; set; }
+        public string TransactionId { get; set; } = string.Empty;
+        public SortedDictionary<string, string> Generated { get; set; } = new(StringComparer.Ordinal);
+        public string[] Pending { get; set; } = Array.Empty<string>();
+        public string[] Raw { get; set; } = Array.Empty<string>();
     }
 
     private sealed record LoadedSnapshot(
         Dictionary<string, string> Generated,
         string[] Pending,
         string[] Raw,
+        long Epoch,
         bool Cleaned);
+
+    private sealed record SnapshotCandidate(
+        string Path,
+        LoadedSnapshot Snapshot,
+        int Priority);
 
     public TranslationCache(
         string root,
@@ -326,6 +348,9 @@ public sealed class TranslationCache
         }
         lock (gate)
         {
+            if (state != null)
+                nextSnapshotEpoch = Math.Max(nextSnapshotEpoch, state.Epoch);
+
             generated.Clear();
             generatedLru.Clear();
             generatedNodes.Clear();
@@ -445,6 +470,8 @@ public sealed class TranslationCache
             string[] pendingSnapshot;
             string[] rawSnapshot;
             long snapshotVersion;
+            long snapshotEpoch;
+            string transactionId;
             lock (gate)
             {
                 if (!dirty) return true;
@@ -452,35 +479,47 @@ public sealed class TranslationCache
                 pendingSnapshot = pending.ToArray();
                 rawSnapshot = raw.ToArray();
                 snapshotVersion = mutationVersion;
+                snapshotEpoch = ++nextSnapshotEpoch;
+                transactionId = Guid.NewGuid().ToString("N");
             }
 
-            var stateJson = SerializeBounded(
-                new DurableSnapshot
-                {
-                    Version = 1,
-                    Generated = generatedSnapshot,
-                    Pending = pendingSnapshot,
-                    Raw = rawSnapshot
-                },
-                StatePath);
+            var state = new DurableSnapshot
+            {
+                Version = 1,
+                Epoch = snapshotEpoch,
+                TransactionId = transactionId,
+                Generated = generatedSnapshot,
+                Pending = pendingSnapshot,
+                Raw = rawSnapshot
+            };
+            state.Checksum = ComputeChecksum(state);
+            var stateJson = SerializeBounded(state, StatePath);
             var generatedJson = SerializeBounded(generatedSnapshot, GeneratedPath);
             var pendingJson = SerializeBounded(pendingSnapshot, PendingPath);
             var rawJson = SerializeBounded(
                 rawSnapshot.ToDictionary(value => value, _ => string.Empty, StringComparer.Ordinal),
                 RawPath);
-            var succeeded = stateJson != null
-                && generatedJson != null
-                && pendingJson != null
-                && rawJson != null
-                // The single state file is authoritative. The three legacy mirrors remain for
-                // older releases, but a crash between mirrors can never create a mixed load.
-                && TryWriteAtomic(StatePath, stateJson, preserveRecovery: true)
-                && TryWriteAtomic(GeneratedPath, generatedJson)
-                && TryWriteAtomic(PendingPath, pendingJson)
-                && TryWriteAtomic(RawPath, rawJson);
+
+            // The state file is the only commit decision. Legacy files are migration mirrors:
+            // once this write is durable, a mirror failure must not make this epoch look lost.
+            var authoritativeSucceeded = stateJson != null
+                && TryWriteAtomic(StatePath, stateJson, preserveRecovery: true);
+            if (!authoritativeSucceeded)
+                ReportPersistenceFailure(StatePath, "authoritative cache state write failed; the dirty epoch remains recoverable/retryable.");
+
+            var mirrorsSucceeded = true;
+            if (authoritativeSucceeded)
+            {
+                mirrorsSucceeded &= TryWriteMirror(GeneratedPath, generatedJson);
+                mirrorsSucceeded &= TryWriteMirror(PendingPath, pendingJson);
+                mirrorsSucceeded &= TryWriteMirror(RawPath, rawJson);
+                if (!mirrorsSucceeded)
+                    ReportPersistenceFailure(StatePath, "authoritative cache state committed, but one or more legacy mirrors failed; recovery will use the state epoch.");
+            }
+
             lock (gate)
             {
-                if (succeeded && mutationVersion == snapshotVersion)
+                if (authoritativeSucceeded && mutationVersion == snapshotVersion)
                 {
                     dirty = false;
                     return true;
@@ -494,6 +533,13 @@ public sealed class TranslationCache
         {
             writerGate.Release();
         }
+    }
+
+    private bool TryWriteMirror(string path, string? json)
+    {
+        if (json == null)
+            return false;
+        return TryWriteAtomic(path, json);
     }
 
     private bool Observe(string original, string normalizedTemplate, bool priority) =>
@@ -764,45 +810,193 @@ public sealed class TranslationCache
         if (!hasStateArtifacts)
             return null;
 
-        foreach (var path in new[] { StatePath, StateTemporaryPath, StateBackupPath })
+        var candidates = new List<SnapshotCandidate>();
+        var paths = new[]
+        {
+            (Path: StatePath, Priority: 0),
+            (Path: StateTemporaryPath, Priority: 1),
+            (Path: StateBackupPath, Priority: 2)
+        };
+        foreach (var candidatePath in paths)
         {
             var cleaned = false;
-            var text = ReadBoundedText(path, ref cleaned);
+            var text = ReadBoundedText(candidatePath.Path, ref cleaned);
             if (text == null)
                 continue;
+
             try
             {
                 var snapshot = JsonSerializer.Deserialize<DurableSnapshot>(text);
-                if (snapshot?.Version != 1
-                    || snapshot.Generated == null
-                    || snapshot.Pending == null
-                    || snapshot.Raw == null)
+                if (!IsValidDurableSnapshot(snapshot))
                 {
-                    ReportBudget("cache-state", "cache state snapshot was incomplete; trying the next recovery epoch.");
+                    ReportBudget(
+                        "cache-state",
+                        Path.GetFileName(candidatePath.Path) + " failed cache state integrity/schema validation; trying the next recovery epoch.");
                     continue;
                 }
 
-                var generated = FilterGenerated(snapshot.Generated, ref cleaned);
-                var pending = FilterPending(snapshot.Pending, ref cleaned);
-                var raw = FilterRaw(snapshot.Raw, ref cleaned);
-                if (!string.Equals(path, StatePath, StringComparison.Ordinal))
-                    cleaned = true;
-                return new LoadedSnapshot(generated, pending, raw, cleaned);
+                var generated = FilterGenerated(snapshot!.Generated!, ref cleaned);
+                var pending = FilterPending(snapshot.Pending!, ref cleaned);
+                var raw = FilterRaw(snapshot.Raw!, ref cleaned);
+                // Epoch-zero is the accepted shape of the pre-journal V1 file. Mark it dirty so
+                // the next successful commit migrates it to the checksummed journal format. A
+                // successfully promoted temp/backup is already authoritative and need not be
+                // rewritten merely because its filename was a recovery artifact.
+                cleaned |= snapshot.Epoch == 0;
+                candidates.Add(new SnapshotCandidate(
+                    candidatePath.Path,
+                    new LoadedSnapshot(generated, pending, raw, snapshot.Epoch, cleaned),
+                    candidatePath.Priority));
             }
             catch (Exception exception) when (exception is JsonException or NotSupportedException)
             {
-                SafeDiagnostic(path, exception);
+                SafeDiagnostic(candidatePath.Path, exception);
             }
         }
 
-        // Do not combine legacy files after a state artifact was observed: that would create a
-        // generated/new-pending/raw mixed epoch. The next observable render can safely rebuild
-        // missing entries, and the next flush writes one coherent state.
-        return new LoadedSnapshot(
-            new Dictionary<string, string>(StringComparer.Ordinal),
-            Array.Empty<string>(),
-            Array.Empty<string>(),
-            true);
+        if (candidates.Count == 0)
+        {
+            // Do not combine legacy files after a state artifact was observed: that would create a
+            // generated/new-pending/raw mixed epoch. The next observable render can safely rebuild
+            // missing entries, and the next flush writes one coherent state.
+            return new LoadedSnapshot(
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                Array.Empty<string>(),
+                Array.Empty<string>(),
+                0,
+                true);
+        }
+
+        // Epoch is authoritative. Path priority is only a deterministic tie-breaker for exact
+        // duplicate epochs, with canonical winning over its journal and backup.
+        var selected = candidates
+            .OrderByDescending(candidate => candidate.Snapshot.Epoch)
+            .ThenBy(candidate => candidate.Priority)
+            .First();
+        var selectedCleaned = selected.Snapshot.Cleaned;
+        var canonicalIsValid = candidates.Any(candidate =>
+            string.Equals(candidate.Path, StatePath, StringComparison.Ordinal));
+        if (!string.Equals(selected.Path, StatePath, StringComparison.Ordinal)
+            && !PromoteRecoveredState(selected.Path, canonicalIsValid))
+        {
+            selectedCleaned = true;
+            ReportPersistenceFailure(
+                selected.Path,
+                "valid cache recovery epoch could not be promoted; it remains available for the next restart.");
+        }
+
+        // A lower/corrupt temp is never allowed to shadow the selected epoch on a later start.
+        // Keep the selected temp if promotion failed; otherwise it is safe to remove.
+        if (!string.Equals(selected.Path, StateTemporaryPath, StringComparison.Ordinal)
+            && File.Exists(StateTemporaryPath))
+            TryDeleteRecoveryTemporary();
+
+        return selected.Snapshot with { Cleaned = selectedCleaned };
+    }
+
+    private bool IsValidDurableSnapshot(DurableSnapshot? snapshot)
+    {
+        if (snapshot?.Version != 1
+            || snapshot.Generated == null
+            || snapshot.Pending == null
+            || snapshot.Raw == null
+            || snapshot.Epoch < 0)
+            return false;
+
+        // A V1 snapshot written before the journal protocol has no epoch or metadata and is
+        // deterministically treated as epoch zero. New snapshots must carry all transaction
+        // metadata and a checksum; accepting only one field would make torn metadata valid.
+        if (snapshot.Epoch == 0)
+            return snapshot.TransactionId == null && snapshot.Checksum == null;
+        if (string.IsNullOrWhiteSpace(snapshot.TransactionId)
+            || snapshot.TransactionId.Length > 128
+            || string.IsNullOrWhiteSpace(snapshot.Checksum))
+            return false;
+
+        try
+        {
+            var expected = ComputeChecksum(snapshot);
+            return string.Equals(expected, snapshot.Checksum, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private string ComputeChecksum(DurableSnapshot snapshot)
+    {
+        if (snapshot.Generated == null || snapshot.Pending == null || snapshot.Raw == null)
+            throw new ArgumentException("snapshot payload is incomplete", nameof(snapshot));
+
+        var generated = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        foreach (var entry in snapshot.Generated)
+        {
+            if (entry.Key == null || entry.Value == null)
+                throw new ArgumentException("snapshot payload contains null generated text", nameof(snapshot));
+            generated.Add(entry.Key, entry.Value);
+        }
+
+        if (snapshot.Pending.Any(value => value == null)
+            || snapshot.Raw.Any(value => value == null))
+            throw new ArgumentException("snapshot payload contains null mirror text", nameof(snapshot));
+
+        var payload = new SnapshotIntegrityPayload
+        {
+            Version = snapshot.Version,
+            Epoch = snapshot.Epoch,
+            TransactionId = snapshot.TransactionId ?? string.Empty,
+            Generated = generated,
+            Pending = snapshot.Pending,
+            Raw = snapshot.Raw
+        };
+        var canonical = JsonSerializer.Serialize(payload, IntegrityJsonOptions);
+        return Convert.ToHexString(SHA256.HashData(StrictUtf8.GetBytes(canonical)));
+    }
+
+    private bool PromoteRecoveredState(string sourcePath, bool canonicalIsValid)
+    {
+        if (string.Equals(sourcePath, StatePath, StringComparison.Ordinal))
+            return true;
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(StatePath)!);
+            if (string.Equals(sourcePath, StateTemporaryPath, StringComparison.Ordinal))
+            {
+                // Preserve the previous canonical only when it was itself a valid candidate. A
+                // corrupt canonical must not destroy a usable backup during recovery.
+                if (canonicalIsValid && File.Exists(StatePath))
+                    File.Copy(StatePath, StateBackupPath, true);
+                File.Move(StateTemporaryPath, StatePath, true);
+                return true;
+            }
+
+            if (!string.Equals(sourcePath, StateBackupPath, StringComparison.Ordinal))
+                return false;
+            // Copy backup to the journal first, then replace canonical. The backup remains in
+            // place as a second recovery candidate if the replacement is interrupted.
+            File.Copy(StateBackupPath, StateTemporaryPath, true);
+            File.Move(StateTemporaryPath, StatePath, true);
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            SafeDiagnostic(sourcePath, exception);
+            return false;
+        }
+    }
+
+    private void TryDeleteRecoveryTemporary()
+    {
+        try
+        {
+            File.Delete(StateTemporaryPath);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            SafeDiagnostic(StateTemporaryPath, exception);
+        }
     }
 
     private Dictionary<string, string> FilterGenerated(
@@ -1119,6 +1313,17 @@ public sealed class TranslationCache
 
     private void ReportBudgetUnsafe(string code, string message) => budgetDiagnostic.Report(code, message);
 
+    private void ReportPersistenceFailure(string path, string message)
+    {
+        try
+        {
+            diagnostic?.Invoke(Path.GetFileName(path) + ": " + message);
+        }
+        catch
+        {
+        }
+    }
+
     private void SafeDiagnostic(string path, Exception exception) =>
-        diagnostic?.Invoke(Path.GetFileName(path) + ": " + exception.GetType().Name);
+        ReportPersistenceFailure(path, exception.GetType().Name);
 }
