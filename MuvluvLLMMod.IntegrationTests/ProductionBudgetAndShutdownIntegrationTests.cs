@@ -51,6 +51,65 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
     }
 
     [Fact]
+    public void Maximum_epoch_is_terminal_and_flush_never_claims_an_invalid_success()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.max-epoch." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var seed = new TranslationCache.DurableSnapshot
+            {
+                Version = 1,
+                Epoch = long.MaxValue,
+                TransactionId = new string('m', 32),
+                Generated = new Dictionary<string, string>
+                {
+                    ["旧する"] = "旧译"
+                },
+                // The checksum/schema is valid; load sanitizes the duplicate mirror and therefore
+                // leaves a dirty state that can exercise both normal and terminal flush guards.
+                Pending = new[] { "待機する", "待機する" },
+                Raw = Array.Empty<string>()
+            };
+            seed.Checksum = ComputeChecksum(seed);
+            var cache = new TranslationCache(root);
+            File.WriteAllText(
+                cache.StatePath,
+                JsonSerializer.Serialize(seed, new JsonSerializerOptions { WriteIndented = true }),
+                new UTF8Encoding(false));
+
+            cache.Load();
+            Assert.True(cache.IsDurableMutationBlocked);
+            Assert.True(cache.TryGetGenerated("旧する", out var oldTranslation));
+            Assert.Equal("旧译", oldTranslation);
+            var before = cache.RetainedSnapshot;
+
+            Assert.False(cache.StoreGenerated("新する", "新译"));
+            Assert.False(cache.ObserveNormal("新的观察する", "新的观察する"));
+            Assert.Equal(before, cache.RetainedSnapshot);
+            Assert.False(cache.Flush());
+            Assert.False(cache.FlushTerminal(TimeSpan.FromSeconds(1)));
+
+            var persisted = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(
+                File.ReadAllText(cache.StatePath));
+            Assert.NotNull(persisted);
+            Assert.Equal(long.MaxValue, persisted!.Epoch);
+
+            var restarted = new TranslationCache(root);
+            restarted.Load();
+            Assert.True(restarted.TryGetGenerated("旧する", out var restartedTranslation));
+            Assert.Equal("旧译", restartedTranslation);
+            Assert.False(restarted.TryGetGenerated("新する", out _));
+            Assert.False(restarted.Flush());
+            Assert.False(restarted.FlushTerminal(TimeSpan.FromSeconds(1)));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public void Full_cap_cjk_pairs_are_rejected_before_an_unwritable_authoritative_state()
     {
         var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.snapshot-admission." + Guid.NewGuid().ToString("N"));

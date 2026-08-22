@@ -5,7 +5,7 @@ set -euo pipefail
 # every mutant is made in a separate throwaway copy under /tmp and is deleted on exit.
 SOURCE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PROJECT="MuvluvLLMMod.IntegrationTests/MuvluvLLMMod.IntegrationTests.csproj"
-EXPECTED_BASELINE=39
+EXPECTED_BASELINE=40
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/muvluv-m5.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 ROOT="$WORK/base"
@@ -164,6 +164,11 @@ gate_mutant() {
                 $'[HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Leave))]\n    public static void SetIsNotPlayingScenario()' \
                 $'[HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Leave))]\n    [HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Refresh), new Type[] { })]\n    public static void SetIsNotPlayingScenario()'
             ;;
+        FR3-1-remove-epoch-overflow-guard)
+            replace_once "$copy/MuvluvLLMMod/TranslationCache.cs" \
+                '        if (nextSnapshotEpoch == long.MaxValue)' \
+                '        if (false)'
+            ;;
         *)
             echo "unknown mutant $id" >&2
             return 1
@@ -231,5 +236,6 @@ gate_mutant PF1-unbounded-callback-wait \
     ProductionCoordinationIntegrationTests.Cleanup_callback_wait_deadline_has_shared_failure_and_late_callback_is_inert
 gate_mutant M2-extra-nonrender-hook \
     ProductionSourceLinkIntegrationTests.Exact_source_harness_applies_only_final_tmp_and_scenario_priority_patches
-
-echo "FR2 mutation gate: all 20 compile-valid configured mutants killed"
+gate_mutant FR3-1-remove-epoch-overflow-guard \
+    ProductionBudgetAndShutdownIntegrationTests.Maximum_epoch_is_terminal_and_flush_never_claims_an_invalid_success
+echo "FR3 mutation gate: all 21 compile-valid configured mutants killed"

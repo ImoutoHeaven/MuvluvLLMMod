@@ -65,6 +65,7 @@ public sealed class TranslationCache
 
     private bool dirty;
     private bool acceptingMutations = true;
+    private bool snapshotEpochExhausted;
     private long mutationVersion;
     private long nextPendingGeneration;
     private long nextSnapshotEpoch;
@@ -186,7 +187,7 @@ public sealed class TranslationCache
 
         lock (gate)
         {
-            if (!acceptingMutations
+            if (!CanAcceptDurableMutationUnsafe()
                 || !TryStoreGeneratedUnsafe(normalizedTemplate, translatedTemplate))
                 return false;
             RemovePendingUnsafe(normalizedTemplate);
@@ -203,7 +204,7 @@ public sealed class TranslationCache
 
         lock (gate)
         {
-            if (!acceptingMutations
+            if (!CanAcceptDurableMutationUnsafe()
                 || !pendingGenerations.TryGetValue(normalizedTemplate, out var currentGeneration)
                 || currentGeneration != pendingGeneration
                 || !TryStoreGeneratedUnsafe(normalizedTemplate, translatedTemplate))
@@ -219,7 +220,7 @@ public sealed class TranslationCache
     {
         lock (gate)
         {
-            if (!acceptingMutations || !RemoveGeneratedUnsafe(normalizedTemplate))
+            if (!CanAcceptDurableMutationUnsafe() || !RemoveGeneratedUnsafe(normalizedTemplate))
                 return;
             MarkDirtyUnsafe();
         }
@@ -231,7 +232,7 @@ public sealed class TranslationCache
     {
         lock (gate)
         {
-            if (!acceptingMutations
+            if (!CanAcceptDurableMutationUnsafe()
                 || !pendingSet.Contains(normalizedTemplate)
                 || !pendingGenerations.TryGetValue(normalizedTemplate, out pendingGeneration))
             {
@@ -343,6 +344,20 @@ public sealed class TranslationCache
         get { lock (gate) return generated.Count; }
     }
 
+    /// <summary>
+    /// True when the authoritative journal has no valid successor epoch. The cache remains
+    /// readable, but durable collection mutations are rejected until a new epoch series is
+    /// explicitly introduced by a future protocol.
+    /// </summary>
+    public bool IsDurableMutationBlocked
+    {
+        get
+        {
+            lock (gate)
+                return !CanAcceptDurableMutationUnsafe();
+        }
+    }
+
     public void FreezeMutations()
     {
         lock (gate) acceptingMutations = false;
@@ -380,7 +395,10 @@ public sealed class TranslationCache
         lock (gate)
         {
             if (state != null)
+            {
                 nextSnapshotEpoch = Math.Max(nextSnapshotEpoch, state.Epoch);
+                snapshotEpochExhausted |= state.Epoch == long.MaxValue;
+            }
 
             generated.Clear();
             generatedLru.Clear();
@@ -510,11 +528,18 @@ public sealed class TranslationCache
             lock (gate)
             {
                 if (!dirty) return true;
+                if (!TryAdvanceSnapshotEpochUnsafe(out snapshotEpoch))
+                {
+                    ReportPersistenceFailure(
+                        StatePath,
+                        "authoritative cache epoch has no valid successor; the dirty state remains unsaved and retryable.");
+                    SignalDirtyUnsafe();
+                    return false;
+                }
                 generatedSnapshot = new Dictionary<string, string>(generated, StringComparer.Ordinal);
                 pendingSnapshot = pending.ToArray();
                 rawSnapshot = raw.ToArray();
                 snapshotVersion = mutationVersion;
-                snapshotEpoch = ++nextSnapshotEpoch;
                 transactionId = Guid.NewGuid().ToString("N");
             }
 
@@ -593,7 +618,7 @@ public sealed class TranslationCache
 
         lock (gate)
         {
-            if (!acceptingMutations)
+            if (!CanAcceptDurableMutationUnsafe())
                 return default;
 
             var rawSample = TextTemplate.Normalize(original).Template;
@@ -671,6 +696,26 @@ public sealed class TranslationCache
                 priority ? promote : addedPending,
                 pendingGenerations[normalizedTemplate]);
         }
+    }
+
+    private bool CanAcceptDurableMutationUnsafe() =>
+        acceptingMutations
+        && !snapshotEpochExhausted
+        && nextSnapshotEpoch < long.MaxValue;
+
+    private bool TryAdvanceSnapshotEpochUnsafe(out long epoch)
+    {
+        if (nextSnapshotEpoch == long.MaxValue)
+        {
+            epoch = 0;
+            snapshotEpochExhausted = true;
+            return false;
+        }
+
+        epoch = checked(nextSnapshotEpoch + 1);
+        nextSnapshotEpoch = epoch;
+        snapshotEpochExhausted = epoch == long.MaxValue;
+        return true;
     }
 
     private void MarkDirtyUnsafe()
