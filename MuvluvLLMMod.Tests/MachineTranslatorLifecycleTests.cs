@@ -131,6 +131,106 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task Stale_transition_cannot_stop_a_worker_installed_by_a_newer_generation()
+    {
+        var cache = new TranslationCache(root);
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var oldStopRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseOld = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var newStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var newStopRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var created = 0;
+        var lifecycle = new MachineTranslatorLifecycle();
+
+        MachineTranslator Factory(RequestRateLimiter _, TranslationPriorityBacklog backlog)
+        {
+            var generation = Interlocked.Increment(ref created);
+            if (generation == 1)
+            {
+                return new MachineTranslator(
+                    cache,
+                    async (_, token) =>
+                    {
+                        using var registration = token.Register(() => oldStopRequested.TrySetResult());
+                        firstStarted.TrySetResult();
+                        return await releaseOld.Task;
+                    },
+                    1,
+                    TimeSpan.FromSeconds(1),
+                    backlog);
+            }
+
+            return new MachineTranslator(
+                cache,
+                (template, token) =>
+                {
+                    using var registration = token.Register(() => newStopRequested.TrySetResult());
+                    if (template == "新しい作業する")
+                        newStarted.TrySetResult();
+                    return Task.FromResult<string?>("新翻译");
+                },
+                1,
+                TimeSpan.FromSeconds(1),
+                backlog);
+        }
+
+        try
+        {
+            lifecycle.Initialize(true, 2, Factory);
+            Assert.True(lifecycle.EnqueuePriority("古い作業する"));
+            await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            // Transition one owns the old worker and is held in StopAsync. Transition two is
+            // therefore stale-but-in-flight while a rapid replacement installs a new worker.
+            Assert.True(lifecycle.Reload(true, 2, Factory));
+            await oldStopRequested.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.True(lifecycle.Reload(true, 2, Factory));
+            lifecycle.Initialize(true, 2, Factory);
+            Assert.True(lifecycle.EnqueuePriority("新しい作業する"));
+            await newStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            releaseOld.TrySetResult(null);
+            await lifecycle.TransitionTask.WaitAsync(TimeSpan.FromSeconds(2));
+
+            // The stale transition must check its generation before taking current. A failed
+            // check after StopAsync would cancel this newly initialized worker.
+            Assert.False(newStopRequested.Task.IsCompleted);
+        }
+        finally
+        {
+            releaseOld.TrySetResult(null);
+            await lifecycle.ShutdownAsync().WaitAsync(TimeSpan.FromSeconds(2));
+        }
+    }
+
+    [Fact]
+    public async Task Reload_after_terminal_shutdown_cannot_start_a_worker_from_a_config_race()
+    {
+        var lifecycle = new MachineTranslatorLifecycle();
+        var created = 0;
+
+        lifecycle.Shutdown();
+
+        Assert.False(lifecycle.Reload(
+            true,
+            1,
+            (_, backlog) =>
+            {
+                Interlocked.Increment(ref created);
+                return new MachineTranslator(
+                    new TranslationCache(root),
+                    (_, _) => Task.FromResult<string?>("不应启动"),
+                    1,
+                    TimeSpan.FromSeconds(1),
+                    backlog);
+            }));
+        await lifecycle.TransitionTask;
+
+        Assert.True(lifecycle.IsShutdown);
+        Assert.Equal(0, created);
+    }
+
+    [Fact]
     public async Task Reload_carries_request_rate_window_to_next_generation()
     {
         var cache = new TranslationCache(root);
