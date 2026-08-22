@@ -21,10 +21,8 @@ public sealed class Plugin : BasePlugin
     internal static MonoBehaviour? Instance { get; private set; }
 
     private static readonly HttpClient LlmHttpClient = OpenAiHttpClientFactory.CreateClient();
-    private static readonly TranslationRetryPolicy LlmRetryPolicy = new();
     private static readonly MachineTranslatorLifecycle MachineLifecycle = new(
-        exception => Logger.Error("[LLM] Lifecycle failure: " + exception.GetType().Name),
-        LlmRetryPolicy);
+        exception => Logger.Error("[LLM] Lifecycle failure: " + exception.GetType().Name));
     private static CancellationTokenSource? persistenceCancellation;
     private static Task persistenceTask = Task.CompletedTask;
     private static MachineTranslator? currentMachine;
@@ -83,10 +81,12 @@ public sealed class Plugin : BasePlugin
         ObserveBackgroundTask(persistenceTask, "cache persistence");
 
         var machineSettings = CaptureMachineSettings();
+        var retryPolicy = new TranslationRetryPolicy();
         MachineLifecycle.Initialize(
             machineSettings.Enabled,
             machineSettings.RequestsPerSecond,
-            (limiter, backlog) => CreateMachineTranslator(machineSettings, limiter, backlog));
+            (limiter, backlog) => CreateMachineTranslator(machineSettings, limiter, backlog, retryPolicy),
+            retryPolicy);
 
         harmony = new Harmony(PluginGuid);
         Patch.Initialize(harmony);
@@ -194,10 +194,12 @@ public sealed class Plugin : BasePlugin
             return;
 
         var settings = CaptureMachineSettings();
+        var retryPolicy = new TranslationRetryPolicy();
         MachineLifecycle.Reload(
             settings.Enabled,
             settings.RequestsPerSecond,
-            (limiter, backlog) => CreateMachineTranslator(settings, limiter, backlog));
+            (limiter, backlog) => CreateMachineTranslator(settings, limiter, backlog, retryPolicy),
+            retryPolicy);
     }
 
     internal static void BeginEnqueueObservation()
@@ -217,7 +219,8 @@ public sealed class Plugin : BasePlugin
     private static MachineTranslator CreateMachineTranslator(
         MachineSettings machineSettings,
         RequestRateLimiter limiter,
-        TranslationPriorityBacklog priorityBacklog)
+        TranslationPriorityBacklog priorityBacklog,
+        TranslationRetryPolicy retryPolicy)
     {
         var settings = new OpenAiChatSettings(
             machineSettings.Endpoint,
@@ -237,7 +240,7 @@ public sealed class Plugin : BasePlugin
             TimeSpan.FromSeconds(machineSettings.TranslatePeriodSeconds),
             priorityBacklog,
             message => Logger.Info("[LLM] " + message),
-            retryPolicy: LlmRetryPolicy);
+            retryPolicy: retryPolicy);
         Volatile.Write(ref currentMachine, machine);
         return machine;
     }

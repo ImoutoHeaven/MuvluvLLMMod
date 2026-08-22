@@ -17,6 +17,22 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task Reload_replaces_the_policy_used_for_priority_retention()
+    {
+        var oldPolicy = new TranslationRetryPolicy(1, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+        Assert.True(oldPolicy.RecordFailure("設定を直す").Blocked);
+        var newPolicy = new TranslationRetryPolicy(1, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+        var lifecycle = new MachineTranslatorLifecycle(retryPolicy: oldPolicy);
+
+        lifecycle.Reload(false, 1, null, newPolicy);
+
+        Assert.True(lifecycle.EnqueuePriority("設定を直す"));
+        Assert.Equal(1, oldPolicy.BlockedCount);
+        Assert.Equal(0, newPolicy.BlockedCount);
+        await lifecycle.TransitionTask;
+    }
+
+    [Fact]
     public async Task Delayed_priority_is_retained_while_lifecycle_has_no_current_translator()
     {
         var nowTicks = new DateTimeOffset(2026, 8, 1, 0, 0, 0, TimeSpan.Zero).Ticks;

@@ -6,7 +6,7 @@ public sealed class MachineTranslatorLifecycle
     private readonly TranslationPriorityBacklog priorityBacklog = new();
     private readonly Dictionary<string, (long Backlog, long Pending)> transitionCancellationCutoffs = new(StringComparer.Ordinal);
     private readonly Action<Exception>? diagnostic;
-    private readonly TranslationRetryPolicy? retryPolicy;
+    private TranslationRetryPolicy? retryPolicy;
     private MachineTranslator? current;
     private MachineTranslator? stopping;
     private RequestRateLimiter? limiter;
@@ -30,12 +30,14 @@ public sealed class MachineTranslatorLifecycle
     public void Initialize(
         bool enabled,
         int requestsPerSecond,
-        Func<RequestRateLimiter, TranslationPriorityBacklog, MachineTranslator>? factory)
+        Func<RequestRateLimiter, TranslationPriorityBacklog, MachineTranslator>? factory,
+        TranslationRetryPolicy? nextRetryPolicy = null)
     {
         var generation = Interlocked.Increment(ref version);
-        if (!enabled || factory == null) return;
         lock (gate)
         {
+            if (nextRetryPolicy != null) retryPolicy = nextRetryPolicy;
+            if (!enabled || factory == null) return;
             limiter = new RequestRateLimiter(Math.Max(1, requestsPerSecond));
             current = factory(limiter, priorityBacklog);
             if (generation == Volatile.Read(ref version)) current.Start();
@@ -45,11 +47,13 @@ public sealed class MachineTranslatorLifecycle
     public void Reload(
         bool enabled,
         int requestsPerSecond,
-        Func<RequestRateLimiter, TranslationPriorityBacklog, MachineTranslator>? factory)
+        Func<RequestRateLimiter, TranslationPriorityBacklog, MachineTranslator>? factory,
+        TranslationRetryPolicy? nextRetryPolicy = null)
     {
         var generation = Interlocked.Increment(ref version);
         lock (gate)
         {
+            if (nextRetryPolicy != null) retryPolicy = nextRetryPolicy;
             transitionsInFlight++;
             transition = RunTransitionAsync(transition, generation, enabled, requestsPerSecond, factory);
             Observe(transition);
