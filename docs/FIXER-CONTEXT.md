@@ -164,7 +164,7 @@ Fix: extract the shared resolution logic into a private method that does **not**
 have both the Harmony prefix and the scan call it, with the scan holding `translatingTmp` across
 its own assignment. Never invoke a Harmony patch method directly as a normal call.
 
-## ITEM 5 — `TODO` — MAJOR: F2 must not restart the translator
+## ITEM 5 — `DONE` (commit `d3fb4cb`) — MAJOR: F2 must not restart the translator
 
 `Hotkey.cs` ~16-22, `Config.cs` ~95 / ~107-116, `Plugin.cs` ~118-128. Flipping
 `Config.Translation` raises `SettingChanged`, whose handler unconditionally reloads the machine
@@ -180,7 +180,7 @@ is off, that coupling is itself wrong — **decouple it so enablement depends on
 Without this, F2-off silently halts production and ITEM 5 is only cosmetically fixed. Check
 nothing else depended on the old coupling.
 
-## ITEM 6 — `TODO` — MAJOR: blocked templates survive reload
+## ITEM 6 — `DONE` (commit `7cc0472`) — MAJOR: blocked templates survive reload
 
 `Plugin.cs` ~23-27 / ~160-168, `TranslationRetryPolicy.cs` ~54-70 / ~82-99. A single
 `static readonly TranslationRetryPolicy` is shared across all reloads; after 3 failed cycles a
@@ -190,7 +190,7 @@ worker but reuses the blocked state, so those strings stay untranslated until th
 Fix: on a **material LLM configuration change**, atomically reset or replace the retry policy
 alongside the worker. Do **not** reset it for F2/debug/refresh changes. Add a unit test.
 
-## ITEM 7 — `TODO` — MAJOR: bound the cache's runtime indexes
+## ITEM 7 — `DONE` (commit `916a3dd`) — MAJOR: bound the cache's runtime indexes
 
 `TranslationCache.cs` ~17-25 / ~282-307 / ~324-337. `generated` is bounded by normalized templates,
 but `raw`, `sourceByTranslatedValue`, and `knownTranslatedValues` retain every exact runtime
