@@ -122,23 +122,6 @@ public sealed class TranslationResolverTests : IDisposable
     }
 
     [Fact]
-    public void Static_context_is_exact_and_unchanged_static_work_is_normal()
-    {
-        var normal = new List<string>();
-        var priority = new List<string>();
-        var cache = new TranslationCache(root);
-        var resolver = new TranslationResolver(cache, priority.Add, normal.Add);
-        var catalog = StaticTranslationCatalog.Parse(
-            @"{ ""SkillMaster"": { ""Name"": { ""烈火スキル"": ""烈火技能"", ""未翻訳する"": ""未翻訳する"" } } }");
-
-        Assert.Equal("烈火技能", resolver.ResolveStatic("烈火スキル", catalog, "SkillMaster", "Name"));
-        Assert.Equal("烈火スキル", resolver.ResolveStatic("烈火スキル", catalog, "ItemMaster", "Name"));
-        foreach (var template in catalog.UnchangedTemplates) resolver.ObserveNormal(template);
-        Assert.Equal(new[] { "烈火スキル" }, priority);
-        Assert.Equal(new[] { "未翻訳する" }, normal);
-    }
-
-    [Fact]
     public void Repeated_runtime_miss_waits_for_periodic_normal_retry_after_failure()
     {
         var queue = new TranslationWorkQueue();

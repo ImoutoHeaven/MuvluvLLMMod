@@ -124,18 +124,6 @@ public sealed class TranslationResolver
         }
     }
 
-    public string ResolveStatic(
-        string original,
-        StaticTranslationCatalog catalog,
-        string masterType,
-        string fieldPath,
-        bool enabled = true)
-    {
-        if (catalog.TryGet(masterType, fieldPath, original, out var exact)) return ResolveKnownSource(original, exact, enabled);
-        var source = cache.TryGetSourceForTranslatedValue(original, out var resolvedSource) ? resolvedSource : original;
-        return Resolve(original, catalog.TryGet(masterType, fieldPath, source, out var value) ? value : null, enabled);
-    }
-
     public void ObserveNormal(string template)
     {
         if (!TextTemplate.IsTranslationCandidate(template)) return;

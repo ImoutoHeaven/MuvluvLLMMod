@@ -25,6 +25,5 @@
     <Compile Include="..\MuvluvLLMMod\TranslationCache.cs" Link="Source\TranslationCache.cs" />
     <Compile Include="..\MuvluvLLMMod\TextTemplate.cs" Link="Source\TextTemplate.cs" />
     <Compile Include="..\MuvluvLLMMod\TranslationResolver.cs" Link="Source\TranslationResolver.cs" />
-    <Compile Include="..\MuvluvLLMMod\ResolverCompatibility.cs" Link="Source\ResolverCompatibility.cs" />
   </ItemGroup>
 </Project>

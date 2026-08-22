@@ -77,8 +77,13 @@ public static class Patch
         new[] { typeof(SkillMaster), typeof(int), typeof(bool) })]
     public static void TranslateSkillDescription(ref string __result)
     {
-        if (!string.IsNullOrEmpty(__result))
+        if (string.IsNullOrEmpty(__result))
+            return;
+
+        if (Config.Translation.Value)
             __result = Translation.ResolveAny(__result);
+        else
+            Translation.ObserveForTranslation(__result, isPlayingScenario);
     }
 
     public static void RefreshAllTmpText()

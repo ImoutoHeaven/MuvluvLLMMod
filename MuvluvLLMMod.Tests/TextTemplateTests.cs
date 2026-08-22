@@ -162,6 +162,8 @@ public sealed class TextTemplateTests
     [InlineData("ﾝ", true)]
     [InlineData("技能 スキル", true)]
     [InlineData("ﾟ", false)]
+    [InlineData("\u3099", false)]
+    [InlineData("\u309c", false)]
     [InlineData("简体中文", false)]
     [InlineData("123 - {0}", false)]
     [InlineData("", false)]
