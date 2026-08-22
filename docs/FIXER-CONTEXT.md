@@ -303,7 +303,12 @@ Outcome per original finding: **CLOSED** — MAJOR-1(re-entry half), MAJOR-2, MA
 MAJOR-5, MINOR-1, MINOR-3, MINOR-4. **PARTIALLY CLOSED** — BLOCKER-1, BLOCKER-2, BLOCKER-3,
 MAJOR-6, MINOR-2, MINOR-5. **Zero-coupling invariant survived intact.**
 
-## FIX-1 — `TODO` — BLOCKER: pooled same-instance/same-value still restores the wrong source
+## FIX-1 — `DONE` — BLOCKER: pooled same-instance/same-value still restores the wrong source
+
+Implemented in commits `c84f1e2` (pure generation-aware restore decision), `21ee914`
+(production wiring and README correction), `eb5f7be` (behavioral and concurrency coverage), and
+`00e8fc4` (explicit external-origin coverage). The final Docker suite is **181 passed / 0 failed**;
+the plugin build is **0 warnings / 0 errors**.
 
 `Patch.cs:56-86`, `TmpTranslationProvenance.cs:66-109`.
 
