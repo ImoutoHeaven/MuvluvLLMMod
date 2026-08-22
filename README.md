@@ -1,44 +1,34 @@
 # MuvluvLLMMod
 
-LLM machine-translation fallback for **Muv-Luv Girls Garden**, as a standalone BepInEx 6 IL2CPP plugin.
+LLM machine-translation fallback for **Muv-Luv Girls Garden**, delivered as a standalone BepInEx 6 IL2CPP plugin.
 
-It watches text as the game renders it, and for anything still containing Japanese kana, translates it
-through an OpenAI-compatible chat endpoint — asynchronously, cached, rate-limited, and retried.
+The plugin observes text at the render layer. Kana-bearing text can be translated through an
+OpenAI-compatible chat endpoint asynchronously, with local caching, rate limiting, and retries.
+It does not require, load, inspect, or coordinate with another plugin.
 
-## Fully standalone
+## Standalone render-layer boundary
 
-This plugin has **no dependency on any other mod**: no compile-time reference, no runtime reference,
-no load-order requirement. It works in either configuration:
+This DLL has no compile-time or runtime dependency on another renderer or data mod, and has no
+load-order requirement. Its fallback behavior is based only on the text arriving at the final
+`TMP_Text` assignment:
 
-| Setup | Behaviour |
-|---|---|
-| **With** [`anosu/MuvluvMod`](https://github.com/anosu/MuvluvMod) installed | Acts as a *fallback tier* — machine-translates only what the curated translation repository does not cover |
-| **Without** it | Acts as a *full* machine translator for all kana-bearing text |
+- kana-free incoming text is not queued;
+- text that still contains Japanese kana may be queued; and
+- if another renderer or data mod has already supplied Chinese (or another kana-free value), this
+  plugin does not actively queue that incoming value.
 
-Same DLL, no configuration change. Nothing to coordinate.
+Those are render-layer rules, not a guarantee that unrelated mods cannot affect the same UI or that
+every game text path is covered. The plugin never reads another mod's data or state.
 
-### Why it never fights other translation mods
+## What gets translated
 
-`MuvluvMod` patches the **data / parameter layer** (`ScenarioController.GenerateFrames`,
-`ScenarioHistoryCell.ApplyText`, `ScenarioChoiceElementComponent.Apply`, `MemoryDB.LoadMasterData`) and
-never touches `TMP_Text`. It also installs prefixes on `ScenarioController.Refresh` and `Leave` to maintain
-its own scenario-state flag. This plugin has separate prefixes on those same two methods for its own flag;
-that deliberate overlap is harmless because each prefix only sets its own state and neither reads or changes
-the other's state. The translation flow remains one way — curated data → game logic → `set_text` → us —
-and the two plugins do not share any data or runtime dependency.
+A string is eligible for production **if and only if it contains Japanese kana** (hiragana,
+katakana, or half-width katakana). Pure-kanji strings (for example `提供割合`) are deliberately
+not translated; this keeps the candidate test conservative.
 
-### What gets translated
-
-A string is queued **if and only if it contains Japanese kana** (hiragana, katakana, or half-width
-katakana). This single rule is the whole correctness story:
-
-- already translated by another mod → no kana → skipped
-- not covered by any mod → kana present → queued
-- curated entry exists but is identical to the original → still Japanese → queued (correctly: no real translation was provided)
-- curated download failed → still Japanese → queued
-
-Pure-kanji strings (e.g. `提供割合`) are deliberately never translated — they are generally legible, and
-skipping them keeps the rule free of false positives.
+Game-produced text is not modified by a data-layer hook. Translation is applied when the final UI
+assignment is observed by this plugin's `TMP_Text` render Prefix. Text produced by a game builder
+or another data source is therefore covered only when it reaches that final assignment.
 
 ## Requirements
 
@@ -58,7 +48,7 @@ Drop `MuvluvLLMMod.dll` into `<GameDir>/BepInEx/plugins/`. Launch once to genera
 
 | Key | Default | Meaning |
 |---|---|---|
-| `Enable` | `true` | Whether translated text is *displayed*. Toggled at runtime with **F2**; it does not stop translation production. |
+| `Enable` | `true` | Whether this plugin's known translations are displayed. Toggled at runtime with **F2**; it does not stop translation production. |
 
 ### `[Translation.Debug]`
 
@@ -87,28 +77,29 @@ Changing a machine-affecting LLM setting (`Enable`, `Endpoint`, `Model`, `ApiKey
 in place. Display, debug, refresh-period, and cache-directory changes do not reload it; no restart is
 needed for the first three, while a cache-directory change takes effect after restart.
 
-## Hotkey
+## Hotkey and display fallback
 
-**F2** — toggle whether translations are *displayed*.
+**F2** toggles whether this plugin's translations are displayed. The toggle is a display operation
+only: when `[LLM] Enable` is true, production continues while display is off so translations can be
+available when display is enabled again.
 
-Turning it off restores original text, but **only on the TMP object whose current assignment this
-plugin translated** and only while this plugin's setter prefix is observing the assignment. A normal
-setter prefix starts a new external assignment—even when its value is byte-identical—so pooled reuse
-cannot reactivate stale provenance. The sole bypass is a one-shot token around the exact
-`text.text = value` write issued by the refresh scan; resolver, queue, reverse-lookup, and logging
-callbacks do not inherit that token, so nested setters invalidate provenance normally. Restoration is
-allowed only during that plugin-owned refresh path and requires the validated object identity,
-assignment generation, lifecycle epoch, and cache reverse mapping to match; any uncertainty leaves the
-current text alone. Provenance is retired before unload unpatches the hook and reset before a new load
-publishes hooks, so assignments made during the unpatched window cannot reuse an old entry. Text
-assigned by another mod is therefore left alone when its setter is observed; the plugin does not claim
-to infer ownership for text rendered outside this TMP setter path.
+For a TMP object whose assignment was translated by this plugin, display-off refresh can restore the
+source only when the object identity, assignment generation, lifecycle epoch, and cache reverse
+mapping all validate. An external setter starts a new assignment even when its value is identical.
+A plugin refresh uses a one-shot token only around the exact setter write it owns. If any check is
+uncertain, the current text is left unchanged; the plugin does not guess ownership from a translated
+string. Text rendered outside an observed TMP setter path is not claimed by this toggle.
 
-LLM production continues in the background while display is off because it is controlled by `[LLM] Enable`,
-not by F2. Toggling back on is therefore instant, without restarting the worker. Pressing F2 also logs a
-progress snapshot (`completed / in-flight / failed`).
+## Runtime verification gates
 
-F3–F5 are deliberately left alone for `anosu/MuvluvMod` to use.
+The release behavior still needs game verification for:
+
+- font fallback and glyph coverage for generated Chinese;
+- whether every relevant UI path reaches the TMP setter; and
+- real pooled-object F2 toggles, layout, and refresh cost.
+
+The documented F2 behavior is limited to the observed TMP display path; it is not a claim of complete
+in-game UI coverage.
 
 ## Status output
 
@@ -120,8 +111,8 @@ Console/log only — there is no in-game UI. A periodic line reports queue healt
 
 ## Building
 
-Requires only Docker; nothing is installed on the host. The game directory is mounted **read-only** and
-is never written to.
+Requires only Docker; nothing is installed on the host. The game directory must be mounted **read-only**
+and is never written to.
 
 ```bash
 # plugin (net6.0, matching the BepInEx IL2CPP runtime)
@@ -142,8 +133,8 @@ Build output goes to `artifacts/`. Game DLL references resolve from `$(GameDir)/
 
 ## Provenance and licence
 
-This is an independent project that interoperates with, but does not depend on,
-[`anosu/MuvluvMod`](https://github.com/anosu/MuvluvMod). The LLM translation core in this repository
-was authored by us; that subsystem never existed in the other project's history.
+This project is independently authored and interoperates at the render boundary without depending
+on another plugin's code, data, or state. The LLM translation core in this repository was authored
+by us.
 
 Licensed under the MIT License; see [`LICENSE`](LICENSE).
