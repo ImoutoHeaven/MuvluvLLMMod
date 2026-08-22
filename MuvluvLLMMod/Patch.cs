@@ -40,10 +40,13 @@ public static class Patch
         if (translatingTmp)
             return;
 
+        // An unguarded setter is an external assignment. Invalidate before looking at the
+        // incoming value: equal content is not evidence that the pooled assignment is continuous.
+        var assignment = tmpProvenance.BeginExternalSetter(__instance, __instance.GetInstanceID());
         translatingTmp = true;
         try
         {
-            ResolveTmpValue(__instance, ref value);
+            ResolveTmpValue(ref value, assignment, TmpTextAssignmentOrigin.ExternalSetter);
         }
         finally
         {
@@ -51,12 +54,11 @@ public static class Patch
         }
     }
 
-    private static void ResolveTmpValue(TMP_Text __instance, ref string value)
+    private static void ResolveTmpValue(
+        ref string value,
+        TmpTextAssignment assignment,
+        TmpTextAssignmentOrigin origin)
     {
-        var instanceId = __instance.GetInstanceID();
-        var current = __instance.text ?? string.Empty;
-        tmpProvenance.InvalidateIfTextChanged(instanceId, current);
-
         var original = value ?? string.Empty;
         var containsKana = TextTemplate.IsTranslationCandidate(original);
         var enqueueObservation = default(EnqueueObservation);
@@ -67,21 +69,25 @@ public static class Patch
                 value = Translation.ResolveAny(original, enqueue: true);
                 enqueueObservation = Translation.LastEnqueueObservation;
                 if (!string.Equals(value, original, StringComparison.Ordinal))
-                    tmpProvenance.Record(instanceId, value, original);
+                    tmpProvenance.Record(assignment, value, original);
             }
             else
             {
                 Translation.ObserveForTranslation(original, isPlayingScenario);
                 enqueueObservation = Translation.LastEnqueueObservation;
-                // HARD RULE: string equality alone is insufficient: only restore an exact value
-                // recorded for this TMP instance, and only while the cache resolves it to its source.
-                if (tmpProvenance.TryRestore(
-                    instanceId,
-                    original,
-                    translatedValue => Core.Cache.TryGetSourceForTranslatedValue(translatedValue, out var source)
-                        ? source
-                        : null,
-                    out var source))
+                // HARD RULE: external setter calls invalidate provenance before this resolution,
+                // including byte-identical values. Only the guarded refresh path may restore, and
+                // only after identity/generation and reverse-source validation succeed. Any
+                // uncertainty leaves the incoming text unchanged.
+                if (origin == TmpTextAssignmentOrigin.PluginRefresh
+                    && tmpProvenance.TryRestore(
+                        assignment,
+                        original,
+                        origin,
+                        translatedValue => Core.Cache.TryGetSourceForTranslatedValue(translatedValue, out var source)
+                            ? source
+                            : null,
+                        out var source))
                 {
                     value = source;
                 }
@@ -123,7 +129,8 @@ public static class Patch
             translatingTmp = true;
             try
             {
-                ResolveTmpValue(text, ref value);
+                var assignment = tmpProvenance.BeginPluginRefresh(text, text.GetInstanceID());
+                ResolveTmpValue(ref value, assignment, TmpTextAssignmentOrigin.PluginRefresh);
                 if (!string.Equals(text.text, value, StringComparison.Ordinal))
                     text.text = value;
             }

@@ -91,10 +91,13 @@ needed for the first three, while a cache-directory change takes effect after re
 
 **F2** — toggle whether translations are *displayed*.
 
-Turning it off restores original text, but **only on the TMP object whose current value this plugin
-translated**. Restoration uses per-instance provenance rather than the translated value alone, so a
-matching value on another object is left untouched. Text translated by another mod is also left alone:
-we have no record of its original and must not corrupt it.
+Turning it off restores original text, but **only on the TMP object whose current assignment this
+plugin translated**. Every unguarded `TMP_Text.set_text` call starts a new external assignment—even
+when its value is byte-identical—so pooled reuse cannot reactivate stale provenance. Restoration is
+allowed only during the plugin's guarded refresh path and requires both the validated object identity /
+assignment generation and the cache's reverse mapping to match; any uncertainty leaves the text alone.
+Text assigned by another mod is therefore left alone: its external setter invalidates our prior record,
+and we have no record of its original to restore.
 
 LLM production continues in the background while display is off because it is controlled by `[LLM] Enable`,
 not by F2. Toggling back on is therefore instant, without restarting the worker. Pressing F2 also logs a
