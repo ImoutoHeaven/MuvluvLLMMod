@@ -161,7 +161,7 @@ public static class Patch
             text,
             containsKana,
             enqueueObservation.DurablyPending,
-            enqueueObservation.AcceptedByLiveWorker,
+            enqueueObservation.AcceptedByScheduler,
             DateTimeOffset.UtcNow);
         if (decision.SuppressedLines > 0)
         {
@@ -181,7 +181,7 @@ public static class Patch
         Logger.Info(
             $"[LLM] seen text=\"{displayed}\" kana={containsKana} "
             + $"durablyPending={enqueueObservation.DurablyPending} "
-            + $"acceptedByLiveWorker={enqueueObservation.AcceptedByLiveWorker}");
+            + $"acceptedByScheduler={enqueueObservation.AcceptedByScheduler}");
     }
 
     private static void VerifyPatches(string harmonyId)

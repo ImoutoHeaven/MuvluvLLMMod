@@ -14,9 +14,21 @@ public sealed class DebugTextLogPolicyTests
         var policy = new DebugTextLogPolicy(capacity: 32, linesPerSecond: 100_000, startTime: Start);
 
         for (var index = 0; index < 10_000; index++)
-            policy.Observe("文本" + index, containsKana: true, durablyPending: true, acceptedByLiveWorker: true, now: Start);
+            policy.Observe("文本" + index, containsKana: true, durablyPending: true, acceptedByScheduler: true, now: Start);
 
         Assert.Equal(32, policy.SeenCount);
+    }
+
+    [Fact]
+    public void Deduper_retains_only_truncated_display_text_for_long_inputs()
+    {
+        var policy = new DebugTextLogPolicy(capacity: 4, linesPerSecond: 100_000, startTime: Start);
+
+        for (var index = 0; index < 20; index++)
+            policy.Observe(new string('字', 1_000) + index, true, true, true, Start);
+
+        Assert.Equal(4, policy.SeenCount);
+        Assert.Equal(80, policy.MaxSeenTextLength);
     }
 
     [Fact]
@@ -67,7 +79,7 @@ public sealed class DebugTextLogPolicyTests
             text,
             containsKana: true,
             durablyPending: true,
-            acceptedByLiveWorker: false,
+            acceptedByScheduler: false,
             now: Start);
 
         Assert.True(decision.ShouldLog);
@@ -75,7 +87,7 @@ public sealed class DebugTextLogPolicyTests
         Assert.Equal(text[..80], decision.Text);
         Assert.True(decision.ContainsKana);
         Assert.True(decision.DurablyPending);
-        Assert.False(decision.AcceptedByLiveWorker);
+        Assert.False(decision.AcceptedByScheduler);
     }
 
     [Fact]
@@ -90,7 +102,7 @@ public sealed class DebugTextLogPolicyTests
                 "并发文本" + index,
                 containsKana: index % 2 == 0,
                 durablyPending: true,
-                acceptedByLiveWorker: true,
+                acceptedByScheduler: true,
                 now: Start));
         });
 

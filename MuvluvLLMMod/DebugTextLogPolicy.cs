@@ -5,7 +5,7 @@ public readonly record struct DebugTextLogDecision(
     string? Text,
     bool ContainsKana,
     bool DurablyPending,
-    bool AcceptedByLiveWorker,
+    bool AcceptedByScheduler,
     int SuppressedLines);
 
 /// <summary>
@@ -19,8 +19,10 @@ public sealed class DebugTextLogPolicy
     private readonly int capacity;
     private readonly double linesPerSecond;
     private readonly TimeSpan summaryInterval;
-    private readonly Dictionary<string, LinkedListNode<string>> seen = new(StringComparer.Ordinal);
-    private readonly LinkedList<string> lru = new();
+    private readonly Dictionary<ulong, LinkedListNode<SeenEntry>> seen = new();
+    private readonly LinkedList<SeenEntry> lru = new();
+
+    private readonly record struct SeenEntry(ulong Hash, string DisplayText);
     private DateTimeOffset lastRefill;
     private DateTimeOffset nextSummary;
     private double tokens;
@@ -65,20 +67,40 @@ public sealed class DebugTextLogPolicy
         }
     }
 
+    /// <summary>
+    /// Returns the largest retained display string, not the size of an input key.
+    /// </summary>
+    public int MaxSeenTextLength
+    {
+        get
+        {
+            lock (gate)
+            {
+                var maximum = 0;
+                foreach (var entry in lru)
+                    maximum = Math.Max(maximum, entry.DisplayText.Length);
+                return maximum;
+            }
+        }
+    }
+
     public DebugTextLogDecision Observe(
         string? text,
         bool containsKana,
         bool durablyPending,
-        bool acceptedByLiveWorker,
+        bool acceptedByScheduler,
         DateTimeOffset now)
     {
-        var key = text ?? string.Empty;
+        var input = text ?? string.Empty;
+        var hash = Hash(input);
+        var display = Truncate(input);
         lock (gate)
         {
             RefillUnsafe(now);
-            if (seen.TryGetValue(key, out var existing))
+            if (seen.TryGetValue(hash, out var existing))
             {
-                // This is a bounded LRU rather than a process-lifetime HashSet.
+                // This is a bounded LRU rather than a process-lifetime HashSet. The key is
+                // fixed-size; only already-truncated display text is retained in the node.
                 lru.Remove(existing);
                 lru.AddLast(existing);
                 return new DebugTextLogDecision(
@@ -90,7 +112,7 @@ public sealed class DebugTextLogPolicy
                     TakeSuppressedSummaryUnsafe(now));
             }
 
-            AddSeenUnsafe(key);
+            AddSeenUnsafe(hash, display);
             var summary = TakeSuppressedSummaryUnsafe(now);
             if (tokens < 1)
             {
@@ -107,10 +129,10 @@ public sealed class DebugTextLogPolicy
             tokens--;
             return new DebugTextLogDecision(
                 true,
-                Truncate(key),
+                display,
                 containsKana,
                 durablyPending,
-                acceptedByLiveWorker,
+                acceptedByScheduler,
                 summary);
         }
     }
@@ -144,15 +166,30 @@ public sealed class DebugTextLogPolicy
         return summary;
     }
 
-    private void AddSeenUnsafe(string key)
+    private void AddSeenUnsafe(ulong hash, string display)
     {
-        var node = lru.AddLast(key);
-        seen[key] = node;
+        var node = lru.AddLast(new SeenEntry(hash, display));
+        seen[hash] = node;
         if (seen.Count <= capacity)
             return;
 
         var oldest = lru.First!;
         lru.RemoveFirst();
-        seen.Remove(oldest.Value);
+        seen.Remove(oldest.Value.Hash);
+    }
+
+    private static ulong Hash(string text)
+    {
+        const ulong offset = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+        var hash = offset;
+        foreach (var character in text)
+        {
+            hash ^= character;
+            hash *= prime;
+        }
+
+        hash ^= (ulong)text.Length;
+        return hash * prime;
     }
 }

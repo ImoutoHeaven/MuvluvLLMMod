@@ -46,7 +46,7 @@ public sealed class TranslationFacadeTests : IDisposable
         Assert.Equal(new[] { original }, normal);
         Assert.Equal(new[] { original }, cache.PendingSnapshot());
         Assert.Equal(new EnqueueObservation(true, true), Translation.LastEnqueueObservation);
-        Assert.True(Translation.LastResolveEnqueued);
+        Assert.True(Translation.LastResolveAcceptedByScheduler);
     }
 
     [Fact]
@@ -61,7 +61,7 @@ public sealed class TranslationFacadeTests : IDisposable
         Assert.Equal(new[] { "保留する" }, priority);
         Assert.Equal(new[] { "保留する" }, cache.PendingSnapshot());
         Assert.Equal(new EnqueueObservation(true, false), Translation.LastEnqueueObservation);
-        Assert.False(Translation.LastResolveEnqueued);
+        Assert.False(Translation.LastResolveAcceptedByScheduler);
     }
 
     [Fact]
@@ -84,6 +84,17 @@ public sealed class TranslationFacadeTests : IDisposable
         Assert.Equal(new[] { "優先する" }, priority);
         Assert.Empty(normal);
         Assert.Equal(new EnqueueObservation(true, true), Translation.LastEnqueueObservation);
+        Assert.True(Translation.LastResolveAcceptedByScheduler);
+    }
+
+    [Fact]
+    public void Display_off_priority_backlog_is_reported_as_scheduler_acceptance()
+    {
+        Config.Translation.Value = false;
+
+        Assert.True(Translation.ObserveForTranslation("场景优先する", priority: true));
+        Assert.Equal(new EnqueueObservation(true, true), Translation.LastEnqueueObservation);
+        Assert.True(Translation.LastResolveAcceptedByScheduler);
     }
 
     public void Dispose()

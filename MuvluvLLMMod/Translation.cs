@@ -9,7 +9,7 @@ public static class Translation
     private static EnqueueObservation lastEnqueueObservation;
 
     public static EnqueueObservation LastEnqueueObservation => lastEnqueueObservation;
-    public static bool LastResolveEnqueued => lastEnqueueObservation.AcceptedByLiveWorker;
+    public static bool LastResolveAcceptedByScheduler => lastEnqueueObservation.AcceptedByScheduler;
 
     public static string ResolveAny(string original, bool enqueue = true)
     {
@@ -50,16 +50,16 @@ public static class Translation
                 original,
                 Core.EndEnqueueObservation());
         }
-        return lastEnqueueObservation.AcceptedByLiveWorker;
+        return lastEnqueueObservation.AcceptedByScheduler;
     }
 
-    private static EnqueueObservation CaptureObservation(string original, bool acceptedByLiveWorker)
+    private static EnqueueObservation CaptureObservation(string original, bool acceptedByScheduler)
     {
         var source = Core.Cache.TryGetSourceForTranslatedValue(original, out var resolvedSource)
             ? resolvedSource
             : original;
         var durablyPending = TextTemplate.IsTranslationCandidate(source)
             && Core.Cache.TryGetPendingGeneration(TextTemplate.Normalize(source).Template, out _);
-        return new EnqueueObservation(durablyPending, acceptedByLiveWorker);
+        return new EnqueueObservation(durablyPending, acceptedByScheduler);
     }
 }
