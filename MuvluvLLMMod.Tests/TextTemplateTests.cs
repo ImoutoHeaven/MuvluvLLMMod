@@ -30,6 +30,17 @@ public sealed class TextTemplateTests
     }
 
     [Fact]
+    public void Fill_rejects_a_final_expansion_over_the_utf16_text_budget()
+    {
+        var translatedTemplate = new string('中', 4080) + "{0}";
+        var numericValue = new string('9', 100);
+
+        Assert.True(TranslationBudget.IsTextWithinBudget(translatedTemplate));
+        Assert.True(TranslationBudget.IsTextWithinBudget(numericValue));
+        Assert.Null(TextTemplate.Fill(translatedTemplate, new[] { numericValue }, 0));
+    }
+
+    [Fact]
     public void Fill_supports_non_contiguous_preexisting_placeholders()
     {
         var normalized = TextTemplate.Normalize("スキル {3} 12 7");

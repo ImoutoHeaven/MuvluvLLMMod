@@ -91,6 +91,28 @@ public sealed class ProductionRenderIntegrationTests
     }
 
     [Fact]
+    public void Over_budget_generated_expansion_stays_source_even_when_f2_is_off()
+    {
+        using var fixture = ProductionHarness.LoadPlugin();
+        Config.Translation.Value = true;
+        var cache = Plugin.CurrentCache!;
+        var source = "スキル " + new string('9', 100);
+        var normalized = TextTemplate.Normalize(source);
+        var translatedTemplate = new string('中', 4080) + "{0}";
+        Assert.True(cache.StoreGenerated(normalized.Template, translatedTemplate));
+
+        var label = new TMP_Text();
+        label.text = source;
+        Assert.Equal(source, label.text);
+        Assert.False(cache.TryGetGenerated(normalized.Template, out _));
+        Assert.Equal(new[] { normalized.Template }, cache.PendingSnapshot());
+
+        Config.Translation.Value = false;
+        Patch.RefreshAllTmpText();
+        Assert.Equal(source, label.text);
+    }
+
+    [Fact]
     public void Missing_required_patch_verification_rolls_back_before_hotkey_persistence_or_worker_start()
     {
         var plugin = ProductionHarness.PreparePluginForLoad();

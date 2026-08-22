@@ -74,11 +74,15 @@ public static class TextTemplate
                 || values.Length > MaxPlaceholderIndex - numericPlaceholderStart + 1)) return null;
         var numeric = indices.Where(index => index >= numericPlaceholderStart).ToArray();
         if (!numeric.SequenceEqual(Enumerable.Range(numericPlaceholderStart, values.Length))) return null;
-        return Placeholder.Replace(translatedTemplate, match =>
+        var filled = Placeholder.Replace(translatedTemplate, match =>
         {
             _ = int.TryParse(match.Groups[1].Value, out var index);
             return index < numericPlaceholderStart ? match.Value : values[index - numericPlaceholderStart];
         });
+        // Placeholder validation bounds each component, but expansion can still make the final
+        // render exceed either the UTF-16 or UTF-8 text budget. Never return an unrecordable
+        // plugin-owned string; the resolver will remove the invalid generated template.
+        return TranslationBudget.IsTextWithinBudget(filled) ? filled : null;
     }
 
     public static bool HasSamePlaceholders(string sourceTemplate, string translatedTemplate)

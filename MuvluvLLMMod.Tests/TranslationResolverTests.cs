@@ -122,6 +122,23 @@ public sealed class TranslationResolverTests : IDisposable
     }
 
     [Fact]
+    public void Over_budget_placeholder_expansion_removes_generated_and_leaves_source_pending()
+    {
+        var priority = new List<string>();
+        var cache = new TranslationCache(root);
+        var source = "スキル " + new string('9', 100);
+        var normalized = TextTemplate.Normalize(source);
+        var translatedTemplate = new string('中', 4080) + "{0}";
+        Assert.True(cache.StoreGenerated(normalized.Template, translatedTemplate));
+        var resolver = new TranslationResolver(cache, priority.Add, _ => { });
+
+        Assert.Equal(source, resolver.Resolve(source));
+        Assert.False(cache.TryGetGenerated(normalized.Template, out _));
+        Assert.Equal(new[] { normalized.Template }, cache.PendingSnapshot());
+        Assert.Equal(new[] { normalized.Template }, priority);
+    }
+
+    [Fact]
     public void Repeated_runtime_miss_waits_for_periodic_normal_retry_after_failure()
     {
         var queue = new TranslationWorkQueue();
