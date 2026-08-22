@@ -163,7 +163,9 @@ public sealed class OpenAiChatClient
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.ApiKey);
         }
 
-        using var response = await limiter.StartAsync(() => client.SendAsync(request, token), token).ConfigureAwait(false);
+        using var response = await limiter.StartAsync(
+            () => client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token),
+            token).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode) throw new HttpRequestException("LLM endpoint returned a non-success status.");
         var json = await ReadContentBoundedAsync(response.Content, token).ConfigureAwait(false);
         using var document = JsonDocument.Parse(json);

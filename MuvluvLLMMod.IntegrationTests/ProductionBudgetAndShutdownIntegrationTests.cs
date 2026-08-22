@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using Xunit;
@@ -45,6 +47,27 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
         {
             try { Directory.Delete(root, recursive: true); } catch { }
         }
+    }
+
+    [Fact]
+    public async Task Response_body_budget_stops_unknown_length_producer_before_full_buffer()
+    {
+        const int totalBytes = 512 * 1024;
+        var content = new CountingChunkedContent(totalBytes);
+        using var http = new HttpClient(new DelegateHandler(_ =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content })));
+        var client = new OpenAiChatClient(
+            http,
+            new OpenAiChatSettings("https://example.test/v1/chat/completions", "model", string.Empty, 30, 1),
+            new RequestRateLimiter(1000));
+
+        Assert.Null(content.Headers.ContentLength);
+        Assert.Null(await client.TranslateAsync("スキル", CancellationToken.None));
+        Assert.InRange(
+            content.ProducedBytes,
+            TranslationBudget.MaxResponseBodyBytes,
+            TranslationBudget.MaxResponseBodyBytes + 8192);
+        Assert.True(content.ProducedBytes < totalBytes);
     }
 
     [Fact]
@@ -266,6 +289,98 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
             release.TrySetResult("翻译");
             try { Directory.Delete(root, recursive: true); } catch { }
         }
+    }
+
+    private sealed class CountingChunkedContent : HttpContent
+    {
+        private readonly int totalBytes;
+        private int producedBytes;
+
+        public CountingChunkedContent(int totalBytes) => this.totalBytes = totalBytes;
+        public int ProducedBytes => Volatile.Read(ref producedBytes);
+
+        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+        {
+            await stream.WriteAsync(new byte[totalBytes]);
+            Interlocked.Exchange(ref producedBytes, totalBytes);
+        }
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync() =>
+            Task.FromResult<Stream>(new CountingReadStream(totalBytes, count => Interlocked.Add(ref producedBytes, count)));
+    }
+
+    private sealed class CountingReadStream : Stream
+    {
+        private readonly int totalBytes;
+        private readonly Action<int> produced;
+        private int position;
+
+        public CountingReadStream(int totalBytes, Action<int> produced)
+        {
+            this.totalBytes = totalBytes;
+            this.produced = produced;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => totalBytes;
+        public override long Position
+        {
+            get => position;
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var read = Math.Min(count, totalBytes - position);
+            if (read <= 0) return 0;
+            Array.Clear(buffer, offset, read);
+            position += read;
+            produced(read);
+            return read;
+        }
+
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var read = Math.Min(buffer.Length, totalBytes - position);
+            if (read <= 0) return ValueTask.FromResult(0);
+            buffer[..read].Span.Clear();
+            position += read;
+            produced(read);
+            return ValueTask.FromResult(read);
+        }
+
+        public override Task<int> ReadAsync(
+            byte[] buffer,
+            int offset,
+            int count,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(Read(buffer, offset, count));
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class DelegateHandler : HttpMessageHandler
+    {
+        private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> send;
+        public DelegateHandler(Func<HttpRequestMessage, Task<HttpResponseMessage>> send) => this.send = send;
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => send(request);
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)
