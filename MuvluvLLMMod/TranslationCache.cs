@@ -9,6 +9,7 @@ public sealed class TranslationCache
 
     private const int RawSampleCapacity = 4096;
     private const int RuntimeReverseIndexCapacity = 4096;
+    public const int TerminalFlushMaxAttempts = 3;
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private readonly object gate = new();
     private readonly object writerGate = new();
@@ -273,7 +274,16 @@ public sealed class TranslationCache
         }
     }
 
-    public void Flush()
+    public bool FlushTerminal()
+    {
+        for (var attempt = 0; attempt < TerminalFlushMaxAttempts; attempt++)
+        {
+            if (Flush()) return true;
+        }
+        return false;
+    }
+
+    public bool Flush()
     {
         lock (writerGate)
         {
@@ -283,7 +293,7 @@ public sealed class TranslationCache
             long snapshotVersion;
             lock (gate)
             {
-                if (!dirty) return;
+                if (!dirty) return true;
                 generatedSnapshot = new Dictionary<string, string>(generated, StringComparer.Ordinal);
                 pendingSnapshot = pending.ToArray();
                 rawSnapshot = raw.ToDictionary(value => value, _ => string.Empty, StringComparer.Ordinal);
@@ -295,8 +305,14 @@ public sealed class TranslationCache
                 && TryWriteAtomic(RawPath, JsonSerializer.Serialize(rawSnapshot, JsonOptions));
             lock (gate)
             {
-                if (succeeded && mutationVersion == snapshotVersion) dirty = false;
-                else SignalDirtyUnsafe();
+                if (succeeded && mutationVersion == snapshotVersion)
+                {
+                    dirty = false;
+                    return true;
+                }
+
+                SignalDirtyUnsafe();
+                return false;
             }
         }
     }

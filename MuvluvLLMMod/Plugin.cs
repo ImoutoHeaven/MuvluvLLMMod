@@ -147,8 +147,13 @@ public sealed class Plugin : BasePlugin
 
         CleanupStep("flush cache", () =>
         {
-            if (Cache != null)
-                Cache.Flush();
+            if (Cache == null || Cache.FlushTerminal())
+                return;
+
+            Logger.Error(
+                $"[LLM] Terminal cache flush failed after {TranslationCache.TerminalFlushMaxAttempts} attempts; "
+                + "dirty cache data may be unrecoverable");
+            throw new InvalidOperationException("terminal cache flush failed");
         }, ref succeeded);
         CleanupStep("unpatch Harmony", () =>
         {

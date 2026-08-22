@@ -188,6 +188,23 @@ public sealed class TranslationCacheTests : IDisposable
     }
 
     [Fact]
+    public void Terminal_flush_retries_a_transient_final_write()
+    {
+        var generatedAttempts = 0;
+        var cache = new TranslationCache(root, writeAtomic: (path, _) =>
+        {
+            if (Path.GetFileName(path) == "generated.zh_Hans.json")
+                return ++generatedAttempts > 1;
+            return true;
+        });
+        Assert.True(cache.ObservePriority("最後する", "最後する"));
+        cache.FreezeMutations();
+
+        Assert.True(cache.FlushTerminal());
+        Assert.Equal(2, generatedAttempts);
+    }
+
+    [Fact]
     public async Task Persistent_write_failures_are_paced()
     {
         var attempts = new List<DateTime>();
