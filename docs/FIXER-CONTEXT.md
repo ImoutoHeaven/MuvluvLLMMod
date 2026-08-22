@@ -737,3 +737,88 @@ N-2/final checkpoint: dotnet build — 0 warnings, 0 errors.
 
 The remaining requested review ID is **M-5** only; it is intentionally deferred to the next
 integration/mutation-test batch.
+
+## M-5 follow-up — exact production wiring harness and mutation gate (implementation submitted)
+
+This section records the M-5 implementation at `9616715` plus commits `53a2432` and `5ac464a`.
+It intentionally does **not** declare M-5 closed; that remains for the final reviewer.
+No production runtime source was changed. The two commits add only the exact-source test target,
+its runtime-boundary stubs, documentation, and the Docker-only mutation script.
+
+### Harness architecture and source boundary
+
+`MuvluvLLMMod.IntegrationTests/MuvluvLLMMod.IntegrationTests.csproj` is a separate net8.0
+xUnit target with `<Compile Include="..\MuvluvLLMMod\*.cs" Link="Production\..." />`. Thus the
+assembly compiles the checked-in production implementation itself, not a project reference or a
+copied analogue. The only excluded production file is `CompilerServices.cs`, whose net6
+compatibility attributes are supplied by the net8 target framework. The linked set includes
+`Patch.cs`, `Plugin.cs`, `Config.cs`, `Hotkey.cs`, `Logger.cs`, `RetainedDelegate.cs`,
+`NativeDelegateCoordinator`, `PluginLifecycleGate`, all translation/cache/worker/budget sources,
+and every other current production `.cs` dependency.
+
+`Stubs/RuntimeStubs.cs` replaces only external runtime edges: BepInEx plugin/config/logging
+objects, Harmony attributes/discovery/ownership, Unity object/component lifetime/time/input,
+TMP, the two scenario target types, and the IL2CPP `Action` plus application add/remove calls.
+The boundaries are executable rather than source checks:
+
+- fake `TMP_Text.text` invokes the exact production `Patch.TranslateTmpSetter` Prefix;
+- fake application add/remove stores native delegate objects by reference, so exact production
+  `Plugin` registration, cleanup, and `NativeDelegateCoordinator` identity are exercised;
+- fake `ConfigFile` raises the actual production `Config` handler, which enters the actual
+  `PluginGenerationLease`; and
+- fake Harmony discovery reports target ownership and can omit a required target, so the actual
+  `Patch.Initialize`/`Plugin.Load` rollback path runs.
+
+No game process or real IL2CPP native runtime is claimed by this harness. The native boundary is
+narrowly simulated; the production coordinator and all surrounding ownership code are exact
+source. Existing source-surface tests remain supplemental only.
+
+### Behavioral coverage
+
+The 13 integration tests are grouped as follows:
+
+- `ProductionRenderIntegrationTests` (3): nested same/other TMP external setters with identical
+  Chinese, F2-off no-op, valid plugin-refresh restoration, unload/retire/reload stale provenance,
+  the single final TMP path for a skill description, and missing required Harmony verification
+  rolling back before Hotkey/application/persistence/worker publication.
+- `ProductionCoordinationIntegrationTests` (6): real Plugin quit registration/removal, forced
+  native remove/register interleaving, cleanup during Loading with rejected late stages, stale
+  Config event snapshots across generations, duplicate machine initialization without replacing
+  the owner, and failed cleanup continuation/quarantine.
+- `ProductionBudgetAndShutdownIntegrationTests` (4): oversized render rejection and no pending
+  retention, transient terminal flush recovery, persistent flush failure quarantining a cleanup,
+  and a non-cooperative machine timing out while later flush/unpatch steps still execute.
+
+### Reproducible mutation gate
+
+`scripts/mutation-gate.sh` copies the repository into a throwaway container directory before
+running anything. It first requires the exact integration baseline to report 13 passed and zero
+failed tests, then makes each mutant in a separate temporary copy. The final Docker run against
+this implementation reported these exact compile-valid outcomes:
+
+| ID | Deliberate production mutation | Focused result |
+|---|---|---|
+| `M5-B1-broad-tmp-token` | Make the real Prefix return for every setter while a token exists (`|| true`). | Build succeeded; 1 failed, 0 passed — killed. |
+| `M5-B2-reopen-generation-gate` | Replace the generation state admission guard with `if (false)`. | Build succeeded with one unreachable-code warning; 1 failed, 0 passed — killed. |
+| `M5-M1-reconvert-quit-delegate` | Re-convert the quit delegate inside the native add callback. | Build succeeded; 1 failed, 0 passed — killed. |
+| `M5-N1-open-required-patch-verification` | Change the required verification failure branch to `if (false && ...)`. | Build succeeded; 1 failed, 0 passed — killed. |
+| `M5-M3-disable-budget-gate` | Make `TranslationBudget.IsTextWithinBudget` always return true. | Build succeeded; 1 failed, 0 passed — killed. |
+| `M5-M4-remove-terminal-retry-guard` | Reduce terminal flush attempts from the production constant to one. | Build succeeded; 1 failed, 0 passed — killed. |
+
+A surviving mutant is a gate failure. The script ends only after all six are killed and prints
+`M-5 mutation gate: all 6 compile-valid mutants killed`; it never mutates the checkout.
+
+### Docker validation
+
+All validation used `docker run --rm` with `mcr.microsoft.com/dotnet/sdk:8.0`; source was copied
+into the container writable layer and the game was never launched. The game path was mounted
+`readonly` for the production build:
+
+- legacy `MuvluvLLMMod.Tests`: **241 passed, 0 failed, 0 skipped**;
+- exact-source `MuvluvLLMMod.IntegrationTests`: **13 passed, 0 failed, 0 skipped**;
+- `dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game`: **0 warnings,
+  0 errors**; and
+- Docker throwaway mutation gate: baseline **13/13**, all six compile-valid mutants killed.
+
+The game directory `C:/Users/Eden/Muv-Luv/muv_luv_girlsgarden_cl` was read-only on the build
+mount and was not written or started. No host `dotnet` or dependency installation was used.
