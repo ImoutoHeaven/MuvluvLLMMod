@@ -54,6 +54,18 @@ public sealed class PatchSurfaceTests
     }
 
     [Fact]
+    public void Patch_routes_external_setters_and_refreshes_through_the_restore_decision()
+    {
+        var patch = ReadProductionSource("Patch.cs");
+
+        Assert.Contains("BeginExternalSetter", patch, StringComparison.Ordinal);
+        Assert.Contains("BeginPluginRefresh", patch, StringComparison.Ordinal);
+        Assert.Contains("TmpTextAssignmentOrigin.ExternalSetter", patch, StringComparison.Ordinal);
+        Assert.Contains("TmpTextAssignmentOrigin.PluginRefresh", patch, StringComparison.Ordinal);
+        Assert.DoesNotContain("InvalidateIfTextChanged", patch, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Config_contains_only_the_plugin_owned_settings()
     {
         var config = ReadProductionSource("Config.cs");

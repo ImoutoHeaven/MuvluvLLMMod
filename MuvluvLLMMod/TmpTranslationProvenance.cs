@@ -29,7 +29,7 @@ public readonly struct TmpTextAssignment
 }
 
 /// <summary>
-/// Bounded, object-free restore decision state for translations applied to TMP instances.
+/// Bounded, Unity-free restore decision state for translations applied to TMP instances.
 /// The caller supplies the Unity object as an opaque identity; this type has no Unity dependency.
 /// </summary>
 public sealed class TmpTranslationProvenance
