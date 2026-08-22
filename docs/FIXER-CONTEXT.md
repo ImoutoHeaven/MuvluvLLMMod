@@ -293,9 +293,128 @@ unless there is a reason not to; state what you chose.
 
 ---
 
+# ROUND 2 — final gate review returned DO-NOT-SHIP
+
+All 14 items above are `DONE` (26 commits, clean rebuild: build 0/0, tests 176 passed).
+A second adversarial review then found the original BLOCKER-1 only **partially** closed, plus
+three new MAJORs and two MINORs. Five fixes are required before the next ship gate.
+
+Outcome per original finding: **CLOSED** — MAJOR-1(re-entry half), MAJOR-2, MAJOR-3, MAJOR-4,
+MAJOR-5, MINOR-1, MINOR-3, MINOR-4. **PARTIALLY CLOSED** — BLOCKER-1, BLOCKER-2, BLOCKER-3,
+MAJOR-6, MINOR-2, MINOR-5. **Zero-coupling invariant survived intact.**
+
+## FIX-1 — `TODO` — BLOCKER: pooled same-instance/same-value still restores the wrong source
+
+`Patch.cs:56-86`, `TmpTranslationProvenance.cs:66-109`.
+
+Deterministic corruption sequence:
+1. Instance `N` translated by us: `確認する → 确定`; provenance records `(N, 确定, 確認する)`.
+2. The same TMP component is **pooled/reused** for unrelated curated text whose value is *also* `确定`.
+3. `InvalidateIfTextChanged` sees `__instance.text` still equals `确定`, so it **keeps** the stale entry.
+4. The incoming value is also `确定`, and the reverse cache still resolves it to `確認する`.
+5. Display-off → `TryRestore` succeeds → unrelated curated `确定` becomes `確認する`.
+
+This needs **no** instance-ID collision. Unity pooling deliberately keeps the same ID because it is
+the same component. The missing dimension is **assignment/content generation**, not object identity.
+`ScenarioHistoryCell` is exactly such a pooled list cell.
+
+Capacity eviction is safe (an evicted entry restores nothing), but a **failed** source validation
+currently leaves the stale entry resident, so it can reactivate if the reverse mapping reappears.
+
+Required:
+- Distinguish **external** setter calls from **plugin-owned refresh** restoration. Any unguarded
+  external setter must invalidate prior provenance *before* resolving — **even when the incoming
+  value equals the recorded translation.** Our own writes are identifiable because they go through
+  the guarded refresh path.
+- Restore **only** from the plugin-owned refresh path.
+- Bind provenance to a validated identity/generation, not a bare integer ID.
+- **Discard entries permanently on failed validation.**
+- Every failure mode must be a **no-op**, never "restore the wrong thing".
+- Extract the restore decision so it is testable without Unity, and test same-instance/same-value
+  reuse plus external-setter-vs-refresh origin.
+
+## FIX-2 — `TODO` — MAJOR: debug deduper has a count cap, not a memory cap
+
+`DebugTextLogPolicy.cs:22-23, 75, 93, 147-156`. The dictionary and linked list retain the **complete**
+input string; truncation happens only when building the log decision. 2,048 arbitrarily long strings
+stay rooted after their TMP owners release them. Lock and token accounting are otherwise sound
+(suppression summaries correctly consume tokens).
+
+Fix: deduplicate on fixed-size hashes or bounded keys, retaining only already-truncated display text.
+A hash collision may conservatively suppress a diagnostic line; it must never require storing the
+full original string.
+
+Also in scope (was MINOR): `acceptedByLiveWorker` is untruthful for scenario-priority work —
+`Plugin.cs:264-268`, `MachineTranslatorLifecycle.cs:73-80`. With the LLM disabled, `current` is null
+yet priority work returns `true` after being retained in `priorityBacklog`. Return a richer result
+(`LiveWorker` / `Backlog` / `Rejected`) or rename to `AcceptedByScheduler`. Durable-pending state is
+already reported correctly and separately.
+
+## FIX-3 — `TODO` — MAJOR: the IL2CPP quit handler cannot be removed
+
+`Plugin.cs:33, 87, 118`. The game's `Application.quitting` is an `Il2CppSystem.Action`;
+`ApplicationQuittingHandler` is a `System.Action`, and both registration and removal implicitly
+convert it. **Il2CppInterop allocates a fresh native delegate target and method-info object on every
+conversion**, so the delegate built at line 118 never compares equal to the one added at line 87 and
+subtraction cannot remove it.
+
+Normal quit still fires, but explicit unload and failed-load rollback leave a native callback rooted;
+repeated unload/reload cycles accumulate callbacks and make rollback incomplete.
+
+Fix: convert **once**, retain that exact `Il2CppSystem.Action`, pass the same native delegate to both
+`Application.add_quitting` and `Application.remove_quitting`, and clear the field only after a
+successful removal.
+
+(Verified read-only against the game's interop assemblies: `Application.quitting` and
+`Internal_ApplicationQuit` genuinely exist — the defect is removal identity, not hook selection.)
+
+## FIX-4 — `TODO` — MAJOR: lifecycle shutdown is not terminal or quiescent
+
+`Plugin.cs:137, 174-177, 207-218`, `MachineTranslatorLifecycle.cs:47-60, 117-171`. Two races:
+- Configuration stays **subscribed** until after machine shutdown. A machine-setting change between
+  shutdown and `Config.Shutdown` obtains a newer lifecycle generation and can start a worker after
+  cleanup, against a frozen cache.
+- Cleanup resets `loadStarted` **without awaiting in-flight transition tasks**. A stale transition
+  takes `current` and stops it before checking its generation, so after a rapid unload/reload it can
+  capture and stop the **newly initialised** worker.
+
+`ReloadMachineTranslator` never checks `IsCleaningUp`, and `MachineTranslatorLifecycle.Shutdown` is
+not a terminal state.
+
+Fix: reject reload/enqueue after lifecycle shutdown; unsubscribe or suppress configuration reloads
+**before** machine shutdown; await/settle current and queued transitions; and either create a fresh
+lifecycle object per successful load or provide a tested complete reset.
+
+## FIX-5 — `TODO` — MINOR but load-bearing: the new tests include a vacuous one, and miss the
+production paths
+
+- `MuvluvLLMMod.Tests/DebugTextLogPolicyTests.cs:81-100` configures 10,000 lines/sec for 5,000 inputs
+  then asserts the logged count is between 0 and 5,000 — **a condition that cannot fail** and so
+  cannot detect missing or racy throttling. It also asserts only retained entry *count*, never
+  retained key *size*.
+- `TmpTranslationProvenanceTests.cs:7-22` would catch a structure keyed only by translated value, but
+  it **does not invoke `Patch.cs`** — reverting or bypassing the production wiring leaves all tests
+  green. Its overwrite test uses a *different* replacement value, so it misses the same-instance/
+  same-value case that is FIX-1.
+- `Patch` restore behaviour and `Plugin` lifecycle sequencing remain untested (ITEM 11 step 5 was
+  never attempted); those omissions are what concealed FIX-1, FIX-3 and FIX-4.
+
+Fix: add concurrent unique inputs at a single timestamp and assert normal + summary lines cannot
+exceed available tokens; add bounded-key-size assertions; and add behavioural tests for the `Patch`
+restore decision (external-setter vs refresh origin) and for lifecycle rollback, ordering, and races.
+
+## Also outstanding
+
+`README.md` currently claims other-mod text is always left alone. That is **false at HEAD** while
+FIX-1 is open. Correct it as part of FIX-1, not before.
+
+---
+
 # Remaining unverifiable-without-the-game risks
 
-Carry these forward; do not attempt to fix them blind.
+Carry these forward; do not attempt to fix them blind. The round-2 review expanded this into an
+actionable hand-off — for each, what to look for and what indicates failure. Highest-value first:
+pooled-cell F2 behaviour (item 7) and glyph fallback (item 1).
 
 1. Whether the other plugin's global `TMP_Settings.fallbackFontAssets` renders all our generated
    Chinese (we deleted a 415-LOC font/style subsystem on the assumption it does).
