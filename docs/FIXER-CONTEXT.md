@@ -593,3 +593,19 @@ MSYS_NO_PATHCONV=1 docker run --rm \
 
 PASS — build succeeded, 0 warnings, 0 errors.
 ```
+
+## M-2 follow-up — DONE (commit `cbbe784`)
+
+Removed the `SkillDescriptionBuilder.GetDescription` Postfix and its Harmony verification target.
+Skill descriptions now remain untouched until their final `TMP_Text.set_text` assignment, where the
+existing render Prefix resolves and records provenance. This keeps F2 display-off restoration on the
+single object-bound, generation-validated render path; it does not infer ownership from translated
+strings or add a pre-render handoff. `SkillRenderFlowTests` exercises generated skill output through
+that final assignment and restores the source on the plugin refresh path when display is off.
+
+Docker validation used read-only source/game mounts and did not launch the game:
+
+```text
+PASS — `dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release`: 221 passed, 0 failed, 0 skipped.
+PASS — `dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game`: 0 warnings, 0 errors.
+```
