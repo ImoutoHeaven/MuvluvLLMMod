@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using Assets.Api.Client;
 using Assets.GameUi.Scenario;
-using Assets.GameUi.Utilities;
 using HarmonyLib;
 using TMPro;
 using UnityEngine;
@@ -96,22 +95,6 @@ public static class Patch
         }
 
         LogSeenText(original, containsKana, enqueueObservation);
-    }
-
-    [HarmonyPostfix]
-    [HarmonyPatch(
-        typeof(SkillDescriptionBuilder),
-        nameof(SkillDescriptionBuilder.GetDescription),
-        new[] { typeof(SkillMaster), typeof(int), typeof(bool) })]
-    public static void TranslateSkillDescription(ref string __result)
-    {
-        if (!IsRuntimeActive(tmpProvenance.LifecycleEpoch) || string.IsNullOrEmpty(__result))
-            return;
-
-        if (Config.Translation.Value)
-            __result = Translation.ResolveAny(__result);
-        else
-            Translation.ObserveForTranslation(__result, isPlayingScenario);
     }
 
     public static void RefreshAllTmpText()
@@ -226,12 +209,6 @@ public static class Patch
             (
                 Label: "Assets.GameUi.Scenario.ScenarioController.Leave",
                 Method: AccessTools.Method(typeof(ScenarioController), nameof(ScenarioController.Leave))),
-            (
-                Label: "Assets.GameUi.Utilities.SkillDescriptionBuilder.GetDescription",
-                Method: AccessTools.Method(
-                    typeof(SkillDescriptionBuilder),
-                    nameof(SkillDescriptionBuilder.GetDescription),
-                    new[] { typeof(SkillMaster), typeof(int), typeof(bool) }))
         };
         var missing = targets
             .Where(target => target.Method == null

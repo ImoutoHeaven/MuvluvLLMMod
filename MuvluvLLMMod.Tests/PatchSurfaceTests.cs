@@ -11,7 +11,8 @@ public sealed class PatchSurfaceTests
         var patch = ReadProductionSource("Patch.cs");
 
         Assert.Contains("typeof(TMP_Text), \"set_text\"", patch, StringComparison.Ordinal);
-        Assert.Contains("SkillDescriptionBuilder.GetDescription", patch, StringComparison.Ordinal);
+        Assert.DoesNotContain("SkillDescriptionBuilder", patch, StringComparison.Ordinal);
+        Assert.DoesNotContain("GetDescription", patch, StringComparison.Ordinal);
         Assert.Contains("FindObjectsByType<TMP_Text>", patch, StringComparison.Ordinal);
         Assert.Contains("HARD RULE", patch, StringComparison.Ordinal);
         Assert.Contains("DebugLogSeenText", patch, StringComparison.Ordinal);
