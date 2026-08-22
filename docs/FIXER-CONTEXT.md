@@ -647,6 +647,8 @@ PASS — `dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/g
 ## M-3 / M-4 / N-2 follow-up — DONE (commits `cc54749`, `b78ca4a`, `b459e9f`)
 
 This batch changes only the bounded-memory, terminal-persistence, and shutdown-timeout paths.
+The input-boundary follow-up is commit `bc7fa29`; the response-diagnostic follow-up is
+`63e5c48`.
 The earlier TMP ownership/epoch, generation/quarantine, F2 display-only, and required-patch
 verification behavior remains in place.
 
