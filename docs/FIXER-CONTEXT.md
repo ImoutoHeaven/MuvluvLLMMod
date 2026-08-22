@@ -1,0 +1,306 @@
+# Fixer context — standing brief
+
+Read this file first. Your dispatch message names which ITEMs to do. Do only those.
+
+## Process rules (non-negotiable)
+
+- **Commit after EACH item.** Never batch. Agents on this task have been terminated at
+  21–60 turns; only committed work survives. This is the single most important rule.
+- Work items in the order given.
+- Do not re-read files you don't need. Do not re-verify facts listed here. Budget is the
+  scarcest resource — spend it on edits, not on rediscovery.
+- Run the Docker build after each item; run the Docker tests after any item touching
+  testable code.
+- Do not re-review, re-litigate, or add scope.
+
+## Hard constraints
+
+1. `C:/Users/Eden/Muv-Luv/muv_luv_girlsgarden_cl` is the GAME INSTALL — **STRICTLY READ-ONLY**.
+   Never write there. Always mount `readonly`.
+2. `C:/Users/Eden/Muv-Luv/MuvluvMod` (third-party upstream) and
+   `C:/Users/Eden/Muv-Luv/MuvluvModMod` (donor repo) are **READ-ONLY REFERENCES**.
+3. All build/test via `docker run --rm`. Never run `dotnet` on the host. Never install on the host.
+4. Prefer FastCtx tools (`fastctx_run`, `fastctx_inspect_local_file`, `fastctx_grep`, `fastctx_replace`).
+
+## What this plugin is
+
+`MuvluvLLMMod` — a **completely standalone** BepInEx 6 IL2CPP plugin that machine-translates
+Japanese game text via an LLM. It patches **only** `TMP_Text.set_text` (render layer).
+
+A separate, unrelated third-party plugin (`anosu/MuvluvMod`) translates via curated data at the
+**data/parameter layer**. We are the fallback tier for whatever it did not cover.
+
+### The central invariant — never break this
+
+**ZERO coupling to the third-party plugin:** no `[BepInDependency]`, no reading its state, no
+compile/runtime reference, and the literal string `MuvluvMod` must not appear in compiled output.
+
+**Never patch these four third-party data-layer targets:**
+`ScenarioController.GenerateFrames`, `ScenarioHistoryCell.ApplyText`,
+`ScenarioChoiceElementComponent.Apply`, `MemoryDB.LoadMasterData`.
+
+The existing `ScenarioController.Refresh` / `Leave` prefixes are a **permitted, approved
+exception**, used only to track "is a scenario playing". The other plugin also patches these two,
+only to set its own flag — two independent prefixes on one method is harmless.
+
+### The correctness gate
+
+A string is queued for translation **iff it contains Japanese kana**. That single rule is the
+entire defence against re-translating text the other plugin already handled. It is already
+verified character-for-character correct. Pure-kanji strings are deliberately never translated —
+**do not add kanji detection**. We read no third-party data structure at all; that is what makes
+zero-coupling possible.
+
+### The display toggle
+
+`Config.Translation` (default `true`) is the **display** toggle, flipped by **F2**.
+Contract: **display only, never production.** The LLM must keep translating while display is off,
+so toggling back on is instant.
+
+## Established facts — trust these, do not re-derive
+
+- `BepInEx.Unity.IL2CPP.BasePlugin.Unload()` is `public virtual bool Unload() => false;`
+- Neither `IL2CPPChainloader` nor `BaseChainloader<T>` calls `Unload()` or hooks application quit.
+  **BepInEx never invokes `Unload()` on normal game exit.**
+- `AddComponent<T>()` delegates to `IL2CPPChainloader.AddUnityComponent<T>()`, attaching to a
+  BepInEx-owned manager GameObject. Setting our own `Instance = null` does **not** destroy it.
+- `TranslationCache.RunPersistenceLoopAsync` already persists periodically during play, so
+  exit-time loss is bounded to the last dirty window — real, but not a whole session.
+- 11 of the 13 copied core files are byte-identical to the donor repo. `TextTemplate.cs` and
+  `TranslationResolver.cs` carry approved deltas. **Do not modify donor-copied files** unless an
+  item explicitly grants an exception.
+- Interop namespaces are **unprefixed**: `TMPro`, `UnityEngine`, `Assets.*`. Target install is
+  BepInEx `6.0.0-be.785`, .NET 6.0.7, Unity 6000.0.59f2.
+
+## REJECTED finding — do not implement
+
+A review claimed `TMP_Text.set_text` should be a **Postfix** instead of `[HarmonyPrefix]`.
+**REJECTED — the original spec was wrong, the code is right.**
+`TranslateTmpSetter(TMP_Text __instance, ref string value)` is inherently a Prefix signature and is
+the correct way to intercept a property setter; a Postfix would have to read `__instance.text` and
+re-assign, causing recursion. **KEEP THE PREFIX.** (The separate re-entrancy defect in ITEM 4 is
+still real and must be fixed.)
+
+## Docker commands (verified working — `MSYS_NO_PATHCONV=1` is mandatory)
+
+```bash
+# build
+MSYS_NO_PATHCONV=1 docker run --rm \
+  --mount type=bind,src=/c/Users/Eden/Muv-Luv/MuvluvLLMMod,dst=/src \
+  --mount type=bind,src=/c/Users/Eden/Muv-Luv/muv_luv_girlsgarden_cl,dst=/game,readonly \
+  -w /src mcr.microsoft.com/dotnet/sdk:8.0 \
+  bash -c 'export DOTNET_CLI_TELEMETRY_OPTOUT=1; dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game'
+
+# test
+MSYS_NO_PATHCONV=1 docker run --rm \
+  --mount type=bind,src=/c/Users/Eden/Muv-Luv/MuvluvLLMMod,dst=/src \
+  -w /src mcr.microsoft.com/dotnet/sdk:8.0 \
+  bash -c 'export DOTNET_CLI_TELEMETRY_OPTOUT=1; dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release'
+```
+
+Baseline: build 0 warnings / 0 errors; tests **117 passed / 0 failed**.
+
+---
+
+# Worklist
+
+Status legend: `DONE` / `WIP` / `TODO`
+
+## ITEM 1 — `DONE` (commit `130c71a`) — BLOCKER: F2 restore provenance
+
+Was: `TryGetSourceForTranslatedValue` keyed on the translated string alone, so F2-off could
+replace another plugin's curated Chinese with our unrelated Japanese source (short strings like
+确定/取消 collide readily). Fixed with per-TMP-instance provenance.
+
+## ITEM 2 — `WIP` — BLOCKER: debug logging unbounded, unthrottled, default ON
+
+`Patch.cs` ~18-20 / ~116-135, `Config.cs` ~89-93. `debugSeenText` was a process-lifetime
+`HashSet<string>` of every distinct observed string, never capped. Dedupe is not rate limiting:
+one scan of hundreds of unseen strings emits hundreds of synchronous main-thread log calls.
+
+**A previous agent already created `MuvluvLLMMod/DebugTextLogPolicy.cs` and
+`MuvluvLLMMod/EnqueueObservation.cs` and edited `Config.cs`, then was terminated. That work is
+uncommitted and NOT yet wired into `Patch.cs`. Inspect it, finish it, wire it up, commit.**
+
+Required:
+- `DebugLogSeenText` default **`false`** (it is a diagnostic; shipping an unbounded default-on
+  diagnostic is unacceptable).
+- Fixed-capacity, thread-safe deduper (LRU/ring, hard cap ~2048).
+- Token-bucket rate limiter (~≤10 lines/sec) with periodic "N lines suppressed" summary.
+- Truncate logged text to ~80 chars.
+- Fix the misleading `enqueued` field: while the LLM is disabled, work IS added to durable cache
+  pending state but `MachineLifecycle.EnqueueNormal` returns false, so the log printed
+  `enqueued=false`. Distinguish "durably pending" from "accepted by a live worker".
+
+## ITEM 3 — `TODO` — BLOCKER: make shutdown a real, idempotent lifecycle
+
+`Plugin.cs` ~78 / ~83-115, `Hotkey.cs` ~9-31. Three defects:
+(a) `Instance = null` leaves the injected `Hotkey` alive on BepInEx's manager object, so it keeps
+calling `Patch.RefreshAllTmpText()` every 0.5s after cleanup/unpatch;
+(b) `return base.Unload()` returns **false** after destructive cleanup;
+(c) nothing runs freeze/cancel/flush on normal game exit.
+
+Required:
+- ONE idempotent cleanup routine guarded by `Interlocked` (runs at most once).
+- Called from `Unload()` **and** an application-quit path — `UnityEngine.Application.quitting`,
+  an `OnApplicationQuit` on the injected component, or `AppDomain.CurrentDomain.ProcessExit`.
+  Pick what actually works under IL2CPP; state which and why.
+- Disable **and** `UnityEngine.Object.Destroy` the injected component; null-guard its `Update` so
+  any survivor is inert.
+- Preserve ordering: `Cache.FreezeMutations()` → `MachineLifecycle.Shutdown()` → cancel
+  persistence CTS → `Cache.Flush()` → `UnpatchSelf()`.
+- `Unload()` must `return true` on successful cleanup.
+- Guard against duplicate components if `Load()` runs twice (two `Hotkey`s would double-toggle F2
+  and double-scan).
+
+## ITEM 4 — `TODO` — MAJOR: `RefreshAllTmpText` double-processes every changed object
+
+`Patch.cs` ~90-115. It calls `TranslateTmpSetter(text, ref value)` as a plain method; that method
+sets and then **clears** `translatingTmp` in its own `finally`; the following `text.text = value`
+therefore re-enters the Harmony prefix. Double work per changed object, and possible
+double-observe/enqueue.
+
+Fix: extract the shared resolution logic into a private method that does **not** touch the guard;
+have both the Harmony prefix and the scan call it, with the scan holding `translatingTmp` across
+its own assignment. Never invoke a Harmony patch method directly as a normal call.
+
+## ITEM 5 — `TODO` — MAJOR: F2 must not restart the translator
+
+`Hotkey.cs` ~16-22, `Config.cs` ~95 / ~107-116, `Plugin.cs` ~118-128. Flipping
+`Config.Translation` raises `SettingChanged`, whose handler unconditionally reloads the machine
+translator, cancelling in-flight HTTP. Violates the display-only contract. Same needless reload
+fires for `RefreshPeriodSeconds` and `DebugLogSeenText`.
+
+Fix: reload **only** for machine-affecting entries — `LLM.Enable`, `Endpoint`, `Model`, `ApiKey`,
+`TimeoutSeconds`, `RetryCount`, `RequestsPerSecond`, `MaxInFlight`, `TranslatePeriodSeconds`.
+
+**Connected defect (must fix together):** the LLM's effective enabled state was
+`Config.Translation.Value && Config.LlmEnable.Value`. Since production must continue while display
+is off, that coupling is itself wrong — **decouple it so enablement depends on `LlmEnable` only.**
+Without this, F2-off silently halts production and ITEM 5 is only cosmetically fixed. Check
+nothing else depended on the old coupling.
+
+## ITEM 6 — `TODO` — MAJOR: blocked templates survive reload
+
+`Plugin.cs` ~23-27 / ~160-168, `TranslationRetryPolicy.cs` ~54-70 / ~82-99. A single
+`static readonly TranslationRetryPolicy` is shared across all reloads; after 3 failed cycles a
+template is blocked for the process lifetime. Correcting a wrong endpoint/model/API key reloads the
+worker but reuses the blocked state, so those strings stay untranslated until the game restarts.
+
+Fix: on a **material LLM configuration change**, atomically reset or replace the retry policy
+alongside the worker. Do **not** reset it for F2/debug/refresh changes. Add a unit test.
+
+## ITEM 7 — `TODO` — MAJOR: bound the cache's runtime indexes
+
+`TranslationCache.cs` ~17-25 / ~282-307 / ~324-337. `generated` is bounded by normalized templates,
+but `raw`, `sourceByTranslatedValue`, and `knownTranslatedValues` retain every exact runtime
+source/translation pair. A kana-bearing countdown or changing status string adds permanent entries
+every refresh tick, forever, across a multi-hour session.
+
+Fix: impose explicit retention limits — LRU-bound the runtime reverse indexes; normalize/sample `raw`.
+
+> **Explicit exception granted:** `TranslationCache.cs` is a byte-for-byte donor copy. The
+> byte-copy rule is waived **for this item only**. Keep the diff minimal and surgical; do not
+> reformat or restructure. Note the exception in the commit message.
+
+## ITEM 8 — `TODO` — MAJOR: terminal flush can silently lose data
+
+`Plugin.cs` ~90-106, `TranslationCache.cs` ~251-275 / ~403-427. After the persistence CTS is
+cancelled, shutdown calls `Flush()` once. On a failed atomic write `Flush()` only re-signals
+`dirtySignal` — whose sole consumer is already cancelled — and returns no success indicator.
+Cleanup then reports success with dirty state stranded in memory.
+
+Fix: terminal flush must report success/failure, retry synchronously a bounded number of times
+after mutations are frozen, and log clearly if data is unrecoverable. Add a test injecting one
+failed final write followed by a success.
+
+## ITEM 9 — `TODO` — MAJOR: `Load()` has no rollback
+
+`Plugin.cs` ~52-80. Persistence and machine workers start *before* Harmony patching and component
+injection. If `Patch.Initialize` or `AddComponent` throws, BepInEx drops the plugin without calling
+our cleanup, leaving workers and partial patches live.
+
+Fix: make initialization transactional — prefer starting workers only *after* patching/component
+setup succeeds; wrap staged init in `try/catch`, invoke ITEM 3's idempotent cleanup on failure,
+then rethrow.
+
+## ITEM 10 — `TODO` — MINOR: pin the kana boundaries in tests
+
+`MuvluvLLMMod.Tests/TextTemplateTests.cs` ~156-173. Implementation is correct but tests omit most
+endpoints/neighbours. Add a numeric-codepoint `[Theory]` asserting BOTH inclusive endpoints AND
+both immediately-excluded neighbours for every range:
+
+| range | included endpoints | excluded neighbours |
+|---|---|---|
+| hiragana | U+3041, U+3096 | U+3040, U+3097 |
+| hiragana iteration | U+309D, U+309F | U+309C, U+30A0 |
+| katakana | U+30A1, U+30FA | U+30A0, U+30FB |
+| katakana iteration | U+30FD, U+30FF | U+30FC, U+3100 |
+| half-width katakana | U+FF66, U+FF9D | U+FF65, U+FF9E |
+
+Plus all four combining marks U+3099–U+309C must be excluded. This predicate is the single gate of
+the whole system; an off-by-one silently breaks everything.
+
+## ITEM 11 — `TODO` — MINOR: make the new integration testable, and test it
+
+`MuvluvLLMMod.Tests.csproj` compiles only the loader-agnostic core, so `Plugin`/`Config`/`Patch`/
+`Translation`/`Hotkey` are untested and `PatchSurfaceTests` only does shallow source-substring
+checks. Extract the loader-independent policies from items 1, 2, 5, 6, 8 (provenance/restore
+decision, log retention+throttle, config-change routing, retry reset, terminal-flush retry) into
+pure classes, link them into the test project, and unit-test them. Highest-value cases:
+
+- two simulated TMP instances holding the same Chinese value → only the one we actually translated
+  may be restored
+- F2-off leaves unresolved text untouched, production continues, no worker reload occurs
+- deduper/throttle respect fixed memory and rate ceilings under many unique concurrent strings
+- material config change resets blocked templates; F2/debug/refresh changes do not
+- terminal flush recovers from one transient write failure
+
+## ITEM 12 — `TODO` — MINOR: verify all four patch targets
+
+`Patch.cs` ~138-155. `VerifyPatches` checks only the TMP and skill-description targets while four
+are applied, so a missing `Refresh`/`Leave` hook would silently break priority routing yet still
+log success. Include all four and report exact targets.
+
+## ITEM 13 — `TODO` — MINOR: pin dependency versions
+
+`MuvluvLLMMod.csproj` ~30-31 uses floating `6.0.0-be.*` and `2.*`. Target install is BepInEx
+`6.0.0-be.785`. Pin `BepInEx.Unity.IL2CPP` to `6.0.0-be.785`, pin the props package. Confirm the
+Docker build still passes.
+
+## ITEM 14 — `TODO` — docs + licence
+
+Fix `README.md`:
+- It claims the two plugins share no Harmony target — **false**, both patch
+  `ScenarioController.Refresh` and `Leave`. Describe this as a deliberate, harmless exception (two
+  independent prefixes, each setting only its own state flag) rather than claiming zero overlap.
+- `DebugLogSeenText` is documented under `[Translation]` but bound under `[Translation.Debug]` —
+  correct it, and update its default to `false` with a note that it is a diagnostic.
+- Document the exposed `CacheDirectory` option (and whether changing it needs a restart).
+- Update anything items 1–13 changed (F2 semantics; LLM enablement no longer gated on the display
+  toggle).
+
+Add a `LICENSE`. Provenance findings: neither the third-party upstream nor the donor repo ships a
+licence file; however the 13 copied files are the LLM subsystem, which **never existed in upstream
+in any commit of its entire history** — they are our own original work. Replace the blunt
+"not derived from" wording with a precise statement: this project is independent, interoperates with
+but does not depend on the other plugin, and its translation core was authored by us. Choose MIT
+unless there is a reason not to; state what you chose.
+
+---
+
+# Remaining unverifiable-without-the-game risks
+
+Carry these forward; do not attempt to fix them blind.
+
+1. Whether the other plugin's global `TMP_Settings.fallbackFontAssets` renders all our generated
+   Chinese (we deleted a 415-LOC font/style subsystem on the assumption it does).
+2. Whether the `TMP_Text.set_text` hook observes every untranslated Japanese string.
+3. Real cost of the inactive-inclusive full TMP scan every 0.5s.
+4. Whether the IL2CPP-injected component reliably receives `Update` and Input System F2 events.
+5. Actual Harmony/native setter behaviour and ordering, incl. skill-description and scenario hooks.
+6. Whether `Refresh`/`Leave` accurately bracket every scenario lifecycle.
+7. Live F2 visual behaviour and real-world frequency of reverse-map collisions with curated Chinese.
+8. Cache-directory permissions and graceful application-quit behaviour in this install.
+9. Real endpoint cancellation, model format compliance, latency, and translation quality.
+10. Chinese layout, clipping, wrapping, and style suitability after the font/style removal.
