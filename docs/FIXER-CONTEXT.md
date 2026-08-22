@@ -1067,3 +1067,88 @@ scenario, and native-event implementations are deterministic net8 stubs. They pr
 policy, ownership, lifecycle, cache, HTTP, and patch-wiring behavior at that boundary, not real
 IL2CPP detours, native delegate conversion, Unity pooling/input, fonts/layout, or complete in-game
 UI coverage. Those remain game-only handoff checks, not unresolved PF-6/PF-7 source defects.
+
+## FR2-1 follow-up — DONE (commits `3a91e50`, `c112cad`, and this context update)
+
+This batch fixes only FR2-1: a state accepted by the cache must be representable by the
+authoritative indented JSON journal. FR2-2 stage lifecycle behavior is unchanged and remains the
+next batch. `docs/FINAL-REVIEW-2.md` and all other historical review documents were not edited.
+
+### One durable snapshot invariant
+
+The existing per-collection payload limits remain in force: generated source-plus-translation
+UTF-8 bytes are capped at 4 MiB, pending and raw are each capped at 512 KiB, and the authoritative
+`cache.state.v1.json` UTF-8 representation is capped at 8 MiB (`8,388,608` bytes). The new limit is
+an additional aggregate admission policy; no snapshot cap was raised.
+
+Admission uses the exact production `JsonSerializerOptions` (`WriteIndented = true` and the default
+`System.Text.Json` encoder), rather than treating raw UTF-8 as JSON cost. For a retained JSON
+string `s`, `J(s)` is the UTF-8 byte count of `JsonSerializer.Serialize(s, JsonOptions)`. This
+therefore includes quotes and the actual escaping of CJK, quotes, backslashes, control characters,
+braces, markup, and all multibyte text. Generated entries add `J(key) + J(value)`; pending and raw
+entries add `J(value)`.
+
+At type initialization, `TranslationCache` measures the fixed serializer layout from the same
+serializer by serializing empty, one-item, and two-item authoritative snapshots. Let `E` be the
+empty envelope size and `G1/Gc`, `P1/Pc`, and `R1/Rc` be the measured first-item and subsequent-item
+structural costs for generated, pending, and raw collections. The admitted upper bound is:
+
+```text
+E
++ (Gcount == 0 ? 0 : GjsonBytes + G1 + (Gcount - 1) * Gc)
++ (Pcount == 0 ? 0 : PjsonBytes + P1 + (Pcount - 1) * Pc)
++ (Rcount == 0 ? 0 : RjsonBytes + R1 + (Rcount - 1) * Rc)
+<= TranslationBudget.MaxCacheSnapshotBytes
+```
+
+The measured envelope uses `Epoch = long.MaxValue` (the maximum 19-digit nonnegative epoch), a
+32-character transaction ID, and a 64-character SHA-256 checksum. Real flushes use a no-dash
+32-character GUID and a nonnegative epoch no larger than that reserve; the checksum output is
+always 64 hexadecimal characters. Thus the reserve covers envelope fields, transaction metadata,
+checksum, indentation, commas, braces, and separators, while the per-entry terms use the exact
+encoder behavior. The final `SerializeBounded` check remains a defensive exact serialization check.
+
+`StoreGenerated` now plans replacement and any normal generated LRU evictions, accounts for pending
+removal, and checks the final aggregate before changing a dictionary, evicting an entry, clearing a
+pending item, or marking dirty. A failed durable admission leaves the prior in-memory state and
+`dirty` bit unchanged. Observation stages a possible raw sample and pending entry together against
+the same aggregate; if that combined mutation cannot fit, neither durable collection changes.
+Runtime count/byte-full raw retention may still omit only the raw sample while allowing an otherwise
+admissible pending item, as before. Removal/cancellation only shrink the aggregate. Legacy mirror
+writes are not the authoritative commit decision.
+
+`Load`/legacy migration resets and repopulates all three durable collections through the same
+admission helpers. An over-aggregate or otherwise invalid legacy/state entry is dropped, the load
+is marked cleaned, and the next migration write is a coherent serializable state. Epoch-zero
+legacy state, newest-valid-epoch selection, checksum validation, temp/backup promotion, and the
+PF-2 journal rules are otherwise unchanged. Since rejected durable mutations never mark dirty,
+the persistence loop has no structurally unrepresentable state to retry; ordinary injected writer
+failures remain the existing bounded retry path. Admission diagnostics use the existing bounded
+per-code reporter under `cache-snapshot-admission`.
+
+### Regression coverage and mutation result
+
+The exact-source integration suite now has **27 passed** tests. Its real linked `TranslationCache`
+coverage includes:
+
+- all **4,096** distinct CJK pairs from the review construction (341 CJK code units / 1,023 raw
+  UTF-8 bytes per pair): current default-encoder behavior admitted **4,075** and rejected **21**
+  before aggregate overflow; normal `Flush()` and `FlushTerminal()` both returned true, the
+  authoritative file was **8,386,570** bytes, and restart recovered all 4,075 accepted entries;
+- hostile quote/control/newline/placeholder/markup strings plus 300 pending and raw observations,
+  with flush, terminal flush, and restart counts preserved; and
+- a legacy migration containing 3,800 generated plus 300 pending/raw candidates, proving that load
+  drops entries through the same aggregate policy before writing a coherent state.
+
+The legacy unit suite now has **251 passed** tests. `scripts/mutation-gate.sh` runs from a read-only
+source mount, copies each mutant into its own Docker throwaway directory, and requires the exact
+linked integration DLL. Its new compile-valid `FR2-1-disable-durable-admission` mutant replaces the
+aggregate predicate with unconditional acceptance; the full-cap CJK test then fails at the normal
+flush assertion. Final gate results for this batch were **27/27 baseline** and **18/18 configured
+mutants killed**.
+
+Docker validation for the implementation commits used `mcr.microsoft.com/dotnet/sdk:8.0`,
+`docker run --rm` only, and a strict read-only game mount. The full solution result was **278 passed,
+0 failed, 0 skipped**; the production build against `-p:GameDir=/game` was **0 warnings, 0 errors**;
+and the mutation gate was **27 passed with 18/18 compile-valid mutants killed**. The game was never
+launched or written. FR2-2 remains open for the next batch.
