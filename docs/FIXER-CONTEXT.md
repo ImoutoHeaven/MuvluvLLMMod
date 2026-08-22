@@ -523,3 +523,73 @@ MSYS_NO_PATHCONV=1 docker run --rm \
 
 PASS — build succeeded, 0 warnings, 0 errors.
 ```
+
+## B-2 / M-1 follow-up — DONE (commit `4474896`)
+
+This batch closes only the outer generation/lifecycle and IL2CPP quit-delegate findings from the
+final review. `FINAL-REVIEW.md` is unchanged.
+
+### B-2 design and production wiring
+
+`PluginLifecycleGate` is now a loader-free, generation-bearing state machine with explicit
+`NotLoaded`, `Loading`, `Running`, `Stopping`, `Stopped`, and terminal `Failed` states. Every
+load gets a `PluginGeneration` cancellation token, owner, stage count, shared cleanup completion,
+and generation leases. `Plugin.Load` stages all cache/resolver, Harmony, Hotkey, quit callback,
+persistence, and machine resources through that generation, publishes the owner only at
+`Running`, then activates the TMP hook and config lease. A cleanup moves the generation to
+`Stopping` first, cancels it, waits for load/activation stages and in-flight lease callbacks,
+then runs the owned teardown. Later stages cannot enter or publish after that boundary.
+Concurrent cleanup callers wait for the same completion/result; any failed teardown leaves the
+generation `Failed` and blocks a replacement load.
+
+Configuration is bound before startup but subscribed only after `Running`. Its event callback
+captures and enters the owning generation lease, so unsubscribe revokes stale callbacks instead
+of merely removing the event delegate. Reload resolves the lifecycle and cache from that lease's
+owner rather than a replaceable static side channel. `ConfigChangePolicy` formats ApiKey events
+from their definition and never includes `BoxedValue`, including for stale entries. Machine
+translator lifecycle initialization is explicitly single-owner and rejects duplicate initialize;
+progress is exposed from the active lifecycle and is zero after terminal shutdown.
+
+Teardown preserves the required order: configuration stop, quit callback/component/TMP
+retirement, cache freeze, machine shutdown, persistence cancellation/await, terminal flush, and
+Harmony unpatch. Persistence is awaited before terminal flush. `Patch` remains a Prefix and is
+runtime-inert until the generation is Running and also rejects calls as soon as cleanup enters
+`Stopping`.
+
+### M-1 design and tests
+
+`NativeDelegateCoordinator<T>` serializes conversion, native add/remove, retention, generation
+ownership, and state publication under one lock. It exposes `Unregistered`, `Registering`,
+`Registered`, `Removing`, and `Failed`; registration is published only after native add succeeds,
+and failed removal retains the exact delegate and prevents a new generation from registering.
+Production `Plugin` uses this coordinator for the retained `Il2CppSystem.Action` and passes the
+same object to native add and remove.
+
+Behavioral tests now cover cleanup during Loading, cancellation/rejection of later stages, stale
+leases, same-result concurrent cleanup, failed-cleanup quarantine, duplicate machine initialize
+without an orphan worker, terminal machine snapshots, ApiKey redaction, and forced native
+remove/register interleaving with exact delegate identity. Production surface tests require the
+actual Plugin coordinator/lease wiring; they are supplemental to the loader-free behavior tests,
+not a replacement for them.
+
+### Docker validation for `4474896`
+
+Both commands copied a read-only repository mount into a throwaway container. The game directory
+was mounted read-only for the build, and no game process was launched.
+
+```text
+MSYS_NO_PATHCONV=1 docker run --rm \
+  --mount type=bind,src=C:/Users/Eden/Muv-Luv/MuvluvLLMMod,dst=/src,readonly \
+  -w / mcr.microsoft.com/dotnet/sdk:8.0 \
+  bash -lc 'cp -a /src /work && cd /work && dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release'
+
+PASS — 219 passed, 0 failed, 0 skipped.
+
+MSYS_NO_PATHCONV=1 docker run --rm \
+  --mount type=bind,src=C:/Users/Eden/Muv-Luv/MuvluvLLMMod,dst=/src,readonly \
+  --mount type=bind,src=C:/Users/Eden/Muv-Luv/muv_luv_girlsgarden_cl,dst=/game,readonly \
+  -w / mcr.microsoft.com/dotnet/sdk:8.0 \
+  bash -lc 'cp -a /src /work && cd /work && dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game'
+
+PASS — build succeeded, 0 warnings, 0 errors.
+```
