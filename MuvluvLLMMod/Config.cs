@@ -112,7 +112,16 @@ public static class Config
         else
             Logger.Info($"[{setting.Definition.Section}] {setting.Definition.Key} => {setting.BoxedValue}");
 
-        // Display changes reload the worker configuration too, but never disable production.
-        Core.ReloadMachineTranslator();
+        var machineAffecting = ReferenceEquals(setting, LlmEnable)
+            || ReferenceEquals(setting, LlmEndpoint)
+            || ReferenceEquals(setting, LlmModel)
+            || ReferenceEquals(setting, LlmApiKey)
+            || ReferenceEquals(setting, LlmTimeoutSeconds)
+            || ReferenceEquals(setting, LlmRetryCount)
+            || ReferenceEquals(setting, LlmRequestsPerSecond)
+            || ReferenceEquals(setting, LlmMaxInFlight)
+            || ReferenceEquals(setting, LlmTranslatePeriodSeconds);
+        if (machineAffecting)
+            Core.ReloadMachineTranslator();
     }
 }
