@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="xunit" Version="2.6.6" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.6" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Every production .cs file except the net6 compatibility attributes is compiled here.
+         Runtime boundaries are replaced only by Stubs/; the implementation under test is not copied. -->
+    <Compile Include="..\MuvluvLLMMod\*.cs" Link="Production\%(Filename)%(Extension)" />
+    <Compile Remove="..\MuvluvLLMMod\CompilerServices.cs" />
+    <Compile Include="Stubs\*.cs" />
+    <Compile Include="*.cs" />
+  </ItemGroup>
+</Project>

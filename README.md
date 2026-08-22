@@ -122,12 +122,37 @@ docker run --rm \
   -w /src mcr.microsoft.com/dotnet/sdk:8.0 \
   dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game
 
-# tests (net8.0; sources are loader-agnostic, no game mount needed)
+# legacy tests (net8.0; no game mount needed)
 docker run --rm \
-  --mount type=bind,src=/path/to/MuvluvLLMMod,dst=/src \
+  --mount type=bind,src=/path/to/MuvluvLLMMod,dst=/src,readonly \
+  -w / mcr.microsoft.com/dotnet/sdk:8.0 \
+  bash -lc 'cp -a /src /work && cd /work && dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release'
+
+# exact-source production integration tests (13 deterministic tests; no game mount needed)
+docker run --rm \
+  --mount type=bind,src=/path/to/MuvluvLLMMod,dst=/src,readonly \
+  -w / mcr.microsoft.com/dotnet/sdk:8.0 \
+  bash -lc 'cp -a /src /work && cd /work && dotnet test MuvluvLLMMod.IntegrationTests/MuvluvLLMMod.IntegrationTests.csproj -c Release'
+
+# optional mutation gate; the script copies every mutant to a throwaway container path
+# and deliberately expects each focused integration test to fail.
+docker run --rm \
+  --mount type=bind,src=/path/to/MuvluvLLMMod,dst=/src,readonly \
   -w /src mcr.microsoft.com/dotnet/sdk:8.0 \
-  dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release
+  bash scripts/mutation-gate.sh
 ```
+
+`MuvluvLLMMod.IntegrationTests` links the checked-in production `.cs` files directly (including
+`Patch.cs`, `Plugin.cs`, `Config.cs`, `Hotkey.cs`, `Logger.cs`, `RetainedDelegate.cs`,
+`NativeDelegateCoordinator`, and all of their real translation/lifecycle dependencies). It does
+not copy a parallel implementation. `Stubs/RuntimeStubs.cs` replaces only external boundaries:
+BepInEx configuration/logging/BasePlugin, Harmony discovery/ownership, Unity object/component
+lifetime and time/input, the TMP type, the application-quitting add/remove calls, and the two
+scenario target types. The fake `TMP_Text.text` setter calls the real `Patch.TranslateTmpSetter`
+Prefix; fake application and config events call the real `Plugin` registration/removal and
+`Config` generation-lease handler. The native delegate interleaving uses the real coordinator
+with identity-preserving fake native storage. No game process or actual IL2CPP runtime is claimed
+by this net8.0 harness; the production DLL build above remains the artifact/runtime check.
 
 Build output goes to `artifacts/`. Game DLL references resolve from `$(GameDir)/BepInEx/interop/`.
 

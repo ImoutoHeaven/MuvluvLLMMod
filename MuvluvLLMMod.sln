@@ -6,6 +6,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MuvluvLLMMod", "MuvluvLLMMo
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MuvluvLLMMod.Tests", "MuvluvLLMMod.Tests\MuvluvLLMMod.Tests.csproj", "{A4BC16B4-C1AF-4FA8-8C8D-49F9B278AC6A}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MuvluvLLMMod.IntegrationTests", "MuvluvLLMMod.IntegrationTests\MuvluvLLMMod.IntegrationTests.csproj", "{C1E9F0A4-6C6E-4A3B-9A53-9B9F0F7D9E45}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -20,6 +22,10 @@ Global
 		{A4BC16B4-C1AF-4FA8-8C8D-49F9B278AC6A}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A4BC16B4-C1AF-4FA8-8C8D-49F9B278AC6A}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{A4BC16B4-C1AF-4FA8-8C8D-49F9B278AC6A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C1E9F0A4-6C6E-4A3B-9A53-9B9F0F7D9E45}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C1E9F0A4-6C6E-4A3B-9A53-9B9F0F7D9E45}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C1E9F0A4-6C6E-4A3B-9A53-9B9F0F7D9E45}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C1E9F0A4-6C6E-4A3B-9A53-9B9F0F7D9E45}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
