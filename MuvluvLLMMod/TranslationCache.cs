@@ -68,7 +68,10 @@ public sealed class TranslationCache
     private bool snapshotEpochExhausted;
     private long mutationVersion;
     private long nextPendingGeneration;
-    private long nextSnapshotEpoch;
+    // snapshotEpoch is the last authoritative epoch. A successor is reserved while its
+    // snapshot is being written, but it is not committed until the authoritative write succeeds.
+    private long snapshotEpoch;
+    private long? reservedSnapshotEpoch;
 
     public sealed class DurableSnapshot
     {
@@ -396,7 +399,7 @@ public sealed class TranslationCache
         {
             if (state != null)
             {
-                nextSnapshotEpoch = Math.Max(nextSnapshotEpoch, state.Epoch);
+                snapshotEpoch = Math.Max(snapshotEpoch, state.Epoch);
                 snapshotEpochExhausted |= state.Epoch == long.MaxValue;
             }
 
@@ -528,7 +531,7 @@ public sealed class TranslationCache
             lock (gate)
             {
                 if (!dirty) return true;
-                if (!TryAdvanceSnapshotEpochUnsafe(out snapshotEpoch))
+                if (!TryReserveSnapshotEpochUnsafe(out snapshotEpoch))
                 {
                     ReportPersistenceFailure(
                         StatePath,
@@ -579,6 +582,9 @@ public sealed class TranslationCache
 
             lock (gate)
             {
+                if (authoritativeSucceeded)
+                    CommitSnapshotEpochUnsafe(snapshotEpoch);
+
                 if (authoritativeSucceeded && mutationVersion == snapshotVersion)
                 {
                     dirty = false;
@@ -701,21 +707,41 @@ public sealed class TranslationCache
     private bool CanAcceptDurableMutationUnsafe() =>
         acceptingMutations
         && !snapshotEpochExhausted
-        && nextSnapshotEpoch < long.MaxValue;
+        && snapshotEpoch < long.MaxValue
+        // A terminal successor cannot safely coexist with another accepted mutation: once it
+        // commits, long.MaxValue is deliberately read-only forever.
+        && (!reservedSnapshotEpoch.HasValue || reservedSnapshotEpoch.Value != long.MaxValue);
 
-    private bool TryAdvanceSnapshotEpochUnsafe(out long epoch)
+    private bool TryReserveSnapshotEpochUnsafe(out long epoch)
     {
-        if (nextSnapshotEpoch == long.MaxValue)
+        if (reservedSnapshotEpoch is { } reserved)
+        {
+            // An authoritative failure leaves this exact valid successor available to the next
+            // normal or terminal retry. It is not a new epoch and must not be skipped.
+            epoch = reserved;
+            return true;
+        }
+
+        if (snapshotEpochExhausted || snapshotEpoch == long.MaxValue)
         {
             epoch = 0;
             snapshotEpochExhausted = true;
             return false;
         }
 
-        epoch = checked(nextSnapshotEpoch + 1);
-        nextSnapshotEpoch = epoch;
-        snapshotEpochExhausted = epoch == long.MaxValue;
+        epoch = checked(snapshotEpoch + 1);
+        reservedSnapshotEpoch = epoch;
         return true;
+    }
+
+    private void CommitSnapshotEpochUnsafe(long epoch)
+    {
+        if (reservedSnapshotEpoch is not { } reserved || reserved != epoch)
+            throw new InvalidOperationException("cache snapshot epoch reservation was lost");
+
+        snapshotEpoch = epoch;
+        reservedSnapshotEpoch = null;
+        snapshotEpochExhausted = epoch == long.MaxValue;
     }
 
     private void MarkDirtyUnsafe()

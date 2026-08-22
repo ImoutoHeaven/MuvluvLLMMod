@@ -267,6 +267,84 @@ public sealed class ProductionCoordinationIntegrationTests
     }
 
     [Fact]
+    public async Task Timed_out_machine_resource_settles_after_eventual_worker_stop_without_reopening_generation()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "MuvluvLLMMod.machine-settlement." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        MachineTranslator? worker = null;
+        try
+        {
+            var cache = new TranslationCache(root);
+            const string template = "最终停止する";
+            Assert.True(cache.ObservePriority(template, template));
+            var lifecycle = new MachineTranslatorLifecycle(
+                shutdownTimeout: TimeSpan.FromMilliseconds(40));
+            var gate = new PluginLifecycleGate(TimeSpan.FromMilliseconds(100));
+            Assert.True(gate.TryBeginLoad(out var generation));
+            Assert.True(generation.AttachOwner(new object()));
+
+            PluginLifecycleGate.PluginGenerationResource resource;
+            using (var stage = generation.TryEnterStage())
+            {
+                Assert.NotNull(stage);
+                resource = stage!.RegisterResource(
+                    "machine worker startup",
+                    lifecycle.ShutdownForResourceRollback);
+                Assert.True(lifecycle.Initialize(
+                    true,
+                    1,
+                    (limiter, backlog) => worker = new MachineTranslator(
+                        cache,
+                        async (_, _) =>
+                        {
+                            entered.TrySetResult();
+                            return await release.Task.ConfigureAwait(false);
+                        },
+                        1,
+                        TimeSpan.FromMilliseconds(10),
+                        backlog),
+                    new TranslationRetryPolicy()));
+                Assert.True(resource.Commit());
+            }
+
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.False(gate.Cleanup(_ => true));
+            Assert.Null(generation.GetOwner<object>());
+            Assert.Equal(PluginLifecycleState.Failed, gate.State);
+            Assert.Equal(1, lifecycle.TrackedStoppingWorkerCount);
+            Assert.Equal(1, generation.OutstandingResourceCount);
+            var originalFailure = gate.Failure;
+            Assert.NotNull(originalFailure);
+
+            release.TrySetResult("晚到翻译");
+            await worker!.StopCompletion.WaitAsync(TimeSpan.FromSeconds(2));
+            await WaitUntilAsync(() => lifecycle.TrackedStoppingWorkerCount == 0);
+            Assert.Equal(0, lifecycle.TrackedStoppingWorkerCount);
+
+            // Only the retained machine reservation is retried. The original failed generation
+            // remains quarantined even though the machine callback can now settle.
+            Assert.False(gate.Cleanup(_ => true));
+            Assert.Equal(0, generation.OutstandingResourceCount);
+            Assert.Equal(PluginLifecycleState.Failed, gate.State);
+            Assert.Same(originalFailure, gate.Failure);
+            Assert.False(gate.TryBeginLoad(out _));
+        }
+        finally
+        {
+            release.TrySetResult(null);
+            if (worker != null)
+            {
+                try { await worker.StopCompletion.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
+            }
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Late_resource_rollback_failure_is_quarantined_and_retryable()
     {
         var gate = new PluginLifecycleGate(TimeSpan.FromMilliseconds(40));

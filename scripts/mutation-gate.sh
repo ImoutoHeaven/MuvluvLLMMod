@@ -5,8 +5,8 @@ set -euo pipefail
 # every mutant is made in a separate throwaway copy under /tmp and is deleted on exit.
 SOURCE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PROJECT="MuvluvLLMMod.IntegrationTests/MuvluvLLMMod.IntegrationTests.csproj"
-EXPECTED_BASELINE=42
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/muvluv-fr3.XXXXXX")
+EXPECTED_BASELINE=47
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/muvluv-fr4.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 ROOT="$WORK/base"
 mkdir -p "$ROOT"
@@ -35,7 +35,7 @@ replace_once() {
     ' "$file"
 }
 
-echo "FR3 baseline: exact-source integration suite"
+echo "FR4 baseline: exact-source integration suite"
 baseline_output=$(run_tests "$ROOT" 2>&1) || {
     printf '%s\n' "$baseline_output"
     echo "baseline integration suite failed" >&2
@@ -166,7 +166,7 @@ gate_mutant() {
             ;;
         FR3-1-remove-epoch-overflow-guard)
             replace_once "$copy/MuvluvLLMMod/TranslationCache.cs" \
-                '        if (nextSnapshotEpoch == long.MaxValue)' \
+                '        if (snapshotEpochExhausted || snapshotEpoch == long.MaxValue)' \
                 '        if (false)'
             ;;
         FR3-2-retain-generation-owner)
@@ -183,6 +183,21 @@ gate_mutant() {
             replace_once "$copy/MuvluvLLMMod/Plugin.cs" \
                 '        resources?.Detach();' \
                 '        // mutant: retain terminated generation resource fields.'
+            ;;
+        FR4-1-remove-successor-reservation)
+            replace_once "$copy/MuvluvLLMMod/TranslationCache.cs" \
+                '        reservedSnapshotEpoch = epoch;' \
+                '        snapshotEpochExhausted = epoch == long.MaxValue;'
+            ;;
+        FR4-2-disable-eventual-machine-settlement)
+            replace_once "$copy/MuvluvLLMMod/MachineTranslatorLifecycle.cs" \
+                '            && NoTrackedStoppingWorkersRemain())' \
+                '            && false)'
+            ;;
+        FR4-3-remove-refresh-assignment-guard)
+            replace_once "$copy/MuvluvLLMMod/Patch.cs" \
+                '                && tmpProvenance.IsCurrent(assignment))' \
+                '                && true)'
             ;;
         *)
             echo "unknown mutant $id" >&2
@@ -259,5 +274,11 @@ gate_mutant FR3-2-retain-config-entry-roots \
     ZzzProductionLateStageIntegrationTests.Real_successful_cleanup_detaches_static_generation_owner_and_config_roots
 gate_mutant FR3-2-retain-resource-fields \
     ZzzProductionLateStageIntegrationTests.Real_successful_cleanup_detaches_static_generation_owner_and_config_roots
+gate_mutant FR4-1-remove-successor-reservation \
+    ProductionBudgetAndShutdownIntegrationTests.Real_writer_reuses_maximum_successor_after_transient_failure
+gate_mutant FR4-2-disable-eventual-machine-settlement \
+    ProductionCoordinationIntegrationTests.Timed_out_machine_resource_settles_after_eventual_worker_stop_without_reopening_generation
+gate_mutant FR4-3-remove-refresh-assignment-guard \
+    ProductionRenderIntegrationTests.Refresh_time_nested_external_assignment_is_not_overwritten_when_display_is_off
 
-echo "FR3 mutation gate: all 24 compile-valid configured mutants killed"
+echo "FR4 mutation gate: all 27 compile-valid configured mutants killed"

@@ -289,7 +289,7 @@ public sealed class Plugin : BasePlugin
                     ?? throw new InvalidOperationException("machine lifecycle was not initialized");
                 using var machineStartupResource = stage.RegisterResource(
                     "machine worker startup",
-                    machineLifecycle.Shutdown);
+                    machineLifecycle.ShutdownForResourceRollback);
                 resources.MachineStartupResource = machineStartupResource;
                 if (!machineLifecycle.Initialize(
                         settings.Enabled,

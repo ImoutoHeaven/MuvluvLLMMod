@@ -268,6 +268,32 @@ public sealed class MachineTranslatorLifecycle
         }
     }
 
+    /// <summary>
+    /// Rolls back the machine resource without rewriting the lifecycle's original failure. A
+    /// timed-out shutdown remains faulted for ordinary lifecycle callers, but once every tracked
+    /// worker has actually completed, a later resource retry can settle its reservation.
+    /// </summary>
+    public void ShutdownForResourceRollback()
+    {
+        Task? existingShutdown;
+        lock (gate)
+            existingShutdown = shutdownTask;
+
+        if (existingShutdown is { IsCompleted: true, IsFaulted: true }
+            && NoTrackedStoppingWorkersRemain())
+            return;
+
+        // On the first attempt this preserves the original failure. A later retry observes the
+        // already-faulted task above and only then treats the machine reservation as settled.
+        Shutdown();
+    }
+
+    private bool NoTrackedStoppingWorkersRemain()
+    {
+        lock (gate)
+            return stoppingWorkers.Count == 0;
+    }
+
     private async Task CompleteShutdownAsync(
         MachineTranslator? active,
         MachineTranslator[] stoppingMachines,

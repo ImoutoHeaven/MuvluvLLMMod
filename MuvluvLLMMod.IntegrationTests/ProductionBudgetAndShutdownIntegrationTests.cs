@@ -110,6 +110,119 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
     }
 
     [Fact]
+    public void Real_writer_reuses_maximum_successor_after_transient_failure()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.max-minus-one-real." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var seedCache = new TranslationCache(root);
+            WriteSeedSnapshot(seedCache, long.MaxValue - 1);
+
+            var cache = new TranslationCache(root);
+            cache.Load();
+            Assert.True(cache.StoreGenerated("新する", "新译"));
+
+            // Obstruct the real atomic writer before it can create a recoverable temp file.
+            Directory.CreateDirectory(cache.StateTemporaryPath);
+            Assert.False(cache.Flush());
+            Assert.True(cache.IsDurableMutationBlocked);
+
+            Directory.Delete(cache.StateTemporaryPath, recursive: true);
+            Assert.True(cache.Flush());
+            Assert.True(cache.IsDurableMutationBlocked);
+
+            var restarted = new TranslationCache(root);
+            restarted.Load();
+            Assert.True(restarted.TryGetGenerated("新する", out var translated));
+            Assert.Equal("新译", translated);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Injected_writer_reaches_the_same_terminal_successor_on_retry()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.max-minus-one-injected." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var stateWrites = 0;
+            var writes = 0;
+            var cache = new TranslationCache(
+                root,
+                writeAtomic: (path, json) =>
+                {
+                    writes++;
+                    if (Path.GetFileName(path) == "cache.state.v1.json" && ++stateWrites == 1)
+                        return false;
+                    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                    File.WriteAllText(path, json, new UTF8Encoding(false));
+                    return true;
+                });
+            WriteSeedSnapshot(cache, long.MaxValue - 1);
+            cache.Load();
+            Assert.True(cache.StoreGenerated("新する", "新译"));
+
+            Assert.False(cache.Flush());
+            Assert.Equal(1, stateWrites);
+            Assert.True(cache.FlushTerminal(TimeSpan.FromSeconds(1)));
+            Assert.Equal(2, stateWrites);
+            Assert.Equal(5, writes);
+
+            var restarted = new TranslationCache(root);
+            restarted.Load();
+            Assert.True(restarted.TryGetGenerated("新する", out var translated));
+            Assert.Equal("新译", translated);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Maximum_minus_one_commit_becomes_read_only_at_maximum_epoch()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.max-minus-one-commit." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var seedCache = new TranslationCache(root);
+            WriteSeedSnapshot(seedCache, long.MaxValue - 1);
+
+            var cache = new TranslationCache(root);
+            cache.Load();
+            Assert.True(cache.StoreGenerated("新する", "新译"));
+            Assert.True(cache.Flush());
+            Assert.True(cache.IsDurableMutationBlocked);
+
+            var before = cache.RetainedSnapshot;
+            Assert.False(cache.StoreGenerated("未来する", "未来译"));
+            Assert.False(cache.ObserveNormal("未来観察する", "未来観察する"));
+            Assert.Equal(before, cache.RetainedSnapshot);
+            var persisted = JsonSerializer.Deserialize<TranslationCache.DurableSnapshot>(
+                File.ReadAllText(cache.StatePath));
+            Assert.NotNull(persisted);
+            Assert.Equal(long.MaxValue, persisted!.Epoch);
+
+            var restarted = new TranslationCache(root);
+            restarted.Load();
+            Assert.True(restarted.TryGetGenerated("新する", out var translated));
+            Assert.Equal("新译", translated);
+            Assert.False(restarted.StoreGenerated("未来する", "未来译"));
+            Assert.True(restarted.IsDurableMutationBlocked);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public void Full_cap_cjk_pairs_are_rejected_before_an_unwritable_authoritative_state()
     {
         var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.snapshot-admission." + Guid.NewGuid().ToString("N"));
@@ -581,6 +694,27 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
             release.TrySetResult("翻译");
             try { Directory.Delete(root, recursive: true); } catch { }
         }
+    }
+
+    private static void WriteSeedSnapshot(TranslationCache cache, long epoch)
+    {
+        var snapshot = new TranslationCache.DurableSnapshot
+        {
+            Version = 1,
+            Epoch = epoch,
+            TransactionId = new string('e', 32),
+            Generated = new Dictionary<string, string>
+            {
+                ["旧する"] = "旧译"
+            },
+            Pending = Array.Empty<string>(),
+            Raw = Array.Empty<string>()
+        };
+        snapshot.Checksum = ComputeChecksum(snapshot);
+        File.WriteAllText(
+            cache.StatePath,
+            JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true }),
+            new UTF8Encoding(false));
     }
 
     private sealed class SnapshotIntegrityPayload

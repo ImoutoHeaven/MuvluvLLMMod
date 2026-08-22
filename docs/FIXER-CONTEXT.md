@@ -1272,3 +1272,38 @@ bash scripts/mutation-gate.sh
   exact-source baseline: 42 passed, 0 failed, 0 skipped
   24/24 compile-valid mutants killed
 ```
+
+## FR4 follow-up — DONE
+
+This batch fixes the three blockers recorded in `FINAL-REVIEW-4.md`; that historical review file
+and every other historical review document remain unchanged.
+
+### FR4-1 — reserved successor epochs
+
+`TranslationCache` now keeps the last authoritative `snapshotEpoch` separate from an in-flight
+successor. A failed authoritative write retains the same successor for the next normal or terminal
+retry; only a successful authoritative commit advances the committed epoch. A reserved
+`long.MaxValue` successor rejects further durable mutations while it is retryable, and a committed
+or loaded maximum epoch remains read-only. Exact linked production tests cover a real temp-file
+obstruction, an injected writer failure, restart recovery, and the no-failure maximum commit.
+
+### FR4-2 — eventual machine-resource settlement
+
+`MachineTranslatorLifecycle.ShutdownForResourceRollback` preserves the original faulted shutdown
+task and lifecycle failure, but lets a later resource retry settle after every tracked stopping
+worker has completed. The failed generation remains detached, quarantined, and unable to load; only
+the retained machine reservation is removed. The exact linked integration test asserts timeout
+failure, detached owner, tracked-worker drain, repeated cleanup, zero outstanding resources, and
+continued `Failed`/load-blocked state.
+
+### FR4-3 — refresh-time ownership assurance
+
+The exact production-source integration suite now performs a synchronous external `外部中文` setter
+on the same TMP object during `RefreshAllTmpText` resolution with display translation disabled. The
+committed `tmpProvenance.IsCurrent(assignment)` guard preserves that external value. The Docker
+mutation gate also replaces that guard with `true`; the focused semantic assertion kills the mutant.
+
+Final Docker validation reports **251 unit + 47 integration = 298 passed**, a production DLL
+build with **0 warnings / 0 errors**, and an exact-source baseline of **47 passed** with
+**27/27 compile-valid mutants killed**. All validation uses disposable `docker run --rm` containers
+with read-only source/game mounts; no historical review document or installed game file is modified.

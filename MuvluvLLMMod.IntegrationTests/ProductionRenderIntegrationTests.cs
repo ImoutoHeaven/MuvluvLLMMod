@@ -68,6 +68,42 @@ public sealed class ProductionRenderIntegrationTests
     }
 
     [Fact]
+    public void Refresh_time_nested_external_assignment_is_not_overwritten_when_display_is_off()
+    {
+        using var fixture = ProductionHarness.LoadPlugin();
+        var cache = Plugin.CurrentCache!;
+        const string source = "更新確認する";
+        const string translated = "更新确认";
+        Assert.True(cache.StoreGenerated(source, translated));
+
+        var label = new TMP_Text();
+        Config.Translation.Value = true;
+        label.text = source;
+        Assert.Equal(translated, label.text);
+
+        Config.Translation.Value = false;
+        Config.DebugLogSeenText.Value = true;
+        var nested = 0;
+        Plugin.Log.OnLog = _ =>
+        {
+            if (Interlocked.Exchange(ref nested, 1) == 0)
+                label.text = "外部中文";
+        };
+
+        try
+        {
+            Patch.RefreshAllTmpText();
+        }
+        finally
+        {
+            Plugin.Log.OnLog = null;
+        }
+
+        Assert.Equal(1, nested);
+        Assert.Equal("外部中文", label.text);
+    }
+
+    [Fact]
     public void Skill_description_is_not_pretranslated_and_uses_the_single_final_tmp_path()
     {
         using var fixture = ProductionHarness.LoadPlugin();
