@@ -434,6 +434,71 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
         lifecycle.Shutdown();
     }
 
+    [Fact]
+    public async Task Shutdown_is_terminal_and_rejects_future_scheduler_mutations()
+    {
+        var lifecycle = new MachineTranslatorLifecycle();
+
+        lifecycle.Shutdown();
+
+        Assert.True(lifecycle.IsShutdown);
+        Assert.False(lifecycle.Reload(false, 1, null));
+        Assert.False(lifecycle.EnqueuePriority("关闭后优先する"));
+        Assert.False(lifecycle.EnqueueNormal("关闭后通常する"));
+        await lifecycle.TransitionTask;
+    }
+
+    [Fact]
+    public async Task Shutdown_async_settles_a_transition_before_returning()
+    {
+        var cache = new TranslationCache(root);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var created = 0;
+        var lifecycle = new MachineTranslatorLifecycle();
+
+        MachineTranslator Factory(RequestRateLimiter _, TranslationPriorityBacklog backlog)
+        {
+            Interlocked.Increment(ref created);
+            return new MachineTranslator(
+                cache,
+                async (_, _) =>
+                {
+                    started.TrySetResult();
+                    return await release.Task;
+                },
+                1,
+                TimeSpan.FromSeconds(1),
+                backlog);
+        }
+
+        Task? shutdown = null;
+        try
+        {
+            lifecycle.Initialize(true, 1, Factory);
+            Assert.True(lifecycle.EnqueuePriority("关闭时等待する"));
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.True(lifecycle.Reload(true, 1, Factory));
+
+            shutdown = lifecycle.ShutdownAsync();
+            Assert.False(shutdown.IsCompleted);
+
+            release.TrySetResult(null);
+            await shutdown.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.True(lifecycle.IsShutdown);
+            Assert.Equal(1, created);
+            Assert.False(lifecycle.EnqueuePriority("关闭后不应排队する"));
+        }
+        finally
+        {
+            release.TrySetResult(null);
+            if (shutdown != null)
+                await shutdown.WaitAsync(TimeSpan.FromSeconds(2));
+            else
+                lifecycle.Shutdown();
+        }
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));

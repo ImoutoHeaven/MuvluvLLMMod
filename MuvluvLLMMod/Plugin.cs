@@ -21,8 +21,7 @@ public sealed class Plugin : BasePlugin
     internal static MonoBehaviour? Instance { get; private set; }
 
     private static readonly HttpClient LlmHttpClient = OpenAiHttpClientFactory.CreateClient();
-    private static readonly MachineTranslatorLifecycle MachineLifecycle = new(
-        exception => Logger.Error("[LLM] Lifecycle failure: " + exception.GetType().Name));
+    private static MachineTranslatorLifecycle machineLifecycle = CreateMachineLifecycle();
     private static CancellationTokenSource? persistenceCancellation;
     private static Task persistenceTask = Task.CompletedTask;
     private static MachineTranslator? currentMachine;
@@ -65,6 +64,7 @@ public sealed class Plugin : BasePlugin
 
         Interlocked.Exchange(ref cleanupStarted, 0);
         Volatile.Write(ref cleanupSucceeded, 0);
+        Volatile.Write(ref machineLifecycle, CreateMachineLifecycle());
 
         try
         {
@@ -116,7 +116,9 @@ public sealed class Plugin : BasePlugin
             return Volatile.Read(ref cleanupSucceeded) != 0;
 
         var succeeded = true;
+        var lifecycle = MachineLifecycle;
         CleanupStep("remove application-quit handler", RemoveApplicationQuittingHandler, ref succeeded);
+        CleanupStep("shutdown configuration", MuvluvLLMMod.Config.Shutdown, ref succeeded);
 
         CleanupStep("disable Hotkey", () =>
         {
@@ -135,7 +137,7 @@ public sealed class Plugin : BasePlugin
             if (Cache != null)
                 Cache.FreezeMutations();
         }, ref succeeded);
-        CleanupStep("shutdown machine translator", MachineLifecycle.Shutdown, ref succeeded);
+        CleanupStep("shutdown machine translator", lifecycle.Shutdown, ref succeeded);
 
         CancellationTokenSource? persistenceSource = null;
         CleanupStep("cancel cache persistence", () =>
@@ -172,7 +174,6 @@ public sealed class Plugin : BasePlugin
             harmony?.UnpatchSelf();
             harmony = null;
         }, ref succeeded);
-        CleanupStep("shutdown configuration", MuvluvLLMMod.Config.Shutdown, ref succeeded);
         Volatile.Write(ref currentMachine, null);
         Volatile.Write(ref cleanupSucceeded, succeeded ? 1 : 0);
         Volatile.Write(ref loadStarted, 0);
@@ -227,12 +228,16 @@ public sealed class Plugin : BasePlugin
 
     internal static void ReloadMachineTranslator()
     {
-        if (Cache == null)
+        if (IsCleaningUp || Cache == null)
+            return;
+
+        var lifecycle = MachineLifecycle;
+        if (lifecycle.IsShutdown)
             return;
 
         var settings = CaptureMachineSettings();
         var retryPolicy = new TranslationRetryPolicy();
-        MachineLifecycle.Reload(
+        lifecycle.Reload(
             settings.Enabled,
             settings.RequestsPerSecond,
             (limiter, backlog) => CreateMachineTranslator(settings, limiter, backlog, retryPolicy),
@@ -298,6 +303,12 @@ public sealed class Plugin : BasePlugin
 
     private static void CancelTranslation(string template, long pendingGeneration) =>
         MachineLifecycle.Cancel(template, pendingGeneration);
+
+    private static MachineTranslatorLifecycle MachineLifecycle =>
+        Volatile.Read(ref machineLifecycle);
+
+    private static MachineTranslatorLifecycle CreateMachineLifecycle() => new(
+        exception => Logger.Error("[LLM] Lifecycle failure: " + exception.GetType().Name));
 
     private static MachineSettings CaptureMachineSettings() => new(
         MuvluvLLMMod.Config.LlmEnable.Value,
