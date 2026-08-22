@@ -609,3 +609,19 @@ Docker validation used read-only source/game mounts and did not launch the game:
 PASS — `dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release`: 221 passed, 0 failed, 0 skipped.
 PASS — `dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game`: 0 warnings, 0 errors.
 ```
+
+## M-6 follow-up — DONE (commit `3660de6`)
+
+Rewrote the release README around the standalone render-layer contract. It no longer names or
+assumes a particular upstream project, internal patch methods, or other mod hotkeys, and it avoids
+unverified "never fights"/complete-coverage guarantees. It documents the tested kana-free incoming
+text rule, the object/generation/epoch fail-closed F2 behavior, continued production while display
+is off, and the remaining runtime gates for font fallback and TMP coverage. `ReadmeSurfaceTests`
+protects the generic wording and rejects upstream-coupled terms.
+
+Docker validation used read-only source/game mounts and did not launch the game:
+
+```text
+PASS — `dotnet test MuvluvLLMMod.Tests/MuvluvLLMMod.Tests.csproj -c Release`: 222 passed, 0 failed, 0 skipped.
+PASS — `dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game`: 0 warnings, 0 errors.
+```
