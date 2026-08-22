@@ -36,6 +36,9 @@ public sealed class TranslationBudgetTests : IDisposable
         Assert.Equal(0, provenance.Count);
         Assert.Equal(0, provenance.RetainedUtf8Bytes);
         Assert.InRange(diagnostics.Count, 0, 2);
+
+        var resolver = new TranslationResolver(cache, _ => { }, _ => { });
+        Assert.Equal("原文する", resolver.Resolve("原文する", new string('译', TranslationBudget.MaxTextUtf16CodeUnits + 1)));
     }
 
     [Fact]

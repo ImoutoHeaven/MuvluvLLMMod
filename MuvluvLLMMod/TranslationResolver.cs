@@ -61,7 +61,10 @@ public sealed class TranslationResolver
 
     private string ResolveCore(string original, string? curated, bool enabled, bool priority, bool knownSource, bool enqueue)
     {
-        if (!enabled || string.IsNullOrEmpty(original)) return original;
+        if (!enabled || string.IsNullOrEmpty(original) || !TranslationBudget.IsTextWithinBudget(original))
+            return original;
+        if (curated != null && !TranslationBudget.IsTextWithinBudget(curated))
+            return original;
         if (knownSource) cache.ConfirmSourceIdentity(original);
         var source = !knownSource && cache.TryGetSourceForTranslatedValue(original, out var resolvedSource) ? resolvedSource : original;
         var alreadyResolved = !string.Equals(source, original, StringComparison.Ordinal);

@@ -10,6 +10,8 @@ namespace MuvluvLLMMod;
 /// </summary>
 public static class TranslationBudget
 {
+    private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+
     public const int MaxTextUtf16CodeUnits = 4096;
     public const int MaxTextUtf8Bytes = 16 * 1024;
     public const int MaxResponseBodyBytes = 128 * 1024;
@@ -52,7 +54,7 @@ public static class TranslationBudget
 
         try
         {
-            bytes = Encoding.UTF8.GetByteCount(text);
+            bytes = StrictUtf8.GetByteCount(text);
             return bytes <= MaxTextUtf8Bytes;
         }
         catch (ArgumentException)
