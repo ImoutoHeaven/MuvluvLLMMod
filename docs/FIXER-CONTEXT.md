@@ -895,8 +895,9 @@ audit or PF-7 final documentation wording closed.
 
 ### PF-2 authoritative cache journal
 
-Commits `8a62ccf` (`fix: recover newest authoritative cache epoch`) and `d32b9e3` (the mutation
-gate update) add an epoch-bearing, checksummed state journal. New `cache.state.v1.json` snapshots
+Commits `8a62ccf` (`fix: recover newest authoritative cache epoch`), `22deacd` (missing
+canonical recovery coverage), and `d32b9e3` (the mutation gate update) add an epoch-bearing,
+checksummed state journal. New `cache.state.v1.json` snapshots
 carry a monotonic `Epoch`, `TransactionId`, and SHA-256 `Checksum` over the version, epoch,
 transaction metadata, and sorted/generated plus ordered pending/raw payload. Pre-journal V1 files
 without metadata are accepted deterministically as epoch zero and marked for safe migration.
