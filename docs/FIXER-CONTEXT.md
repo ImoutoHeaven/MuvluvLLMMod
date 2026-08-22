@@ -1152,3 +1152,58 @@ Docker validation for the implementation commits used `mcr.microsoft.com/dotnet/
 0 failed, 0 skipped**; the production build against `-p:GameDir=/game` was **0 warnings, 0 errors**;
 and the mutation gate was **27 passed with 18/18 compile-valid mutants killed**. The game was never
 launched or written. FR2-2 remains open for the next batch.
+
+## FR2-2 follow-up — DONE (production `2d7c49e`, tests `19cd2cb`)
+
+`docs/FINAL-REVIEW-2.md` and all other historical review files were intentionally left unchanged.
+This batch closes the late-publication defect without adding an upstream dependency or patch target.
+
+### Generation resource protocol
+
+`PluginLifecycleGate.PluginGenerationResource` is a per-stage reservation for each production
+side effect: configuration initialization, cache/ resolver ownership, Harmony, Hotkey, native quit
+delegate, persistence, machine startup, and running/config activation. The reservation is installed
+before the external boundary. The boundary's local object is published only by `Commit` while the
+generation and stage are still admissible; a late or failed commit immediately invokes the retained
+idempotent rollback. Cleanup requests rollback without waiting on a pending non-cooperative call.
+After the bounded quiescence deadline, the generation remains `Failed`/quarantined, and the resource
+reservation is retained until the late stage returns. A late completion drains its rollback, while
+repeated cleanup retries only failed retained rollback callbacks and never re-runs the teardown graph.
+Harmony also retires static patch state before and after unpatching, and activation rollback revokes
+configuration itself so no late event handler or static runtime state survives.
+
+### Exact-source coverage and mutation gate
+
+The integration project continues to wildcard-link the current production source. The deterministic
+stubs now block real linked `PatchAll`, `AddComponent`, and native `Application.add_quitting`
+boundaries. Tests assert:
+
+- blocked Harmony publication is unpatched after timeout and late completion, with zero final hooks;
+- a late Hotkey component is destroyed and a late native delegate is removed by exact identity;
+- late persistence and machine-worker resources are cancelled/stopped;
+- rollback failure remains quarantined and a later cleanup retry is safe; and
+- removing the stage commit or the late Harmony rollback is killed by focused behavior tests.
+
+The exact-source integration baseline is **39 passed**. `scripts/mutation-gate.sh` now kills
+**20/20 compile-valid mutants**, including the two FR2-2 mutants; each mutant is built and tested in
+its own disposable container copy.
+
+### Final Docker validation
+
+All validation used `mcr.microsoft.com/dotnet/sdk:8.0` with `docker run --rm`; source was mounted
+read-only and copied into the container, and
+`C:/Users/Eden/Muv-Luv/muv_luv_girlsgarden_cl` was mounted read-only and never launched or written:
+
+```text
+dotnet test MuvluvLLMMod.sln -c Release
+  MuvluvLLMMod.Tests: 251 passed, 0 failed, 0 skipped
+  MuvluvLLMMod.IntegrationTests: 39 passed, 0 failed, 0 skipped
+  Total: 290 passed, 0 failed, 0 skipped
+
+dotnet build MuvluvLLMMod/MuvluvLLMMod.csproj -c Release -p:GameDir=/game
+  0 warnings, 0 errors
+
+bash scripts/mutation-gate.sh
+  exact-source baseline: 39 passed, 0 failed, 0 skipped
+  20/20 compile-valid mutants killed
+```
