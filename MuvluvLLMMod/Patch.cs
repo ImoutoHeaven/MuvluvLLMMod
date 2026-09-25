@@ -124,7 +124,7 @@ public static class Patch
                 foreach (var pair in translations)
                     Plugin.CurrentCache?.RememberResolution(pair.Key, pair.Value);
 
-                sceneCoordinator.MarkApplied(work.SceneId, work.Generation);
+                sceneCoordinator.MarkApplied(work.SceneId, work.SceneIdentity);
                 Logger.Info(
                     $"[LLM][Scene] translated scene={work.SceneId} targets={translations.Count}");
             }

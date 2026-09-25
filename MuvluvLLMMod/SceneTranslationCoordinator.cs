@@ -23,20 +23,26 @@ namespace MuvluvLLMMod;
 internal sealed class SceneTranslationCoordinator
 {
     private readonly SceneTranslationMarker marker = new(TranslationBudget.MaxAppliedSceneEntries);
-    private long generation;
 
     /// <summary>
     /// Applies the currently known translations to every frame document in the array, and returns
-    /// the dialogue that still needs translating along with the scene generation it belongs to.
-    /// Returns null when scene translation is disabled or the array carries nothing to translate.
+    /// the dialogue that still needs translating along with the identity of the document set it
+    /// belongs to. Returns null when scene translation is disabled, the array carries nothing to
+    /// translate, or this exact document set was already translated.
     /// </summary>
     internal ScenePendingWork? Prepare(Il2CppReferenceArray<SceneFrameMaster>? masters, long sceneId)
     {
         if (!Config.Translation.Value || !Config.SceneTranslation.Value || masters is null)
             return null;
 
-        var currentGeneration = ++generation;
-        if (marker.IsApplied(sceneId, currentGeneration))
+        // The documents arrive exactly as the game fetched them, so their fingerprint identifies
+        // this scene instance regardless of how often it is re-entered.
+        var documents = new List<string?>(masters.Length);
+        foreach (var master in masters)
+            documents.Add(master?.ConfigurationJson);
+
+        var identity = SceneFrameDocument.Fingerprint(documents);
+        if (marker.IsApplied(sceneId, identity))
             return null;
 
         var pending = new List<string>();
@@ -81,19 +87,26 @@ internal sealed class SceneTranslationCoordinator
 
         return pending.Count == 0
             ? null
-            : new ScenePendingWork(sceneId, currentGeneration, pending);
+            : new ScenePendingWork(sceneId, identity, pending);
     }
 
     /// <summary>
-    /// Records that a scene generation was fully applied, so a re-entered scene is not resent.
+    /// Records that this document set was fully translated, so re-entering the same scene is not
+    /// resent. Keyed by document identity rather than call order, because the same scene can be
+    /// re-entered any number of times.
     /// </summary>
-    internal void MarkApplied(long sceneId, long sceneGeneration) =>
-        marker.MarkApplied(sceneId, sceneGeneration);
+    internal void MarkApplied(long sceneId, long sceneIdentity) =>
+        marker.MarkApplied(sceneId, sceneIdentity);
 
     internal int RetainedSceneCount => marker.Count;
 
     internal void Reset() => marker.Clear();
 }
 
-/// <summary>Dialogue awaiting a scene request, together with the scene generation it belongs to.</summary>
-internal readonly record struct ScenePendingWork(long SceneId, long Generation, IReadOnlyList<string> Sources);
+/// <summary>
+/// Dialogue awaiting a scene request, together with the identity of the document set it came from.
+/// </summary>
+internal readonly record struct ScenePendingWork(
+    long SceneId,
+    long SceneIdentity,
+    IReadOnlyList<string> Sources);

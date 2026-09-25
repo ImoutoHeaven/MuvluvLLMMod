@@ -118,6 +118,37 @@ public static class SceneFrameDocument
         return changed ? document.ToJsonString(WriteOptions) : null;
     }
 
+    /// <summary>
+    /// A stable identifier for a specific set of frame documents. Used to recognize a scene that
+    /// has already been translated: identical documents produce the same value, and any change to
+    /// any document produces a different one. Computed before rewriting, so the identity reflects
+    /// the text as the game fetched it.
+    /// </summary>
+    public static long Fingerprint(IEnumerable<string?> documents)
+    {
+        // FNV-1a: arithmetic only, so the value is stable for the lifetime of the process.
+        const ulong offset = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+
+        var hash = offset;
+        foreach (var document in documents)
+        {
+            if (document is not null)
+            {
+                foreach (var character in document)
+                {
+                    hash ^= character;
+                    hash *= prime;
+                }
+            }
+
+            hash ^= 0xFFFF;
+            hash *= prime;
+        }
+
+        return unchecked((long)hash);
+    }
+
     private static IEnumerable<JsonObject> EnumeratePhrases(string? configurationJson)
     {
         if (string.IsNullOrEmpty(configurationJson))

@@ -108,4 +108,60 @@ public sealed class SceneTranslationMarkerTests
 
         Assert.True(marker.Count <= 64);
     }
+
+    [Fact]
+    public void Fingerprint_is_stable_for_identical_documents()
+    {
+        var first = SceneFrameDocument.Fingerprint(new[] { "{\"Phrase\":{\"Text\":\"a\"}}", "b" });
+        var second = SceneFrameDocument.Fingerprint(new[] { "{\"Phrase\":{\"Text\":\"a\"}}", "b" });
+
+        Assert.Equal(first, second);
+    }
+
+    [Fact]
+    public void Fingerprint_changes_when_any_document_changes()
+    {
+        var baseline = SceneFrameDocument.Fingerprint(new[] { "a", "b" });
+
+        Assert.NotEqual(baseline, SceneFrameDocument.Fingerprint(new[] { "a", "c" }));
+        Assert.NotEqual(baseline, SceneFrameDocument.Fingerprint(new[] { "b", "a" }));
+        Assert.NotEqual(baseline, SceneFrameDocument.Fingerprint(new[] { "a" }));
+        Assert.NotEqual(baseline, SceneFrameDocument.Fingerprint(new[] { "a", "b", "c" }));
+    }
+
+    [Fact]
+    public void Fingerprint_tolerates_null_documents()
+    {
+        Assert.Equal(
+            SceneFrameDocument.Fingerprint(new string?[] { null, "a", null }),
+            SceneFrameDocument.Fingerprint(new string?[] { null, "a", null }));
+        Assert.NotEqual(
+            SceneFrameDocument.Fingerprint(new string?[] { null, "a" }),
+            SceneFrameDocument.Fingerprint(new string?[] { "a", null }));
+    }
+
+    [Fact]
+    public void A_re_entered_scene_is_suppressed_by_its_document_identity()
+    {
+        // A scene can be re-entered any number of times, so suppression must key on the document
+        // set rather than a call counter; a counter never matches and leaves the guard inert.
+        var marker = new SceneTranslationMarker(8);
+        var identity = SceneFrameDocument.Fingerprint(new[] { "{\"Phrase\":{\"Text\":\"a\"}}" });
+
+        Assert.False(marker.IsApplied(40003301, identity));
+        marker.MarkApplied(40003301, identity);
+
+        // Identical documents on the next entry are recognized.
+        Assert.True(marker.IsApplied(40003301, identity));
+        Assert.True(
+            marker.IsApplied(
+                40003301,
+                SceneFrameDocument.Fingerprint(new[] { "{\"Phrase\":{\"Text\":\"a\"}}" })));
+
+        // Re-fetched documents translate again.
+        Assert.False(
+            marker.IsApplied(
+                40003301,
+                SceneFrameDocument.Fingerprint(new[] { "{\"Phrase\":{\"Text\":\"b\"}}" })));
+    }
 }
