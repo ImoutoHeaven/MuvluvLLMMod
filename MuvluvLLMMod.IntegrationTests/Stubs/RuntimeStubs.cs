@@ -171,7 +171,7 @@ namespace HarmonyLib
         public sealed record PatchApplication(string Owner, string PatchMethod, string Target);
 
         private static readonly object gate = new();
-        private static readonly Dictionary<MethodInfo, HashSet<string>> owners = new();
+        private static readonly Dictionary<MethodBase, HashSet<string>> owners = new();
         private static readonly List<PatchApplication> applications = new();
 
         public Harmony(string id) => Id = id;
@@ -264,7 +264,7 @@ namespace HarmonyLib
             }
         }
 
-        public static PatchInfo? GetPatchInfo(MethodInfo? method)
+        public static PatchInfo? GetPatchInfo(MethodBase? method)
         {
             if (method == null)
                 return null;
@@ -520,6 +520,30 @@ namespace UnityEngine.InputSystem
     }
 }
 
+namespace Il2CppInterop.Runtime.InteropTypes.Arrays
+{
+    /// <summary>
+    /// Stand-in for the IL2CPP array wrapper. The scene seam iterates the frame documents and
+    /// reads their count, so only enumeration and length are modelled.
+    /// </summary>
+    public sealed class Il2CppReferenceArray<T> : IEnumerable<T>
+    {
+        private readonly T[] items;
+
+        public Il2CppReferenceArray(int length) => items = new T[length];
+
+        public Il2CppReferenceArray(params T[] items) => this.items = items;
+
+        public int Length => items.Length;
+
+        public T this[int index] => items[index];
+
+        public IEnumerator<T> GetEnumerator() => ((IEnumerable<T>)items).GetEnumerator();
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => items.GetEnumerator();
+    }
+}
+
 namespace TMPro
 {
     using UnityEngine;
@@ -548,15 +572,59 @@ namespace TMPro
     }
 }
 
+namespace Assets.GameUi.Service
+{
+    /// <summary>Only the scene-download seam referenced by production code is modelled.</summary>
+    public sealed class EpisodeService
+    {
+    }
+}
+
 namespace Assets.Api.Client
 {
+    /// <summary>
+    /// Minimal frame document stand-in. The scene seam only reads and writes
+    /// <see cref="ConfigurationJson"/>, so no other member is modelled.
+    /// </summary>
+    public sealed class SceneFrameMaster
+    {
+        public string ConfigurationJson { get; set; } = string.Empty;
+    }
 }
 
 namespace Assets.GameUi.Scenario
 {
+    /// <summary>
+    /// The scene seam reads <c>sceneMasterId</c> and rewrites the frame documents handed to
+    /// <c>GenerateFrames</c>, so both are modelled here. <c>FunctionFlags</c> is nested in the real
+    /// type, which is why the seam signature names it as <c>ScenarioController.FunctionFlags</c>.
+    /// </summary>
     public sealed class ScenarioController
     {
+        [Flags]
+        public enum FunctionFlags
+        {
+            None = 0,
+        }
+
+        public long sceneMasterId;
+
         public void Refresh() { }
+
         public void Leave() { }
+
+        /// <summary>
+        /// Present so the scene seam's Harmony signature resolves. The stub returns nothing; the
+        /// tests exercise the rewrite through the coordinator directly.
+        /// </summary>
+        public Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<ScenarioFrameViewModel> GenerateFrames(
+            Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Assets.Api.Client.SceneFrameMaster> masters,
+            FunctionFlags disableFunctionFlags,
+            bool enableDummyBranch = false) =>
+            new(0);
+    }
+
+    public sealed class ScenarioFrameViewModel
+    {
     }
 }

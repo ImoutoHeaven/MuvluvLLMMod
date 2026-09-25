@@ -17,7 +17,6 @@ public sealed class ReadmeSurfaceTests
         foreach (var forbidden in new[]
         {
             "MuvluvMod",
-            "GenerateFrames",
             "ScenarioHistoryCell",
             "ScenarioChoiceElementComponent",
             "LoadMasterData",
@@ -30,6 +29,12 @@ public sealed class ReadmeSurfaceTests
         {
             Assert.DoesNotContain(forbidden, readme, StringComparison.OrdinalIgnoreCase);
         }
+
+        // Scene translation is documented as a second, bounded route with all-or-nothing validation.
+        Assert.Contains("Scene translation", readme, StringComparison.Ordinal);
+        Assert.Contains("all-or-nothing", readme, StringComparison.Ordinal);
+        Assert.Contains("never published half-translated", readme, StringComparison.Ordinal);
+        Assert.Contains("docs/scene-frame-evidence.md", readme, StringComparison.Ordinal);
 
         Assert.Contains("kana-free incoming text is not queued", readme, StringComparison.Ordinal);
         Assert.Contains("Kana is necessary but not sufficient", readme, StringComparison.Ordinal);

@@ -22,6 +22,7 @@ public static class Config
     public static ConfigEntry<float> LlmRefreshPeriodSeconds { get; private set; } = null!;
     public static ConfigEntry<string> CacheDirectory { get; private set; } = null!;
     public static ConfigEntry<bool> DebugLogSeenText { get; private set; } = null!;
+    public static ConfigEntry<bool> SceneTranslation { get; private set; } = null!;
 
     public static void Initialize(ConfigFile configFile) => _ = InitializeCore(configFile, null);
 
@@ -61,6 +62,7 @@ public static class Config
         LlmMaxInFlight,
         LlmTranslatePeriodSeconds,
         LlmRefreshPeriodSeconds,
+        SceneTranslation,
         CacheDirectory,
         DebugLogSeenText
     }.Count(entry => entry != null);
@@ -80,6 +82,7 @@ public static class Config
         LlmRefreshPeriodSeconds = null!;
         CacheDirectory = null!;
         DebugLogSeenText = null!;
+        SceneTranslation = null!;
     }
 
     private static bool InitializeCore(
@@ -168,6 +171,11 @@ public static class Config
                 "DebugLogSeenText",
                 false,
                 "诊断用途：是否记录观察到的文本");
+            SceneTranslation = configFile.Bind(
+                "Translation",
+                "SceneTranslation",
+                true,
+                "以整个场景为一批向 LLM 发送台词，使同一场景的称呼与语气保持一致；关闭则退回逐条翻译");
         }
 
         if (generation?.IsCancellationRequested == true)

@@ -40,6 +40,20 @@ public static class TranslationBudget
     public const int MaxConcurrentWorkers = 16;
     public const int MaxTransitions = 16;
 
+    /// <summary>
+    /// Scene-level rewrite markers. Scenes are far fewer than strings, so this is deliberately
+    /// small next to the text budgets above.
+    /// </summary>
+    public const int MaxAppliedSceneEntries = 512;
+
+    /// <summary>
+    /// A whole-scene request is one larger payload rather than one line. Measured against the
+    /// shipping corpus (1056 scenes), scene prompts run to about 15k UTF-16 units at the maximum
+    /// and 9k at the ninetieth percentile, so the per-string ceiling would reject most scenes.
+    /// </summary>
+    public const int MaxSceneUtf16CodeUnits = 16 * 1024;
+    public const int MaxSceneUtf8Bytes = 48 * 1024;
+
     public const int MaxCacheFileBytes = 8 * 1024 * 1024;
     public const int MaxCacheSnapshotBytes = 8 * 1024 * 1024;
     public static readonly TimeSpan DefaultShutdownTimeout = TimeSpan.FromSeconds(5);
@@ -47,6 +61,8 @@ public static class TranslationBudget
     public static readonly TimeSpan DefaultLifecycleQuiescenceTimeout = TimeSpan.FromSeconds(5);
     public static readonly TimeSpan MaxLifecycleQuiescenceTimeout = TimeSpan.FromSeconds(60);
     public static readonly TimeSpan DefaultTerminalFlushBudget = TimeSpan.FromSeconds(5);
+
+    public static int MaxSceneUtf16Codes() => MaxSceneUtf16CodeUnits;
 
     public static bool TryGetTextBytes(string? text, out int bytes)
     {
@@ -66,6 +82,25 @@ public static class TranslationBudget
     }
 
     public static bool IsTextWithinBudget(string? text) => TryGetTextBytes(text, out _);
+
+    /// <summary>
+    /// Scene payloads are larger than a single string but still bounded. Kept separate so raising
+    /// the scene ceiling never widens what the per-string path, cache, or regex work may accept.
+    /// </summary>
+    public static bool IsSceneWithinBudget(string? text)
+    {
+        if (text == null || text.Length == 0 || text.Length > MaxSceneUtf16CodeUnits)
+            return false;
+
+        try
+        {
+            return StrictUtf8.GetByteCount(text) <= MaxSceneUtf8Bytes;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
 
     public static bool TryGetPairBytes(
         string? first,

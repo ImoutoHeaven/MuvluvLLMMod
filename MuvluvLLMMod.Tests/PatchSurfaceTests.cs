@@ -28,11 +28,9 @@ public sealed class PatchSurfaceTests
 
         foreach (var forbidden in new[]
         {
-            "GenerateFrames",
             "ScenarioHistoryCell",
             "ScenarioChoiceElementComponent",
             "LoadMasterData",
-            "DownloadSceneFrameMasters",
             "Mosaic",
             "EnableSkipButton",
             "VoiceInterruption",
@@ -40,12 +38,38 @@ public sealed class PatchSurfaceTests
             "FontBundle",
             "GenericFont",
             "ScenarioTextStyle",
-            "RemoteCatalog",
-            "SceneRequest"
+            "RemoteCatalog"
         })
         {
             Assert.DoesNotContain(forbidden, patch, StringComparison.Ordinal);
         }
+
+        // Scene translation is a second, deliberate seam: GenerateFrames is the only place the game
+        // consumes ConfigurationJson, and it runs before Refresh publishes the frame view models.
+        Assert.Contains(
+            "[HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.GenerateFrames))]",
+            patch,
+            StringComparison.Ordinal);
+        Assert.Contains("TranslateSceneFrames", patch, StringComparison.Ordinal);
+        Assert.Contains("sceneCoordinator.Prepare", patch, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Scene_path_registers_translations_before_marking_the_scene_applied()
+    {
+        var patch = ReadProductionSource("Patch.cs");
+
+        // Registering into the reverse index first is what stops the per-string path from
+        // re-enqueueing these lines once they render; marking applied skips the whole scene next
+        // time. Reversing the order would reopen the re-entry window.
+        var register = patch.IndexOf("RememberResolution", StringComparison.Ordinal);
+        var mark = patch.IndexOf("sceneCoordinator.MarkApplied", StringComparison.Ordinal);
+        Assert.True(register >= 0);
+        Assert.True(mark > register);
+
+        // A rejected or failed batch must leave the frames untouched and fall back to per-string.
+        Assert.Contains("batch.TryParseResponse", patch, StringComparison.Ordinal);
+        Assert.Contains("response rejected", patch, StringComparison.Ordinal);
     }
 
     [Fact]

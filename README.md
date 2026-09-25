@@ -30,9 +30,33 @@ budgets permit admission. The generated or filled output must pass its own bound
 before it is displayed or retained. Kana is necessary but not sufficient. Pure-kanji strings (for
 example `提供割合`) are deliberately not translated; this keeps the candidate test conservative.
 
-Game-produced text is not modified by a data-layer hook. Translation is applied when the final UI
-assignment is observed by this plugin's `TMP_Text` render Prefix. Text produced by a game builder
-or another data source is therefore covered only when it reaches that final assignment.
+Game-produced text reaches the pipeline through two routes. Scenario dialogue is rewritten at the
+frame document before the game consumes it, which is what the section below describes. Every other
+string is translated when the final UI assignment is observed by this plugin's `TMP_Text` render
+Prefix, so builder output and other data sources are covered once they reach that assignment.
+
+## Scene translation
+
+Scenario dialogue has a second route. A scene's frame documents are rewritten before the game
+consumes them, so one request covers the whole scene and the model sees every line in order. That is
+what keeps a speaker's tone, honorifics, and terminology consistent within a scene, and it turns
+roughly seventy requests per scene into one.
+
+Evidence for the seam is recorded in [`docs/scene-frame-evidence.md`](docs/scene-frame-evidence.md):
+the game reads `SceneFrameMaster.ConfigurationJson` exactly once, and the frame factory runs before
+`Refresh` publishes the frame view models.
+
+Only dialogue `Text` is batched. Speaker and team names are few and highly repetitive, so the
+per-string path already translates each of them once.
+
+Validation of a scene response is all-or-nothing. The response must echo the protocol version and
+scene id, carry exactly one entry per target in the same order, and restore to the exact protected
+token sequence with matching markup. Any mismatch rejects the whole scene, and the dialogue is then
+translated by the per-string path instead. A scene is never published half-translated.
+
+The scene route shares the bounded text, request, and cache budgets with the rest of the plugin; a
+scene payload has its own ceiling because one scene is larger than one line. `__MLM_FMT_n__` tokens,
+including ruby tags such as `<r=ダイブ>潜航</r>`, are preserved exactly as in the per-string path.
 
 ## Requirements
 
@@ -53,6 +77,7 @@ Drop `MuvluvLLMMod.dll` into `<GameDir>/BepInEx/plugins/`. Launch once to genera
 | Key | Default | Meaning |
 |---|---|---|
 | `Enable` | `true` | Whether this plugin's known translations are displayed. Toggled at runtime with **F2**; it does not stop translation production. |
+| `SceneTranslation` | `true` | Sends a whole scene's dialogue as one request so terminology and tone stay consistent across it. Turning this off falls back to per-string translation. |
 
 ### `[Translation.Debug]`
 

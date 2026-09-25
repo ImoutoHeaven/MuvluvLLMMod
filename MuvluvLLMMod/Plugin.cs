@@ -53,6 +53,8 @@ public sealed class Plugin : BasePlugin
         public PluginLifecycleGate.PluginGenerationResource? PersistenceResource { get; set; }
         public PluginLifecycleGate.PluginGenerationResource? MachineStartupResource { get; set; }
         public PluginLifecycleGate.PluginGenerationResource? ActivationResource { get; set; }
+        public OpenAiChatClient? SceneClient { get; set; }
+        public RequestRateLimiter? SceneLimiter { get; set; }
 
         public void Detach()
         {
@@ -74,6 +76,8 @@ public sealed class Plugin : BasePlugin
             PersistenceResource = null;
             MachineStartupResource = null;
             ActivationResource = null;
+            SceneClient = null;
+            SceneLimiter = null;
         }
     }
 
@@ -99,6 +103,7 @@ public sealed class Plugin : BasePlugin
 
     internal static TranslationCache? CurrentCache => RunningResources?.Cache;
     internal static TranslationResolver? CurrentResolver => RunningResources?.Resolver;
+    internal static OpenAiChatClient? CurrentSceneClient => RunningResources?.SceneClient;
     internal static PluginLifecycleGate.PluginGeneration? CurrentGeneration =>
         lifecycleGate.CurrentGeneration;
     internal static object? CurrentGenerationOwner =>
@@ -317,6 +322,21 @@ public sealed class Plugin : BasePlugin
                 }
                 if (!machineStartupResource.Commit())
                     throw CanceledGeneration(generation, "machine worker startup");
+
+                // A scene request is one larger call per scene rather than one per line, so it gets
+                // its own pacing so a scene burst cannot starve the per-string queue.
+                resources.SceneLimiter = new RequestRateLimiter(
+                    Math.Max(1, Math.Min(settings.RequestsPerSecond, 2)));
+                resources.SceneClient = new OpenAiChatClient(
+                    LlmHttpClient,
+                    new OpenAiChatSettings(
+                        settings.Endpoint,
+                        settings.Model,
+                        settings.ApiKey,
+                        SceneTimeoutSeconds(settings.TimeoutSeconds),
+                        settings.RetryCount),
+                    resources.SceneLimiter,
+                    message => SafeWarn("[LLM][Scene] " + message));
             }
 
             if (!lifecycleGate.TryPublishRunning(generation))
@@ -710,6 +730,13 @@ public sealed class Plugin : BasePlugin
         Math.Max(1, MuvluvLLMMod.Config.LlmRequestsPerSecond.Value),
         Math.Max(1, MuvluvLLMMod.Config.LlmMaxInFlight.Value),
         Math.Max(0.1f, MuvluvLLMMod.Config.LlmTranslatePeriodSeconds.Value));
+
+    /// <summary>
+    /// A scene is one larger request, so its ceiling is longer than a single line's while staying
+    /// bounded and derived from the configured timeout.
+    /// </summary>
+    private static int SceneTimeoutSeconds(int configuredTimeoutSeconds) =>
+        Math.Clamp(configuredTimeoutSeconds * 4, 30, 300);
 
     private static string ResolvePluginPath(string path) =>
         Path.IsPathRooted(path) ? path : Path.Combine(Paths.PluginPath, path);

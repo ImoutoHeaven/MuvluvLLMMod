@@ -40,7 +40,7 @@ public sealed class ProductionSourceLinkIntegrationTests
         using var fixture = ProductionHarness.LoadPlugin();
         var applications = Harmony.SnapshotApplications();
 
-        Assert.Equal(3, applications.Count);
+        Assert.Equal(4, applications.Count);
         Assert.All(applications, application =>
             Assert.Equal(Plugin.PluginGuid, application.Owner));
         Assert.Contains(
@@ -55,6 +55,11 @@ public sealed class ProductionSourceLinkIntegrationTests
             applications,
             application => application.PatchMethod == "SetIsNotPlayingScenario"
                 && application.Target == "ScenarioController.Leave");
+        // The scene seam rewrites frame documents before Refresh publishes them.
+        Assert.Contains(
+            applications,
+            application => application.PatchMethod == "TranslateSceneFrames"
+                && application.Target == "ScenarioController.GenerateFrames");
         Assert.DoesNotContain(
             applications,
             application => application.PatchMethod.Contains("Skill", StringComparison.OrdinalIgnoreCase)

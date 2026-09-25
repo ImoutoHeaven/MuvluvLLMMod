@@ -1,8 +1,11 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Threading.Tasks;
 using Assets.Api.Client;
 using Assets.GameUi.Scenario;
+using Assets.GameUi.Service;
 using HarmonyLib;
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using TMPro;
 using UnityEngine;
 
@@ -11,6 +14,7 @@ namespace MuvluvLLMMod;
 public static class Patch
 {
     public static bool isPlayingScenario;
+    private static readonly SceneTranslationCoordinator sceneCoordinator = new();
 
     private static readonly DebugTextLogPolicy debugTextLogPolicy = new();
     private static readonly TmpTranslationProvenance tmpProvenance = new();
@@ -57,6 +61,79 @@ public static class Patch
     [HarmonyPrefix]
     [HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Refresh), new Type[] { })]
     public static void SetIsPlayingScenario() => isPlayingScenario = true;
+
+    /// <summary>
+    /// Scene-level seam. Evidence (docs/scene-frame-evidence.md): the game reads
+    /// <c>SceneFrameMaster.ConfigurationJson</c> exactly once, in
+    /// <c>ScenarioController+&lt;&gt;c__DisplayClass113_0.&lt;GenerateFrames&gt;b__0</c>, and
+    /// <c>GenerateFrames</c> runs before <c>ScenarioController.Refresh</c>. Rewriting the frame
+    /// documents here is therefore the single write that reaches every consumer.
+    /// </summary>
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.GenerateFrames))]
+    public static void TranslateSceneFrames(ScenarioController __instance, Il2CppReferenceArray<SceneFrameMaster> masters)
+    {
+        var sceneId = __instance.sceneMasterId;
+        if (masters is null || sceneId <= 0)
+            return;
+
+        ScenePendingWork? pending;
+        try
+        {
+            pending = sceneCoordinator.Prepare(masters, sceneId);
+        }
+        catch (Exception exception)
+        {
+            // The frame array belongs to the game; never let translation break scenario loading.
+            Logger.Warn("[LLM][Scene] prepare failed: " + exception.GetType().Name);
+            return;
+        }
+
+        if (pending is { } work)
+            EnqueueSceneRequest(work);
+    }
+
+    /// <summary>
+    /// Sends one whole-scene request and writes the result back. A failure leaves the frame
+    /// documents untouched, so the existing per-string path still translates the rendered text.
+    /// </summary>
+    private static void EnqueueSceneRequest(ScenePendingWork work)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var batch = SceneTranslationBatch.TryCreate(work.SceneId, work.Sources);
+                if (batch is null)
+                    return;
+
+                var client = Plugin.CurrentSceneClient;
+                if (client is null)
+                    return;
+
+                var response = await client.SendSceneAsync(batch).ConfigureAwait(false);
+                if (!batch.TryParseResponse(response, out var translations))
+                {
+                    Logger.Warn(
+                        $"[LLM][Scene] response rejected scene={work.SceneId} targets={batch.TargetCount}");
+                    return;
+                }
+
+                // Register before marking applied: the reverse index is what stops the per-string
+                // path from re-enqueueing these lines once they render.
+                foreach (var pair in translations)
+                    Plugin.CurrentCache?.RememberResolution(pair.Key, pair.Value);
+
+                sceneCoordinator.MarkApplied(work.SceneId, work.Generation);
+                Logger.Info(
+                    $"[LLM][Scene] translated scene={work.SceneId} targets={translations.Count}");
+            }
+            catch (Exception exception)
+            {
+                Logger.Warn("[LLM][Scene] request failed: " + exception.GetType().Name);
+            }
+        });
+    }
 
     [HarmonyPrefix]
     [HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Leave))]
@@ -206,6 +283,7 @@ public static class Patch
         tmpWriteOwnership.ResetForLifecycle();
         tmpProvenance.ResetForLifecycle();
         isPlayingScenario = false;
+        sceneCoordinator.Reset();
         Volatile.Write(ref refreshScanCount, 0);
     }
 
@@ -230,6 +308,15 @@ public static class Patch
                 "Assets.GameUi.Scenario.ScenarioController.Leave",
                 typeof(ScenarioController),
                 nameof(ScenarioController.Leave)),
+            // Scene-level seam: the game consumes ConfigurationJson in GenerateFrames, which runs
+            // before Refresh publishes the frame view models.
+            Spec(
+                "Assets.GameUi.Scenario.ScenarioController.GenerateFrames",
+                typeof(ScenarioController),
+                nameof(ScenarioController.GenerateFrames),
+                typeof(Il2CppReferenceArray<SceneFrameMaster>),
+                typeof(ScenarioController.FunctionFlags),
+                typeof(bool)),
         };
 
     private static PatchPreflightPolicy.PatchTargetSpec Spec(
