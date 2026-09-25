@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using Assets.Api.Client;
 using Assets.GameUi.Scenario;
 using HarmonyLib;
@@ -22,13 +23,31 @@ public static class Patch
     {
         // Clear the previous lifecycle before Harmony can publish any new setter hooks.
         ResetRuntimeState();
+
+        // Pre-install gate: resolve every declared target before Harmony publishes anything, so a
+        // game update that moves a seam aborts the generation instead of installing a partial patch
+        // set whose hooks silently no-op.
+        var preflight = Preflight();
+        if (!preflight.Ok)
+        {
+            throw new HarmonyPatchPreflightException(preflight.Failures);
+        }
+
         harmony.PatchAll(typeof(Patch));
         // Hooks may be installed while the generation is still Loading. Keep their runtime
         // body inert until Plugin publishes Running and activates the complete owner.
-        var verification = VerifyPatches(harmony.Id);
+        var verification = VerifyPatches(harmony.Id, preflight.Targets);
         if (!verification.Succeeded)
             throw new HarmonyPatchVerificationException(verification);
     }
+
+    /// <summary>
+    /// Resolves every declared Harmony target against the loaded game assemblies. The loader calls
+    /// this before any configuration side effect, so a moved seam aborts the generation with all
+    /// resources still unallocated.
+    /// </summary>
+    public static PatchPreflightPolicy.Report Preflight() =>
+        PatchPreflightPolicy.Check(TargetSpecs(), AppDomain.CurrentDomain.GetAssemblies());
 
     public static void Activate()
     {
@@ -195,29 +214,45 @@ public static class Patch
         && !Plugin.IsCleaningUp
         && tmpProvenance.LifecycleEpoch == epoch;
 
-    private static HarmonyPatchVerificationResult VerifyPatches(string harmonyId)
-    {
-        var targets = new[]
+    /// <summary>
+    /// Declared Harmony targets, resolved together with their labels. A game update that removes
+    /// or re-signatures a seam fails preflight before any patch is installed.
+    /// </summary>
+    private static PatchPreflightPolicy.PatchTargetSpec[] TargetSpecs() =>
+        new[]
         {
-            (
-                Label: "TMPro.TMP_Text.set_text",
-                Method: AccessTools.Method(typeof(TMP_Text), "set_text")),
-            (
-                Label: "Assets.GameUi.Scenario.ScenarioController.Refresh",
-                Method: AccessTools.Method(
-                    typeof(ScenarioController),
-                    nameof(ScenarioController.Refresh),
-                    new Type[] { })),
-            (
-                Label: "Assets.GameUi.Scenario.ScenarioController.Leave",
-                Method: AccessTools.Method(typeof(ScenarioController), nameof(ScenarioController.Leave)))
+            Spec("TMPro.TMP_Text.set_text", typeof(TMP_Text), "set_text", typeof(string)),
+            Spec(
+                "Assets.GameUi.Scenario.ScenarioController.Refresh",
+                typeof(ScenarioController),
+                nameof(ScenarioController.Refresh)),
+            Spec(
+                "Assets.GameUi.Scenario.ScenarioController.Leave",
+                typeof(ScenarioController),
+                nameof(ScenarioController.Leave)),
         };
+
+    private static PatchPreflightPolicy.PatchTargetSpec Spec(
+        string label,
+        Type declaringType,
+        string methodName,
+        params Type[] argumentTypes) =>
+        new(
+            nameof(Patch),
+            label,
+            declaringType.FullName ?? declaringType.Name,
+            methodName,
+            argumentTypes.Length == 0 ? null : argumentTypes);
+
+    private static HarmonyPatchVerificationResult VerifyPatches(
+        string harmonyId,
+        IReadOnlyList<MethodBase> targets)
+    {
         var result = HarmonyPatchVerificationPolicy.Verify(
             targets.Select(target => new HarmonyPatchTargetStatus(
-                target.Label,
-                target.Method != null,
-                target.Method != null
-                    && Harmony.GetPatchInfo(target.Method)?.Owners.Contains(harmonyId) == true)));
+                target.DeclaringType?.FullName + "." + target.Name,
+                TargetFound: true,
+                OwnedByHarmony: Harmony.GetPatchInfo(target)?.Owners.Contains(harmonyId) == true)));
         var targetList = string.Join(", ", result.Targets.Select(target => target.Label));
         if (result.Succeeded)
         {

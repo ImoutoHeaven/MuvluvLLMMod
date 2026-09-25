@@ -18,6 +18,9 @@ public sealed class PatchSurfaceTests
         Assert.Contains("DebugLogSeenText", patch, StringComparison.Ordinal);
         Assert.Contains("HarmonyPatchVerificationPolicy.Verify", patch, StringComparison.Ordinal);
         Assert.Contains("HarmonyPatchVerificationException", patch, StringComparison.Ordinal);
+        Assert.Contains("PatchPreflightPolicy.Check", patch, StringComparison.Ordinal);
+        Assert.Contains("HarmonyPatchPreflightException", patch, StringComparison.Ordinal);
+        Assert.Contains("Patch.Preflight()", ReadProductionSource("Plugin.cs"), StringComparison.Ordinal);
         Assert.Contains(
             "[HarmonyPrefix]\n    [HarmonyPatch(typeof(TMP_Text), \"set_text\")]",
             patch,
@@ -128,20 +131,40 @@ public sealed class PatchSurfaceTests
     {
         var patch = ReadProductionSource("Patch.cs");
         var initialize = patch.IndexOf("public static void Initialize", StringComparison.Ordinal);
-        var verification = patch.IndexOf("var verification = VerifyPatches(harmony.Id)", initialize, StringComparison.Ordinal);
+        var preflightCall = patch.IndexOf("var preflight = Preflight();", initialize, StringComparison.Ordinal);
+        var preflightFailure = patch.IndexOf("if (!preflight.Ok)", preflightCall, StringComparison.Ordinal);
+        var throwPreflight = patch.IndexOf("throw new HarmonyPatchPreflightException", preflightFailure, StringComparison.Ordinal);
+        var patchAll = patch.IndexOf("harmony.PatchAll(typeof(Patch))", initialize, StringComparison.Ordinal);
+        var verification = patch.IndexOf("var verification = VerifyPatches(harmony.Id, preflight.Targets)", initialize, StringComparison.Ordinal);
         var failure = patch.IndexOf("if (!verification.Succeeded)", verification, StringComparison.Ordinal);
         var throwFailure = patch.IndexOf("throw new HarmonyPatchVerificationException(verification)", failure, StringComparison.Ordinal);
 
+        Assert.True(initialize >= 0);
+        // Targets resolve before any Harmony install, and ownership is checked after it.
+        Assert.True(preflightCall > initialize);
+        Assert.True(preflightFailure > preflightCall);
+        Assert.True(throwPreflight > preflightFailure);
+        Assert.True(patchAll > throwPreflight);
+        Assert.True(verification > patchAll);
+        Assert.True(failure > verification);
+        Assert.True(throwFailure > failure);
+
+        // The loader runs the precheck before any configuration side effect, so a moved seam
+        // aborts the generation with nothing allocated.
         var plugin = ReadProductionSource("Plugin.cs");
+        var loaderPreflight = plugin.IndexOf("var preflight = Patch.Preflight();", StringComparison.Ordinal);
+        var loaderFailure = plugin.IndexOf("if (!preflight.Ok)", loaderPreflight, StringComparison.Ordinal);
+        var loaderThrow = plugin.IndexOf("throw new HarmonyPatchPreflightException", loaderFailure, StringComparison.Ordinal);
+        var configuration = plugin.IndexOf("Config.Initialize(base.Config, generation)", StringComparison.Ordinal);
         var patchCall = plugin.IndexOf("Patch.Initialize(harmony)", StringComparison.Ordinal);
         var hotkey = plugin.IndexOf("hotkey = AddComponent<Hotkey>()", patchCall, StringComparison.Ordinal);
         var persistence = plugin.IndexOf("RunPersistenceLoopAsync", patchCall, StringComparison.Ordinal);
         var machine = plugin.IndexOf("machineLifecycle.Initialize", patchCall, StringComparison.Ordinal);
 
-        Assert.True(initialize >= 0);
-        Assert.True(verification > initialize);
-        Assert.True(failure > verification);
-        Assert.True(throwFailure > failure);
+        Assert.True(loaderPreflight >= 0);
+        Assert.True(loaderFailure > loaderPreflight);
+        Assert.True(loaderThrow > loaderFailure);
+        Assert.True(configuration > loaderThrow);
         Assert.True(patchCall >= 0);
         Assert.True(hotkey > patchCall);
         Assert.True(persistence > patchCall);

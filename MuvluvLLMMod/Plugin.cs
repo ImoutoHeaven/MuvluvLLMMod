@@ -128,6 +128,17 @@ public sealed class Plugin : BasePlugin
 
             using (var stage = RequireLoadStage(generation))
             {
+                // Precheck before any configuration side effect or resource allocation: a game update
+                // that moved a patch seam must abort the generation with nothing to roll back.
+                var preflight = Patch.Preflight();
+                if (!preflight.Ok)
+                {
+                    foreach (var failure in preflight.Failures)
+                        SafeError("[LLM] precheck " + failure);
+
+                    throw new HarmonyPatchPreflightException(preflight.Failures);
+                }
+
                 using var configurationResource = stage.RegisterResource(
                     "configuration initialization",
                     () => MuvluvLLMMod.Config.Shutdown(),
