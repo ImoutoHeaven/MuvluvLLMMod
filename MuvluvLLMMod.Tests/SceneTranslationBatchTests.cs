@@ -57,11 +57,15 @@ public sealed class SceneTranslationBatchTests
     {
         var batch = Create("こんにちは", "こんにちは");
 
-        var translations = Accepted(
-            batch,
-            Response(SceneId, Entry("t0000", "こんにちは"), Entry("t0001", "你好")));
+        // An invalid first occurrence does not block a valid later one...
+        Assert.Equal(
+            "你好",
+            Accepted(batch, Response(SceneId, Entry("t0000", "こんにちは"), Entry("t0001", "你好")))["こんにちは"]);
 
-        Assert.Equal("你好", translations["こんにちは"]);
+        // ...and between two valid ones the first wins.
+        Assert.Equal(
+            "你好",
+            Accepted(batch, Response(SceneId, Entry("t0000", "你好"), Entry("t0001", "您好")))["こんにちは"]);
     }
 
     [Fact]

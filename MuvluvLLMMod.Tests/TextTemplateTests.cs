@@ -118,6 +118,21 @@ public sealed class TextTemplateTests
     }
 
     [Fact]
+    public void Protected_llm_text_protects_percent_placeholders_without_catching_percent_signs()
+    {
+        var player = TextTemplate.ProtectForLlm("%usernameusernameuserna%さん");
+        Assert.Equal("__MLM_FMT_0__さん", player.Prompt);
+        Assert.False(TextTemplate.TryRestoreLlm("%usernameusernameuserna%先生", player, out _));
+
+        // Percent signs around protected tokens are prose, not an unprotected %name% placeholder.
+        var template = TextTemplate.Normalize("10%\n20%アップ").Template;
+        var percent = TextTemplate.ProtectForLlm(template);
+        Assert.Equal("__MLM_FMT_0__%__MLM_FMT_1____MLM_FMT_2__%アップ", percent.Prompt);
+        Assert.True(TextTemplate.TryRestoreLlm("__MLM_FMT_0__%__MLM_FMT_1____MLM_FMT_2__%提升", percent, out var restored));
+        Assert.Equal("{0}%\n{1}%提升", restored);
+    }
+
+    [Fact]
     public void Protected_llm_text_preserves_literal_escaped_line_breaks()
     {
         const string source = "<size=24>一行\\n二行\\r\\n三行{0}</size>";

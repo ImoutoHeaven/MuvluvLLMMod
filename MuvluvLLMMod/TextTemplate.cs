@@ -157,7 +157,8 @@ public static class TextTemplate
         restored = string.Empty;
         if (!TranslationBudget.IsTextWithinBudget(response)
             || !TranslationBudget.IsTextWithinBudget(protectedText.Prompt)
-            || FormatToken.IsMatch(response)) return false;
+            // Masked so a %name% match cannot span two tokens, as in "%__MLM_FMT_1__%".
+            || FormatToken.IsMatch(ProtectedToken.Replace(response, "\u0001"))) return false;
         if (!protectedText.Tokens.SequenceEqual(
                 ProtectedToken.Matches(response).Select(match => match.Value),
                 StringComparer.Ordinal)) return false;

@@ -42,10 +42,11 @@ public static class TranslationBudget
 
     /// <summary>
     /// A whole-scene request is one larger payload rather than one line. Measured against the
-    /// shipping corpus (1056 scenes), scene prompts run to about 15k UTF-16 units at the maximum
-    /// and 9k at the ninetieth percentile, so the per-string ceiling would reject most scenes.
+    /// shipping corpus (1056 scenes), a protected scene prompt with every line and its speaker name
+    /// runs to 19,370 UTF-16 units and 33,836 UTF-8 bytes at the maximum, so the per-string
+    /// ceiling would reject most scenes.
     /// </summary>
-    public const int MaxSceneUtf16CodeUnits = 16 * 1024;
+    public const int MaxSceneUtf16CodeUnits = 24 * 1024;
     public const int MaxSceneUtf8Bytes = 48 * 1024;
 
     public const int MaxCacheFileBytes = 8 * 1024 * 1024;
