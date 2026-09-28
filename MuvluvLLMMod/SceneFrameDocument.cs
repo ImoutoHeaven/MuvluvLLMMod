@@ -17,7 +17,8 @@ namespace MuvluvLLMMod;
 /// a second pass.
 ///
 /// The document is edited as a JSON tree so unrelated fields survive byte-for-byte in meaning;
-/// only <c>configuration.Phrase.Text</c> is replaced.
+/// only <c>configuration.Phrase.Text</c> is replaced. <c>Phrase.SpeakerName</c> is read as context
+/// for the model and never rewritten.
 ///
 /// Pure logic: no game or Harmony types, so the loader-free test project covers it.
 /// </summary>
@@ -29,6 +30,7 @@ public static class SceneFrameDocument
     // JsonConvert.DeserializeObject<ScenarioConfiguration>.
     private const string PhraseProperty = "Phrase";
     private const string TextProperty = "Text";
+    private const string SpeakerProperty = "SpeakerName";
 
     // The game deserializes this document with Newtonsoft.Json, which leaves non-ASCII and markup
     // literal. Matching that keeps the rewritten document compact and its ruby tags readable.
@@ -38,33 +40,36 @@ public static class SceneFrameDocument
     };
 
     /// <summary>
-    /// Extracts every dialogue text in the document that is a translation candidate. Returns an
-    /// empty list when the document is absent, unparsable, or carries no candidates.
+    /// Extracts every dialogue line in the document that is a translation candidate, with its
+    /// speaker name (null for narration). Returns an empty list when the document is absent,
+    /// unparsable, or carries no candidates.
     /// </summary>
-    public static IReadOnlyList<string> CollectTexts(string? configurationJson)
+    public static IReadOnlyList<SceneDialogueLine> CollectLines(string? configurationJson)
     {
-        var texts = new List<string>();
+        var lines = new List<SceneDialogueLine>();
         foreach (var phrase in EnumeratePhrases(configurationJson))
         {
-            if (phrase[TextProperty] is not JsonValue value)
-                continue;
-
-            string? text;
-            try
-            {
-                text = value.GetValue<string>();
-            }
-            catch (InvalidOperationException)
-            {
-                // A non-string Text is left untouched rather than coerced.
-                continue;
-            }
-
-            if (TextTemplate.IsTranslationCandidate(text))
-                texts.Add(text);
+            var text = ReadString(phrase[TextProperty]);
+            if (text is not null && TextTemplate.IsTranslationCandidate(text))
+                lines.Add(new SceneDialogueLine(text, ReadString(phrase[SpeakerProperty])));
         }
 
-        return texts;
+        return lines;
+    }
+
+    // A non-string value is left untouched rather than coerced.
+    private static string? ReadString(JsonNode? node)
+    {
+        if (node is not JsonValue value)
+            return null;
+        try
+        {
+            return value.GetValue<string>();
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -118,37 +123,6 @@ public static class SceneFrameDocument
         return changed ? document.ToJsonString(WriteOptions) : null;
     }
 
-    /// <summary>
-    /// A stable identifier for a specific set of frame documents. Used to recognize a scene that
-    /// has already been translated: identical documents produce the same value, and any change to
-    /// any document produces a different one. Computed before rewriting, so the identity reflects
-    /// the text as the game fetched it.
-    /// </summary>
-    public static long Fingerprint(IEnumerable<string?> documents)
-    {
-        // FNV-1a: arithmetic only, so the value is stable for the lifetime of the process.
-        const ulong offset = 14695981039346656037UL;
-        const ulong prime = 1099511628211UL;
-
-        var hash = offset;
-        foreach (var document in documents)
-        {
-            if (document is not null)
-            {
-                foreach (var character in document)
-                {
-                    hash ^= character;
-                    hash *= prime;
-                }
-            }
-
-            hash ^= 0xFFFF;
-            hash *= prime;
-        }
-
-        return unchecked((long)hash);
-    }
-
     private static IEnumerable<JsonObject> EnumeratePhrases(string? configurationJson)
     {
         if (string.IsNullOrEmpty(configurationJson))
@@ -169,3 +143,6 @@ public static class SceneFrameDocument
             yield return phrase;
     }
 }
+
+/// <summary>One dialogue line of a scene: its text and the displayed speaker name, if any.</summary>
+public readonly record struct SceneDialogueLine(string Text, string? Speaker);

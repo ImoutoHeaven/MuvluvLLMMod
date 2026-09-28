@@ -30,10 +30,10 @@ public sealed class ReadmeSurfaceTests
             Assert.DoesNotContain(forbidden, readme, StringComparison.OrdinalIgnoreCase);
         }
 
-        // Scene translation is documented as a second, bounded route with all-or-nothing validation.
+        // Scene translation is documented as a second, bounded route with per-line validation.
         Assert.Contains("Scene translation", readme, StringComparison.Ordinal);
-        Assert.Contains("all-or-nothing", readme, StringComparison.Ordinal);
-        Assert.Contains("never published half-translated", readme, StringComparison.Ordinal);
+        Assert.Contains("per line within a checked structure", readme, StringComparison.Ordinal);
+        Assert.Contains("stays on the per-string path", readme, StringComparison.Ordinal);
         Assert.Contains("docs/scene-frame-evidence.md", readme, StringComparison.Ordinal);
 
         Assert.Contains("kana-free incoming text is not queued", readme, StringComparison.Ordinal);

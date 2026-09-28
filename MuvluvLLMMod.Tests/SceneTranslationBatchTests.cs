@@ -1,33 +1,39 @@
+using System.Text.Json.Nodes;
 using Xunit;
 
 namespace MuvluvLLMMod.Tests;
 
 /// <summary>
-/// Whole-scene batch protocol. The contract under test is all-or-nothing: any structural or
-/// per-target defect must reject the entire scene so the caller can fall back to the per-string
-/// path instead of publishing a partially translated scene.
+/// Whole-scene batch protocol. A structural defect rejects the batch, because entries can no
+/// longer be matched to lines. A defect in one entry drops only that entry, so the rest of the
+/// scene is kept and the dropped line stays on the per-string path.
 /// </summary>
 public sealed class SceneTranslationBatchTests
 {
     private const long SceneId = 40003301;
 
     private static SceneTranslationBatch Create(params string[] sources) =>
-        SceneTranslationBatch.TryCreate(SceneId, sources)!;
+        SceneTranslationBatch.TryCreate(SceneId, sources.Select(source => new SceneDialogueLine(source, null)))!;
 
-    private static string Response(long sceneId, params string[] entries)
-    {
-        var items = entries.Select(entry => entry).ToArray();
-        return "{\"version\":1,\"sceneId\":" + sceneId
-            + ",\"translations\":[" + string.Join(",", items) + "]}";
-    }
+    private static string Response(long sceneId, params string[] entries) =>
+        "{\"version\":1,\"sceneId\":" + sceneId
+        + ",\"translations\":[" + string.Join(",", entries) + "]}";
 
     private static string Entry(string id, string text) =>
         "{\"id\":\"" + id + "\",\"text\":\"" + text + "\"}";
 
+    private static IReadOnlyDictionary<string, string> Accepted(SceneTranslationBatch batch, string response)
+    {
+        Assert.True(batch.TryParseResponse(response, out var translations));
+        return translations;
+    }
+
     [Fact]
     public void TryCreate_returns_null_when_nothing_is_a_candidate()
     {
-        Assert.Null(SceneTranslationBatch.TryCreate(SceneId, new[] { "hello", string.Empty }));
+        Assert.Null(SceneTranslationBatch.TryCreate(
+            SceneId,
+            new[] { new SceneDialogueLine("hello", null), new SceneDialogueLine(string.Empty, null) }));
     }
 
     [Fact]
@@ -67,6 +73,24 @@ public sealed class SceneTranslationBatchTests
     }
 
     [Fact]
+    public void Prompt_carries_each_speaker_name_in_story_order()
+    {
+        var batch = SceneTranslationBatch.TryCreate(SceneId, new[]
+        {
+            new SceneDialogueLine("まさか……", "威厳のある女性"),
+            new SceneDialogueLine("最後の言葉が、震える。", null),
+            new SceneDialogueLine("すまない。", "？？？"),
+        })!;
+
+        var targets = JsonNode.Parse(batch.Prompt)!["targets"]!.AsArray();
+        Assert.Equal(3, targets.Count);
+        Assert.Equal("威厳のある女性", targets[0]!["name"]!.GetValue<string>());
+        Assert.Null(targets[1]!["name"]);
+        Assert.Equal("？？？", targets[2]!["name"]!.GetValue<string>());
+        Assert.Equal("すまない。", targets[2]!["source"]!.GetValue<string>());
+    }
+
+    [Fact]
     public void Prompt_protects_markup_and_line_breaks()
     {
         // A ruby line and a break must both become protected tokens before the model sees them.
@@ -77,15 +101,28 @@ public sealed class SceneTranslationBatchTests
     }
 
     [Fact]
+    public void Targets_are_normalized_templates()
+    {
+        // Numbers become placeholders exactly as on the per-string path, so the stored generated
+        // template serves every rendering of the line.
+        var batch = Create("あと3分です");
+
+        var translations = Accepted(
+            batch,
+            Response(SceneId, Entry("t0000", "还有__MLM_FMT_0__分钟")));
+
+        Assert.Equal("还有{0}分钟", translations["あと{0}分です"]);
+    }
+
+    [Fact]
     public void TryParseResponse_maps_each_target_to_its_translation()
     {
         var batch = Create("こんにちは", "さようなら");
 
-        var ok = batch.TryParseResponse(
-            Response(SceneId, Entry("t0000", "你好"), Entry("t0001", "再见")),
-            out var translations);
+        var translations = Accepted(
+            batch,
+            Response(SceneId, Entry("t0000", "你好"), Entry("t0001", "再见")));
 
-        Assert.True(ok);
         Assert.Equal("你好", translations["こんにちは"]);
         Assert.Equal("再见", translations["さようなら"]);
     }
@@ -96,8 +133,23 @@ public sealed class SceneTranslationBatchTests
         var batch = Create("こんにちは");
         var body = "```json\n" + Response(SceneId, Entry("t0000", "你好")) + "\n```";
 
-        Assert.True(batch.TryParseResponse(body, out var translations));
+        Assert.Equal("你好", Accepted(batch, body)["こんにちは"]);
+    }
+
+    [Fact]
+    public void TryParseResponse_keeps_valid_entries_when_one_entry_is_invalid()
+    {
+        var batch = Create("こんにちは", "<r=ダイブ>潜航</r>を開始せよ", "さようなら");
+
+        // The middle entry drops its ruby tokens; only that line is left to the per-string path.
+        var translations = Accepted(
+            batch,
+            Response(SceneId, Entry("t0000", "你好"), Entry("t0001", "开始潜航"), Entry("t0002", "再见")));
+
+        Assert.Equal(2, translations.Count);
         Assert.Equal("你好", translations["こんにちは"]);
+        Assert.Equal("再见", translations["さようなら"]);
+        Assert.False(translations.ContainsKey("<r=ダイブ>潜航</r>を開始せよ"));
     }
 
     [Fact]
@@ -161,34 +213,35 @@ public sealed class SceneTranslationBatchTests
     }
 
     [Fact]
-    public void TryParseResponse_rejects_an_empty_translation()
+    public void TryParseResponse_rejects_a_null_entry()
     {
         var batch = Create("こんにちは");
 
-        Assert.False(batch.TryParseResponse(Response(SceneId, Entry("t0000", "   ")), out _));
+        Assert.False(batch.TryParseResponse(Response(SceneId, "null"), out _));
     }
 
     [Fact]
-    public void TryParseResponse_rejects_a_dropped_protected_token()
+    public void TryParseResponse_drops_an_empty_translation()
+    {
+        Assert.Empty(Accepted(Create("こんにちは"), Response(SceneId, Entry("t0000", "   "))));
+    }
+
+    [Fact]
+    public void TryParseResponse_drops_a_dropped_protected_token()
     {
         // The source carries a ruby tag; losing it would corrupt the rendered line.
         var batch = Create("<r=ダイブ>潜航</r>を開始せよ");
 
-        Assert.False(
-            batch.TryParseResponse(Response(SceneId, Entry("t0000", "开始潜航")), out _));
+        Assert.Empty(Accepted(batch, Response(SceneId, Entry("t0000", "开始潜航"))));
     }
 
     [Fact]
-    public void TryParseResponse_rejects_a_reordered_protected_token()
+    public void TryParseResponse_drops_a_reordered_protected_token()
     {
         // Ruby readings are katakana, so this source is a candidate; the tags become tokens.
         var batch = Create("前<r=あ>甲</r>後<r=い>乙</r>");
 
-        // Tokens present but in the wrong order must not be accepted.
-        Assert.False(
-            batch.TryParseResponse(
-                Response(SceneId, Entry("t0000", "后__MLM_FMT_1__后__MLM_FMT_0__")),
-                out _));
+        Assert.Empty(Accepted(batch, Response(SceneId, Entry("t0000", "后__MLM_FMT_1__后__MLM_FMT_0__"))));
     }
 
     [Fact]
@@ -196,20 +249,17 @@ public sealed class SceneTranslationBatchTests
     {
         var batch = Create("潜航<r=ダイブ>開始</r>");
 
-        var ok = batch.TryParseResponse(
-            Response(SceneId, Entry("t0000", "开始__MLM_FMT_0____MLM_FMT_1__")),
-            out var translations);
+        var translations = Accepted(
+            batch,
+            Response(SceneId, Entry("t0000", "开始__MLM_FMT_0____MLM_FMT_1__")));
 
-        Assert.True(ok);
         Assert.Contains("<r=ダイブ>", translations["潜航<r=ダイブ>開始</r>"], StringComparison.Ordinal);
     }
 
     [Fact]
-    public void TryParseResponse_rejects_an_identity_translation()
+    public void TryParseResponse_drops_an_identity_translation()
     {
-        var batch = Create("こんにちは");
-
-        Assert.False(batch.TryParseResponse(Response(SceneId, Entry("t0000", "こんにちは")), out _));
+        Assert.Empty(Accepted(Create("こんにちは"), Response(SceneId, Entry("t0000", "こんにちは"))));
     }
 
     [Fact]
@@ -223,11 +273,38 @@ public sealed class SceneTranslationBatchTests
     }
 
     [Fact]
-    public void TryParseResponse_rejects_a_dropped_line_break()
+    public void TryParseResponse_drops_a_dropped_line_break()
     {
-        var batch = Create("いち\nに");
+        Assert.Empty(Accepted(Create("いち\nに"), Response(SceneId, Entry("t0000", "一二"))));
+    }
 
-        Assert.False(
-            batch.TryParseResponse(Response(SceneId, Entry("t0000", "一二")), out _));
+    [Fact]
+    public void An_accepted_template_resolves_the_rendered_source()
+    {
+        // Scene results must land where the per-string path looks them up; storing them anywhere
+        // else leaves every rendered line untranslated.
+        var root = Path.Combine(Path.GetTempPath(), "mlm-scene-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var cache = new TranslationCache(root);
+            var resolver = new TranslationResolver(cache, _ => { }, _ => { });
+            var batch = Create("あと3分です", "こんにちは");
+
+            var translations = Accepted(
+                batch,
+                Response(SceneId, Entry("t0000", "还有__MLM_FMT_0__分钟"), Entry("t0001", "你好")));
+            foreach (var pair in translations)
+                Assert.True(cache.StoreGenerated(pair.Key, pair.Value));
+
+            Assert.Equal("还有3分钟", resolver.Lookup("あと3分です"));
+            Assert.Equal("还有7分钟", resolver.Lookup("あと7分です"));
+            Assert.Equal("你好", resolver.Lookup("こんにちは"));
+            Assert.True(cache.IsKnownTranslatedValue("你好"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, true);
+        }
     }
 }

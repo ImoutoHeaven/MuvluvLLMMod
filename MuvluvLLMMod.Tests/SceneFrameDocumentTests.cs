@@ -16,22 +16,33 @@ public sealed class SceneFrameDocumentTests
     private static string Wrapped(string inner) => inner;
 
     [Fact]
-    public void CollectTexts_returns_kana_dialogue_in_order()
+    public void CollectLines_returns_kana_dialogue_with_its_speaker()
     {
-        var texts = SceneFrameDocument.CollectTexts(Wrapped(Document("こんにちは")));
+        var lines = SceneFrameDocument.CollectLines(Wrapped(Document("こんにちは")));
 
-        Assert.Single(texts);
-        Assert.Equal("こんにちは", texts[0]);
+        Assert.Equal(new[] { new SceneDialogueLine("こんにちは", "威厳のある女性") }, lines);
     }
 
     [Fact]
-    public void CollectTexts_skips_non_candidates_and_broken_documents()
+    public void CollectLines_reports_narration_without_a_speaker()
     {
-        Assert.Empty(SceneFrameDocument.CollectTexts(Wrapped(Document("hello"))));
-        Assert.Empty(SceneFrameDocument.CollectTexts("{not json"));
-        Assert.Empty(SceneFrameDocument.CollectTexts(null));
-        Assert.Empty(SceneFrameDocument.CollectTexts(""));
-        Assert.Empty(SceneFrameDocument.CollectTexts("[]"));
+        // Narration frames carry no SpeakerName at all; a null or non-string one is the same.
+        Assert.Equal(
+            new[] { new SceneDialogueLine("最後の言葉が、震える。", null) },
+            SceneFrameDocument.CollectLines("{\"Phrase\":{\"Text\":\"最後の言葉が、震える。\"}}"));
+        Assert.Null(SceneFrameDocument.CollectLines("{\"Phrase\":{\"Text\":\"はい\",\"SpeakerName\":null}}")[0].Speaker);
+        Assert.Null(SceneFrameDocument.CollectLines("{\"Phrase\":{\"Text\":\"はい\",\"SpeakerName\":3}}")[0].Speaker);
+    }
+
+    [Fact]
+    public void CollectLines_skips_non_candidates_and_broken_documents()
+    {
+        Assert.Empty(SceneFrameDocument.CollectLines(Wrapped(Document("hello"))));
+        Assert.Empty(SceneFrameDocument.CollectLines("{\"Phrase\":{\"Text\":3}}"));
+        Assert.Empty(SceneFrameDocument.CollectLines("{not json"));
+        Assert.Empty(SceneFrameDocument.CollectLines(null));
+        Assert.Empty(SceneFrameDocument.CollectLines(""));
+        Assert.Empty(SceneFrameDocument.CollectLines("[]"));
     }
 
     [Fact]
@@ -101,6 +112,6 @@ public sealed class SceneFrameDocumentTests
         Assert.Contains("<r=ダイブ>潜航</r>", rewritten, StringComparison.Ordinal);
 
         // The rewritten document must still expose the same source text for reverse lookup.
-        Assert.Equal(new[] { "<r=ダイブ>潜航</r>，开始！" }, SceneFrameDocument.CollectTexts(rewritten));
+        Assert.Equal("<r=ダイブ>潜航</r>，开始！", SceneFrameDocument.CollectLines(rewritten).Single().Text);
     }
 }

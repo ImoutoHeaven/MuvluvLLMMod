@@ -41,12 +41,6 @@ public static class TranslationBudget
     public const int MaxTransitions = 16;
 
     /// <summary>
-    /// Scene-level rewrite markers. Scenes are far fewer than strings, so this is deliberately
-    /// small next to the text budgets above.
-    /// </summary>
-    public const int MaxAppliedSceneEntries = 512;
-
-    /// <summary>
     /// A whole-scene request is one larger payload rather than one line. Measured against the
     /// shipping corpus (1056 scenes), scene prompts run to about 15k UTF-16 units at the maximum
     /// and 9k at the ninetieth percentile, so the per-string ceiling would reject most scenes.

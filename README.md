@@ -38,21 +38,25 @@ Prefix, so builder output and other data sources are covered once they reach tha
 ## Scene translation
 
 Scenario dialogue has a second route. A scene's frame documents are rewritten before the game
-consumes them, so one request covers the whole scene and the model sees every line in order. That is
-what keeps a speaker's tone, honorifics, and terminology consistent within a scene, and it turns
-roughly seventy requests per scene into one.
+consumes them, so one request covers the whole scene and the model sees every line in order with its
+speaker name. That is what keeps a speaker's tone, honorifics, and terminology consistent within a
+scene. Accepted lines are stored in the same generated-template cache as per-string results: lines
+still on screen pick them up at the next refresh, and every later entry of the scene applies them
+to the frame documents with no request.
 
 Evidence for the seam is recorded in [`docs/scene-frame-evidence.md`](docs/scene-frame-evidence.md):
 the game reads `SceneFrameMaster.ConfigurationJson` exactly once, and the frame factory runs before
 `Refresh` publishes the frame view models.
 
-Only dialogue `Text` is batched. Speaker and team names are few and highly repetitive, so the
-per-string path already translates each of them once.
+Only dialogue `Text` is translated in the batch. Each line carries its `SpeakerName` as context
+(null for narration); speaker and team names themselves are translated once each by the per-string
+path.
 
-Validation of a scene response is all-or-nothing. The response must echo the protocol version and
-scene id, carry exactly one entry per target in the same order, and restore to the exact protected
-token sequence with matching markup. Any mismatch rejects the whole scene, and the dialogue is then
-translated by the per-string path instead. A scene is never published half-translated.
+Validation of a scene response is per line within a checked structure. The response must echo the
+protocol version and scene id and carry exactly one entry per target, in order, with matching ids;
+otherwise the whole response is discarded. Each entry is then accepted only when it restores to the
+exact protected token sequence with matching placeholders and markup, and is not the source itself.
+A line that fails is dropped and stays on the per-string path, while the rest of the scene is kept.
 
 The scene route shares the bounded text, request, and cache budgets with the rest of the plugin; a
 scene payload has its own ceiling because one scene is larger than one line. `__MLM_FMT_n__` tokens,

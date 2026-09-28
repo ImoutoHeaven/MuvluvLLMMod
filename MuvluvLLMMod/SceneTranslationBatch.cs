@@ -6,16 +6,20 @@ namespace MuvluvLLMMod;
 /// <summary>
 /// Scene-level batch translation for one scene.
 ///
-/// A scene is sent as one request so the model sees every line in order, which is what keeps
-/// speaker tone and terminology consistent across the scene. Only dialogue <c>Text</c> is
-/// batched: speaker and team names are few and highly repetitive, so the per-string cache
-/// already translates each of them once.
+/// A scene is sent as one request so the model sees every line in order, with each line's speaker
+/// name, which is what keeps speaker tone, forms of address, and terminology consistent across the
+/// scene. Only dialogue <c>Text</c> is translated; speaker names are context and stay on the
+/// per-string path.
 ///
-/// Validation is deliberately all-or-nothing. The batch is accepted only when the response
-/// echoes the protocol version and scene id, carries exactly one entry per target in the same
-/// order, and every entry is non-empty and restores to its exact protected token sequence with
-/// matching markup. A single bad entry rejects the whole scene, and the caller falls back to the
-/// per-string path rather than publishing a partial scene.
+/// Targets are normalized templates, the same unit the per-string path translates and caches, so an
+/// accepted line is stored as a generated template and every consumer resolves it identically.
+///
+/// Validation has two levels. The response structure must echo the protocol version and scene id
+/// and carry exactly one entry per target, in order, with matching ids; otherwise the whole batch
+/// is rejected, because entries can no longer be matched to lines. Within a valid structure each
+/// entry is checked on its own: a non-empty translation that restores to its exact protected token
+/// sequence with matching placeholders and markup is accepted, and any other entry is dropped so
+/// that line stays on the per-string path.
 ///
 /// Pure logic: no Harmony, no Unity, and no game types, so the loader-free test project covers it.
 /// </summary>
@@ -47,26 +51,29 @@ public sealed class SceneTranslationBatch
     public int TargetCount => targets.Count;
 
     /// <summary>
-    /// Builds a batch from the scene's dialogue sources. Returns null when the scene holds nothing
-    /// translatable, or when the payload would exceed the bounded prompt budget.
+    /// Builds a batch from the scene's dialogue lines in story order. Returns null when the scene
+    /// holds nothing translatable, or when the payload would exceed the bounded prompt budget.
     /// </summary>
-    public static SceneTranslationBatch? TryCreate(long sceneId, IEnumerable<string> sources)
+    public static SceneTranslationBatch? TryCreate(long sceneId, IEnumerable<SceneDialogueLine> lines)
     {
         var states = new List<TargetState>();
-        var idByTemplate = new Dictionary<string, string>(StringComparer.Ordinal);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (var source in sources)
+        foreach (var line in lines)
         {
-            if (!TextTemplate.IsTranslationCandidate(source))
+            if (!TextTemplate.IsTranslationCandidate(line.Text))
                 continue;
 
-            var protectedText = TextTemplate.ProtectForLlm(source);
-            if (string.IsNullOrEmpty(protectedText.Prompt)
-                || idByTemplate.ContainsKey(protectedText.Prompt))
+            var template = TextTemplate.Normalize(line.Text).Template;
+            var protectedText = TextTemplate.ProtectForLlm(template);
+            if (string.IsNullOrEmpty(protectedText.Prompt) || !seen.Add(template))
                 continue;
 
-            idByTemplate.Add(protectedText.Prompt, "t" + states.Count.ToString("D4"));
-            states.Add(new TargetState(idByTemplate[protectedText.Prompt], source, protectedText));
+            states.Add(new TargetState(
+                "t" + states.Count.ToString("D4"),
+                template,
+                string.IsNullOrEmpty(line.Speaker) ? null : line.Speaker,
+                protectedText));
         }
 
         if (states.Count == 0)
@@ -81,6 +88,7 @@ public sealed class SceneTranslationBatch
                     .Select(state => new SceneTargetPayload
                     {
                         Id = state.Id,
+                        Name = state.Speaker,
                         Source = state.ProtectedText.Prompt,
                     })
                     .ToList(),
@@ -93,10 +101,8 @@ public sealed class SceneTranslationBatch
     }
 
     /// <summary>
-    /// Validates a response against this batch and yields source-to-translation pairs. Every
-    /// target must appear exactly once, in order, with the same id, carrying non-empty text whose
-    /// token sequence restores exactly and whose markup matches the source. Any mismatch fails
-    /// the whole scene.
+    /// Validates a response against this batch and yields template-to-translated-template pairs
+    /// for the entries that passed. Returns false only when the structure does not match.
     /// </summary>
     public bool TryParseResponse(string? response, out IReadOnlyDictionary<string, string> translations)
     {
@@ -126,32 +132,31 @@ public sealed class SceneTranslationBatch
             || document.Translations.Count != targets.Count)
             return false;
 
+        // Order and identity are checked so a missing, duplicated, or reordered entry rejects the
+        // batch instead of shifting translations onto the wrong lines.
+        for (var index = 0; index < targets.Count; index++)
+        {
+            if (document.Translations[index] is not { } entry
+                || !string.Equals(entry.Id, targets[index].Id, StringComparison.Ordinal))
+                return false;
+        }
+
         var parsed = new Dictionary<string, string>(StringComparer.Ordinal);
         for (var index = 0; index < targets.Count; index++)
         {
             var expected = targets[index];
-            var actual = document.Translations[index];
+            var text = document.Translations[index]!.Text;
 
-            // Order and identity are checked so a missing, duplicated, or reordered entry fails the
-            // whole scene instead of shifting translations onto the wrong lines.
-            // Do not trim: a leading or trailing line break is meaningful scene text, and
-            // trimming it would desynchronize the rest of the protection checks. Whitespace the
-            // model adds around the value is caught by the markup comparison below.
-            if (actual is null
-                || !string.Equals(actual.Id, expected.Id, StringComparison.Ordinal)
-                || string.IsNullOrWhiteSpace(actual.Text))
-                return false;
-
-            if (!TextTemplate.TryRestoreLlm(actual.Text, expected.ProtectedText, out var translated))
-                return false;
-
-            if (string.IsNullOrEmpty(translated)
-                || string.Equals(translated, expected.Source, StringComparison.Ordinal)
-                || !TextTemplate.HasSamePlaceholders(expected.Source, translated)
-                || !TextTemplate.HasSameMarkup(expected.Source, translated))
-                return false;
-
-            parsed[expected.Source] = translated;
+            // Do not trim: a leading or trailing line break is meaningful scene text, and trimming
+            // it would desynchronize the protection checks. Whitespace the model adds around the
+            // value is caught by the markup comparison below.
+            if (!string.IsNullOrWhiteSpace(text)
+                && TextTemplate.TryRestoreLlm(text, expected.ProtectedText, out var translated)
+                && !string.IsNullOrEmpty(translated)
+                && !string.Equals(translated, expected.Template, StringComparison.Ordinal)
+                && TextTemplate.HasSamePlaceholders(expected.Template, translated)
+                && TextTemplate.HasSameMarkup(expected.Template, translated))
+                parsed[expected.Template] = translated;
         }
 
         translations = parsed;
@@ -174,7 +179,7 @@ public sealed class SceneTranslationBatch
             : trimmed;
     }
 
-    private sealed record TargetState(string Id, string Source, LlmProtectedText ProtectedText);
+    private sealed record TargetState(string Id, string Template, string? Speaker, LlmProtectedText ProtectedText);
 
     private sealed class SceneRequestPayload
     {
@@ -186,6 +191,7 @@ public sealed class SceneTranslationBatch
     private sealed class SceneTargetPayload
     {
         public string Id { get; set; } = string.Empty;
+        public string? Name { get; set; }
         public string Source { get; set; } = string.Empty;
     }
 
@@ -193,7 +199,7 @@ public sealed class SceneTranslationBatch
     {
         public int Version { get; set; }
         public long SceneId { get; set; }
-        public List<SceneTranslationEntry>? Translations { get; set; }
+        public List<SceneTranslationEntry?>? Translations { get; set; }
     }
 
     private sealed class SceneTranslationEntry

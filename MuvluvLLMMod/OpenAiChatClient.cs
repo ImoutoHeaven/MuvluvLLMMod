@@ -37,12 +37,16 @@ public sealed class OpenAiChatClient
 
     private const string SceneSystemPrompt =
         "Translate Japanese game dialogue into Simplified Chinese. You receive a JSON object with "
-        + "version, sceneId, and targets. Return a JSON object with the same version, the same "
-        + "sceneId, and a translations array holding one object per target, in the same order, each "
-        + "with the target's id and the translated text. Translate every target; keep the speaker's "
-        + "tone and terminology consistent across the whole scene. Strings such as __MLM_FMT_0__ are "
-        + "protected formatting: preserve each one exactly once, in its original order, and never "
-        + "translate, remove, duplicate, or move them. Return only the JSON object.";
+        + "version, sceneId, and targets in story order. Each target has an id, a name (the "
+        + "displayed speaker name, null for narration; it may hide identity, such as ？？？, and a "
+        + "name wrapped in % stands for the player character), and the source text. Use the name to "
+        + "choose pronouns, tone, and forms of address, and keep each speaker consistent across the "
+        + "scene. The name is context only: never translate it separately or add it to the text. "
+        + "Return a JSON object with the same version, the same sceneId, and a translations array "
+        + "holding one object per target, in the same order, each with the target's id and the "
+        + "translated text. Strings such as __MLM_FMT_0__ are protected formatting: preserve each one "
+        + "exactly once, in its original order, and never translate, remove, duplicate, or move "
+        + "them. Return only the JSON object.";
 
     /// <summary>
     /// A scene is a single larger request, so it gets a longer ceiling than one line.

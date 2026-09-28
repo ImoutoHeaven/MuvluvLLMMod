@@ -14,7 +14,6 @@ namespace MuvluvLLMMod;
 public static class Patch
 {
     public static bool isPlayingScenario;
-    private static readonly SceneTranslationCoordinator sceneCoordinator = new();
 
     private static readonly DebugTextLogPolicy debugTextLogPolicy = new();
     private static readonly TmpTranslationProvenance tmpProvenance = new();
@@ -80,7 +79,7 @@ public static class Patch
         ScenePendingWork? pending;
         try
         {
-            pending = sceneCoordinator.Prepare(masters, sceneId);
+            pending = SceneTranslationCoordinator.Prepare(masters, sceneId);
         }
         catch (Exception exception)
         {
@@ -94,8 +93,9 @@ public static class Patch
     }
 
     /// <summary>
-    /// Sends one whole-scene request and writes the result back. A failure leaves the frame
-    /// documents untouched, so the existing per-string path still translates the rendered text.
+    /// Sends one whole-scene request and stores every accepted line as a generated template, the
+    /// entry the per-string path resolves. Lines the response did not validate stay on the
+    /// per-string path, and a failed request leaves every line there.
     /// </summary>
     private static void EnqueueSceneRequest(ScenePendingWork work)
     {
@@ -103,7 +103,7 @@ public static class Patch
         {
             try
             {
-                var batch = SceneTranslationBatch.TryCreate(work.SceneId, work.Sources);
+                var batch = SceneTranslationBatch.TryCreate(work.SceneId, work.Lines);
                 if (batch is null)
                     return;
 
@@ -119,14 +119,16 @@ public static class Patch
                     return;
                 }
 
-                // Register before marking applied: the reverse index is what stops the per-string
-                // path from re-enqueueing these lines once they render.
+                var cache = Plugin.CurrentCache;
+                var stored = 0;
                 foreach (var pair in translations)
-                    Plugin.CurrentCache?.RememberResolution(pair.Key, pair.Value);
+                {
+                    if (cache?.StoreGenerated(pair.Key, pair.Value) == true)
+                        stored++;
+                }
 
-                sceneCoordinator.MarkApplied(work.SceneId, work.SceneIdentity);
                 Logger.Info(
-                    $"[LLM][Scene] translated scene={work.SceneId} targets={translations.Count}");
+                    $"[LLM][Scene] translated scene={work.SceneId} targets={batch.TargetCount} accepted={translations.Count} stored={stored}");
             }
             catch (Exception exception)
             {
@@ -283,7 +285,6 @@ public static class Patch
         tmpWriteOwnership.ResetForLifecycle();
         tmpProvenance.ResetForLifecycle();
         isPlayingScenario = false;
-        sceneCoordinator.Reset();
         Volatile.Write(ref refreshScanCount, 0);
     }
 

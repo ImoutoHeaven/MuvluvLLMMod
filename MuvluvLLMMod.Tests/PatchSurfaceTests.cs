@@ -51,21 +51,18 @@ public sealed class PatchSurfaceTests
             patch,
             StringComparison.Ordinal);
         Assert.Contains("TranslateSceneFrames", patch, StringComparison.Ordinal);
-        Assert.Contains("sceneCoordinator.Prepare", patch, StringComparison.Ordinal);
+        Assert.Contains("SceneTranslationCoordinator.Prepare", patch, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Scene_path_registers_translations_before_marking_the_scene_applied()
+    public void Scene_path_stores_accepted_lines_as_generated_templates()
     {
         var patch = ReadProductionSource("Patch.cs");
 
-        // Registering into the reverse index first is what stops the per-string path from
-        // re-enqueueing these lines once they render; marking applied skips the whole scene next
-        // time. Reversing the order would reopen the re-entry window.
-        var register = patch.IndexOf("RememberResolution", StringComparison.Ordinal);
-        var mark = patch.IndexOf("sceneCoordinator.MarkApplied", StringComparison.Ordinal);
-        Assert.True(register >= 0);
-        Assert.True(mark > register);
+        // The per-string path and the scene seam look translations up by source template, which
+        // only the generated store answers; the reverse index alone never reaches the screen.
+        Assert.Contains("StoreGenerated(pair.Key, pair.Value)", patch, StringComparison.Ordinal);
+        Assert.DoesNotContain("RememberResolution", patch, StringComparison.Ordinal);
 
         // A rejected or failed batch must leave the frames untouched and fall back to per-string.
         Assert.Contains("batch.TryParseResponse", patch, StringComparison.Ordinal);

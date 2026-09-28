@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Assets.Api.Client;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 
@@ -16,36 +15,25 @@ namespace MuvluvLLMMod;
 /// so a prefix on <c>GenerateFrames</c> is the single seam that reaches every consumer with no
 /// second pass.
 ///
-/// Translations that are already known are applied immediately; the remainder are sent as one
-/// scene request. Only a fully validated response is written back, so a scene is never published
-/// half-translated.
+/// Translations already in the cache are applied immediately; the remaining lines are returned for
+/// one scene request. Accepted scene results are stored in the same generated-template cache the
+/// per-string path uses, so the next entry applies them here and the rendered text resolves them
+/// in the meantime. A line whose cached translation exists is never requested again.
 /// </summary>
-internal sealed class SceneTranslationCoordinator
+internal static class SceneTranslationCoordinator
 {
-    private readonly SceneTranslationMarker marker = new(TranslationBudget.MaxAppliedSceneEntries);
-
     /// <summary>
     /// Applies the currently known translations to every frame document in the array, and returns
-    /// the dialogue that still needs translating along with the identity of the document set it
-    /// belongs to. Returns null when scene translation is disabled, the array carries nothing to
-    /// translate, or this exact document set was already translated.
+    /// the dialogue that still needs translating, in story order with speaker names. Returns null
+    /// when scene translation is disabled or nothing remains to translate.
     /// </summary>
-    internal ScenePendingWork? Prepare(Il2CppReferenceArray<SceneFrameMaster>? masters, long sceneId)
+    internal static ScenePendingWork? Prepare(Il2CppReferenceArray<SceneFrameMaster>? masters, long sceneId)
     {
         if (!Config.Translation.Value || !Config.SceneTranslation.Value || masters is null)
             return null;
 
-        // The documents arrive exactly as the game fetched them, so their fingerprint identifies
-        // this scene instance regardless of how often it is re-entered.
-        var documents = new List<string?>(masters.Length);
-        foreach (var master in masters)
-            documents.Add(master?.ConfigurationJson);
-
-        var identity = SceneFrameDocument.Fingerprint(documents);
-        if (marker.IsApplied(sceneId, identity))
-            return null;
-
-        var pending = new List<string>();
+        var pending = new List<SceneDialogueLine>();
+        var pendingTexts = new HashSet<string>(StringComparer.Ordinal);
         var applied = 0;
         foreach (var master in masters)
         {
@@ -53,22 +41,24 @@ internal sealed class SceneTranslationCoordinator
                 continue;
 
             var json = master.ConfigurationJson;
-            if (string.IsNullOrEmpty(json))
-                continue;
-
-            var texts = SceneFrameDocument.CollectTexts(json);
-            if (texts.Count == 0)
+            var lines = SceneFrameDocument.CollectLines(json);
+            if (lines.Count == 0)
                 continue;
 
             var known = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (var text in texts)
+            foreach (var line in lines)
             {
-                var translated = Plugin.CurrentResolver?.Lookup(text);
+                // Frame objects are cached by the game, so a re-entered scene can carry a document
+                // this seam already rewrote; a translation that still contains kana is not new work.
+                if (Plugin.CurrentCache?.IsKnownTranslatedValue(line.Text) == true)
+                    continue;
+
+                var translated = Plugin.CurrentResolver?.Lookup(line.Text);
                 if (!string.IsNullOrEmpty(translated)
-                    && !string.Equals(translated, text, StringComparison.Ordinal))
-                    known[text] = translated;
-                else if (!pending.Contains(text, StringComparer.Ordinal))
-                    pending.Add(text);
+                    && !string.Equals(translated, line.Text, StringComparison.Ordinal))
+                    known[line.Text] = translated;
+                else if (pendingTexts.Add(line.Text))
+                    pending.Add(line);
             }
 
             if (known.Count == 0)
@@ -87,26 +77,9 @@ internal sealed class SceneTranslationCoordinator
 
         return pending.Count == 0
             ? null
-            : new ScenePendingWork(sceneId, identity, pending);
+            : new ScenePendingWork(sceneId, pending);
     }
-
-    /// <summary>
-    /// Records that this document set was fully translated, so re-entering the same scene is not
-    /// resent. Keyed by document identity rather than call order, because the same scene can be
-    /// re-entered any number of times.
-    /// </summary>
-    internal void MarkApplied(long sceneId, long sceneIdentity) =>
-        marker.MarkApplied(sceneId, sceneIdentity);
-
-    internal int RetainedSceneCount => marker.Count;
-
-    internal void Reset() => marker.Clear();
 }
 
-/// <summary>
-/// Dialogue awaiting a scene request, together with the identity of the document set it came from.
-/// </summary>
-internal readonly record struct ScenePendingWork(
-    long SceneId,
-    long SceneIdentity,
-    IReadOnlyList<string> Sources);
+/// <summary>Dialogue awaiting a scene request, in story order.</summary>
+internal readonly record struct ScenePendingWork(long SceneId, IReadOnlyList<SceneDialogueLine> Lines);

@@ -7,7 +7,7 @@ namespace MuvluvLLMMod.Tests;
 /// <summary>
 /// Regression coverage for source text whose leading or trailing line break is part of the scene
 /// text. A trailing newline protects as a trailing token, so any step that trims the restored value
-/// makes the markup comparison fail and silently rejects an otherwise valid scene.
+/// makes the markup comparison fail and silently drops an otherwise valid line.
 ///
 /// Measured against the shipping corpus: 16 of 38183 dialogue lines end with a line break, and all
 /// 16 were rejected before this was fixed.
@@ -16,7 +16,7 @@ public sealed class SceneTranslationWhitespaceTests
 {
     private static (SceneTranslationBatch Batch, string Id, string Protected) Create(string source)
     {
-        var batch = SceneTranslationBatch.TryCreate(40003301, new[] { source })!;
+        var batch = SceneTranslationBatch.TryCreate(40003301, new[] { new SceneDialogueLine(source, null) })!;
         var target = JsonNode.Parse(batch.Prompt)!["targets"]!.AsArray()[0]!;
         return (batch, target["id"]!.GetValue<string>(), target["source"]!.GetValue<string>());
     }
@@ -47,12 +47,13 @@ public sealed class SceneTranslationWhitespaceTests
     }
 
     [Fact]
-    public void Rejects_a_translation_that_drops_the_trailing_line_break()
+    public void Drops_a_translation_that_drops_the_trailing_line_break()
     {
         var (batch, id, _) = Create("おはよう\n");
 
         // Structured the same but with the break removed: the line structure changed.
-        Assert.False(batch.TryParseResponse(Response(id, "早上好"), out _));
+        Assert.True(batch.TryParseResponse(Response(id, "早上好"), out var translations));
+        Assert.Empty(translations);
     }
 
     [Fact]
