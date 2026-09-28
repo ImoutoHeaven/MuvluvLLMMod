@@ -611,6 +611,14 @@ namespace Assets.GameUi.Scenario
 
         public void Refresh() { }
 
+        // The game declares three Refresh overloads; the seam is the parameterless one.
+        public bool Refresh(long sceneMasterId, FunctionFlags disableFunctionFlags, bool a, bool b, bool c) => false;
+
+        public void Refresh(
+            Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Assets.Api.Client.SceneFrameMaster> scenes,
+            Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Assets.Api.Client.SceneFrameMaster> episodes,
+            Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Assets.Api.Client.SceneFrameMaster> frames) { }
+
         public void Leave() { }
 
         /// <summary>

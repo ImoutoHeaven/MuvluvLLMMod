@@ -320,6 +320,8 @@ public static class Patch
                 typeof(bool)),
         };
 
+    // Every seam names its exact signature; no argument types means the parameterless overload,
+    // matching `new Type[] { }` on the Refresh patch (the game declares three Refresh overloads).
     private static PatchPreflightPolicy.PatchTargetSpec Spec(
         string label,
         Type declaringType,
@@ -330,7 +332,7 @@ public static class Patch
             label,
             declaringType.FullName ?? declaringType.Name,
             methodName,
-            argumentTypes.Length == 0 ? null : argumentTypes);
+            argumentTypes);
 
     private static HarmonyPatchVerificationResult VerifyPatches(
         string harmonyId,
