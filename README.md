@@ -40,9 +40,11 @@ Prefix, so builder output and other data sources are covered once they reach tha
 Scenario dialogue has a second route. A scene's frame documents are rewritten before the game
 consumes them, so one request covers the whole scene and the model sees every line in order with its
 speaker name. That is what keeps a speaker's tone, honorifics, and terminology consistent within a
-scene. Accepted lines are stored in the same generated-template cache as per-string results: lines
-still on screen pick them up at the next refresh, and every later entry of the scene applies them
-to the frame documents with no request.
+scene. Accepted lines are stored in the same generated-template cache as per-string results: every
+later entry of the scene applies them to the frame documents with no request, and lines still on
+screen pick them up at the next refresh. A line containing the player-name placeholder
+`%usernameusernameuserna%` renders with the name substituted, so on first play it is served by the
+per-string path and the scene result applies from the next entry.
 
 Evidence for the seam is recorded in [`docs/scene-frame-evidence.md`](docs/scene-frame-evidence.md):
 the game reads `SceneFrameMaster.ConfigurationJson` exactly once, and the frame factory runs before
@@ -56,6 +58,7 @@ Validation of a scene response is per line within a checked structure. The respo
 protocol version and scene id and carry exactly one entry per target, in order, with matching ids;
 otherwise the whole response is discarded. Each entry is then accepted only when it restores to the
 exact protected token sequence with matching placeholders and markup, and is not the source itself.
+Protected tokens include `%name%` placeholders, so the player-name placeholder always survives.
 A line that fails is dropped and stays on the per-string path, while the rest of the scene is kept.
 
 The scene route shares the bounded text, request, and cache budgets with the rest of the plugin; a

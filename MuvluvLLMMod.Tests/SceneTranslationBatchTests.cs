@@ -37,11 +37,56 @@ public sealed class SceneTranslationBatchTests
     }
 
     [Fact]
-    public void TryCreate_deduplicates_repeated_sources()
+    public void TryCreate_keeps_each_speaker_of_a_repeated_line()
     {
-        var batch = Create("こんにちは", "こんにちは", "さようなら");
+        // Corpus scene 10120109 gives this line to two speakers; both must reach the model.
+        var batch = SceneTranslationBatch.TryCreate(SceneId, new[]
+        {
+            new SceneDialogueLine("それはそうだけど……", "レイラ"),
+            new SceneDialogueLine("それはそうだけど……", "エヴィ"),
+        })!;
 
+        var targets = JsonNode.Parse(batch.Prompt)!["targets"]!.AsArray();
         Assert.Equal(2, batch.TargetCount);
+        Assert.Equal("レイラ", targets[0]!["name"]!.GetValue<string>());
+        Assert.Equal("エヴィ", targets[1]!["name"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void TryParseResponse_keeps_the_first_valid_translation_of_a_repeated_line()
+    {
+        var batch = Create("こんにちは", "こんにちは");
+
+        var translations = Accepted(
+            batch,
+            Response(SceneId, Entry("t0000", "こんにちは"), Entry("t0001", "你好")));
+
+        Assert.Equal("你好", translations["こんにちは"]);
+    }
+
+    [Fact]
+    public void Player_name_placeholder_is_protected()
+    {
+        const string source = "%usernameusernameuserna%さん、こんにちは";
+        var batch = Create(source);
+
+        Assert.DoesNotContain("%username", batch.Prompt, StringComparison.Ordinal);
+        Assert.Empty(Accepted(batch, Response(SceneId, Entry("t0000", "你好，玩家"))));
+        Assert.Equal(
+            "%usernameusernameuserna%，你好",
+            Accepted(batch, Response(SceneId, Entry("t0000", "__MLM_FMT_0__，你好")))[source]);
+    }
+
+    [Fact]
+    public void TryParseResponse_drops_only_an_entry_whose_text_is_not_a_string()
+    {
+        var batch = Create("こんにちは", "さようなら");
+
+        var translations = Accepted(
+            batch,
+            Response(SceneId, Entry("t0000", "你好"), "{\"id\":\"t0001\",\"text\":123}"));
+
+        Assert.Equal("你好", Assert.Single(translations).Value);
     }
 
     [Fact]

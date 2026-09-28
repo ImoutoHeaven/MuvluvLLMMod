@@ -24,7 +24,7 @@ internal static class SceneTranslationCoordinator
 {
     /// <summary>
     /// Applies the currently known translations to every frame document in the array, and returns
-    /// the dialogue that still needs translating, in story order with speaker names. Returns null
+    /// every dialogue line that still needs translating, in story order with its speaker. Returns null
     /// when scene translation is disabled or nothing remains to translate.
     /// </summary>
     internal static ScenePendingWork? Prepare(Il2CppReferenceArray<SceneFrameMaster>? masters, long sceneId)
@@ -33,7 +33,6 @@ internal static class SceneTranslationCoordinator
             return null;
 
         var pending = new List<SceneDialogueLine>();
-        var pendingTexts = new HashSet<string>(StringComparer.Ordinal);
         var applied = 0;
         foreach (var master in masters)
         {
@@ -50,6 +49,9 @@ internal static class SceneTranslationCoordinator
             {
                 // Frame objects are cached by the game, so a re-entered scene can carry a document
                 // this seam already rewrote; a translation that still contains kana is not new work.
+                // ponytail: relies on the bounded reverse index, like the per-string path; once its
+                // entry is evicted such a line is requested again. Keep rewrite provenance per
+                // frame if that shows up in logs.
                 if (Plugin.CurrentCache?.IsKnownTranslatedValue(line.Text) == true)
                     continue;
 
@@ -57,7 +59,7 @@ internal static class SceneTranslationCoordinator
                 if (!string.IsNullOrEmpty(translated)
                     && !string.Equals(translated, line.Text, StringComparison.Ordinal))
                     known[line.Text] = translated;
-                else if (pendingTexts.Add(line.Text))
+                else
                     pending.Add(line);
             }
 

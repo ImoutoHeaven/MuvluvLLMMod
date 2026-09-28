@@ -51,13 +51,13 @@ public sealed class SceneTranslationBatch
     public int TargetCount => targets.Count;
 
     /// <summary>
-    /// Builds a batch from the scene's dialogue lines in story order. Returns null when the scene
-    /// holds nothing translatable, or when the payload would exceed the bounded prompt budget.
+    /// Builds a batch from the scene's dialogue lines in story order. Every occurrence is sent, so
+    /// a repeated line keeps each of its speakers. Returns null when the scene holds nothing
+    /// translatable, or when the payload would exceed the bounded prompt budget.
     /// </summary>
     public static SceneTranslationBatch? TryCreate(long sceneId, IEnumerable<SceneDialogueLine> lines)
     {
         var states = new List<TargetState>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var line in lines)
         {
@@ -66,7 +66,7 @@ public sealed class SceneTranslationBatch
 
             var template = TextTemplate.Normalize(line.Text).Template;
             var protectedText = TextTemplate.ProtectForLlm(template);
-            if (string.IsNullOrEmpty(protectedText.Prompt) || !seen.Add(template))
+            if (string.IsNullOrEmpty(protectedText.Prompt))
                 continue;
 
             states.Add(new TargetState(
@@ -102,7 +102,8 @@ public sealed class SceneTranslationBatch
 
     /// <summary>
     /// Validates a response against this batch and yields template-to-translated-template pairs
-    /// for the entries that passed. Returns false only when the structure does not match.
+    /// for the entries that passed; a template sent more than once keeps its first valid
+    /// translation. Returns false only when the structure does not match.
     /// </summary>
     public bool TryParseResponse(string? response, out IReadOnlyDictionary<string, string> translations)
     {
@@ -145,12 +146,14 @@ public sealed class SceneTranslationBatch
         for (var index = 0; index < targets.Count; index++)
         {
             var expected = targets[index];
-            var text = document.Translations[index]!.Text;
+            var value = document.Translations[index]!.Text;
+            var text = value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
             // Do not trim: a leading or trailing line break is meaningful scene text, and trimming
             // it would desynchronize the protection checks. Whitespace the model adds around the
             // value is caught by the markup comparison below.
-            if (!string.IsNullOrWhiteSpace(text)
+            if (!parsed.ContainsKey(expected.Template)
+                && !string.IsNullOrWhiteSpace(text)
                 && TextTemplate.TryRestoreLlm(text, expected.ProtectedText, out var translated)
                 && !string.IsNullOrEmpty(translated)
                 && !string.Equals(translated, expected.Template, StringComparison.Ordinal)
@@ -205,6 +208,7 @@ public sealed class SceneTranslationBatch
     private sealed class SceneTranslationEntry
     {
         public string Id { get; set; } = string.Empty;
-        public string Text { get; set; } = string.Empty;
+        // Read per entry, so a wrongly typed text drops only its own line.
+        public JsonElement Text { get; set; }
     }
 }

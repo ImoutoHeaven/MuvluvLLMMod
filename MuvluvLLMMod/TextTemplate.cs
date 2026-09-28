@@ -23,7 +23,8 @@ public static class TextTemplate
     private static readonly Regex Placeholder = new(@"\{([0-9]+)\}", RegexOptions.Compiled);
     private static readonly Regex Tag = new(@"<.*?>", RegexOptions.Compiled);
     private static readonly Regex LineBreak = new(@"\\r\\n|\\n|\r\n|\n", RegexOptions.Compiled);
-    private static readonly Regex FormatToken = new(@"<.*?>|\{[0-9]+\}|\\r\\n|\\n|\r\n|\n", RegexOptions.Compiled);
+    // %name% is a game-substituted placeholder, such as the player name in scenario text.
+    private static readonly Regex FormatToken = new(@"<.*?>|\{[0-9]+\}|%[A-Za-z_][A-Za-z0-9_]*%|\\r\\n|\\n|\r\n|\n", RegexOptions.Compiled);
     private static readonly Regex ProtectedToken = new(@"__MLM_FMT_[A-Za-z0-9]+__", RegexOptions.Compiled);
 
     public static (string Template, string[] Values, int NumericPlaceholderStart) Normalize(string text)
