@@ -44,11 +44,32 @@ public sealed class OpenAiChatClientTests
         using var document = JsonDocument.Parse(body!);
         Assert.Equal("qwen-test", document.RootElement.GetProperty("model").GetString());
         Assert.Equal(0, document.RootElement.GetProperty("temperature").GetInt32());
-        Assert.False(document.RootElement.GetProperty("stream").GetBoolean());
+        Assert.True(document.RootElement.GetProperty("stream").GetBoolean());
         var messages = document.RootElement.GetProperty("messages");
         Assert.Contains("Simplified Chinese", messages[0].GetProperty("content").GetString());
         Assert.Equal("スキル __MLM_FMT_0____MLM_FMT_1__", messages[1].GetProperty("content").GetString());
         Assert.DoesNotContain(diagnostics, value => value.Contains("secret-sentinel", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("[DONE]", "技能 {0}")]
+    [InlineData("{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}", "技能 {0}")]
+    [InlineData("{\"error\":{\"message\":\"failed\"}}", null)]
+    [InlineData("{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}", null)]
+    [InlineData("", null)]
+    public async Task Stream_is_assembled_before_translation_validation(string terminal, string? expected)
+    {
+        var sse = ": keepalive\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\r\n\r\n"
+            + "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"not translation\",\"content\":\"技\"}}]}\r\n\r\n"
+            + "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"能 __MLM_FMT_0__\"}}]}\r\n\r\n"
+            + (terminal.Length == 0 ? "" : "data: " + terminal + "\r\n\r\n");
+        using var http = new HttpClient(new DelegateHandler(_ => Task.FromResult(
+            new HttpResponseMessage(HttpStatusCode.OK)
+            { Content = new StringContent(sse, Encoding.UTF8, "text/event-stream") })));
+        var client = new OpenAiChatClient(http,
+            new OpenAiChatSettings("https://example.test/v1/chat/completions", "model", "", 30, 1),
+            new RequestRateLimiter(1000));
+        Assert.Equal(expected, await client.TranslateAsync("スキル {0}", CancellationToken.None));
     }
 
     [Fact]
@@ -247,21 +268,29 @@ public sealed class OpenAiChatClientTests
         Assert.Equal(2, attempts);
     }
 
-    [Fact]
-    public async Task Wrapped_gateway_envelope_is_accepted_on_the_per_string_route()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Wrapped_gateway_envelope_is_accepted_on_the_per_string_route(bool stream)
     {
-        using var http = new HttpClient(new DelegateHandler(_ =>
-            Task.FromResult(WrappedResponse("技能 __MLM_FMT_0__"))));
+        using var http = new HttpClient(new DelegateHandler(async request =>
+        {
+            using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync());
+            Assert.Equal(stream, body.RootElement.GetProperty("stream").GetBoolean());
+            return WrappedResponse("技能 __MLM_FMT_0__");
+        }));
         var client = new OpenAiChatClient(
             http,
-            new OpenAiChatSettings("https://example.test/v1/chat/completions", "model", string.Empty, 30, 1),
+            new OpenAiChatSettings("https://example.test/v1/chat/completions", "model", string.Empty, 30, 1, Stream: stream),
             new RequestRateLimiter(1000));
 
         Assert.Equal("技能 {0}", await client.TranslateAsync("スキル {0}", CancellationToken.None));
     }
 
-    [Fact]
-    public async Task Wrapped_gateway_envelope_carries_a_scene_batch_response()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Gateway_envelope_or_stream_carries_a_complete_scene_batch_response(bool sse)
     {
         const long sceneId = 40000101;
         var batch = SceneTranslationBatch.TryCreate(
@@ -273,7 +302,11 @@ public sealed class OpenAiChatClientTests
             sceneId,
             translations = new[] { new { id = "t0000", text = "早上好" } },
         });
-        using var http = new HttpClient(new DelegateHandler(_ => Task.FromResult(WrappedResponse(payload))));
+        var chunk = JsonSerializer.Serialize(new { choices = new[] { new { index = 0, delta = new { content = payload } } } });
+        using var http = new HttpClient(new DelegateHandler(_ => Task.FromResult(sse
+            ? new HttpResponseMessage(HttpStatusCode.OK)
+            { Content = new StringContent("data: " + chunk + "\n\ndata: [DONE]\n\n", Encoding.UTF8, "text/event-stream") }
+            : WrappedResponse(payload))));
         var client = new OpenAiChatClient(
             http,
             new OpenAiChatSettings("https://example.test/v1/chat/completions", "model", string.Empty, 30, 1),

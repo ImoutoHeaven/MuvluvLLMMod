@@ -10,7 +10,8 @@ public sealed record OpenAiChatSettings(
     string Model,
     string ApiKey,
     int TimeoutSeconds,
-    int RetryCount);
+    int RetryCount,
+    bool Stream = true);
 
 public static class EndpointPolicy
 {
@@ -233,7 +234,7 @@ public sealed class OpenAiChatClient
         {
             model = settings.Model,
             temperature = 0,
-            stream = false,
+            stream = settings.Stream,
             messages = new[]
             {
                 new { role = "system", content = systemPrompt },
@@ -254,48 +255,7 @@ public sealed class OpenAiChatClient
             token).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode) throw new HttpRequestException("LLM endpoint returned a non-success status.");
         var json = await ReadContentBoundedAsync(response.Content, token).ConfigureAwait(false);
-        using var document = JsonDocument.Parse(json);
-        return ReadMessageContent(document.RootElement);
+        return OpenAiResponse.Read(json);
     }
 
-    /// <summary>
-    /// Compatibility shim over the chat completions body.
-    ///
-    /// The OpenAI shape carries the choices array at the root. Some OpenAI-compatible gateways
-    /// instead wrap the same completion in one envelope object, for example
-    /// <c>{"data":{"choices":[...]},"success":true}</c>. Both shapes are read here, so a gateway
-    /// envelope is accepted without changing the request or any later step; anything else is a
-    /// retryable <see cref="JsonException"/>.
-    /// </summary>
-    private static string? ReadMessageContent(JsonElement root)
-    {
-        if (!TryGetChoices(root, out var choices) && root.ValueKind == JsonValueKind.Object)
-        {
-            foreach (var property in root.EnumerateObject())
-            {
-                if (TryGetChoices(property.Value, out choices))
-                    break;
-            }
-        }
-
-        if (choices.ValueKind != JsonValueKind.Array || choices.GetArrayLength() == 0)
-            throw new JsonException("LLM response does not contain a chat completion choice.");
-
-        if (!choices[0].TryGetProperty("message", out var message)
-            || !message.TryGetProperty("content", out var content)
-            || content.ValueKind != JsonValueKind.String)
-        {
-            throw new JsonException("LLM response choice does not contain a string message content.");
-        }
-
-        return content.GetString();
-    }
-
-    private static bool TryGetChoices(JsonElement value, out JsonElement choices)
-    {
-        choices = default;
-        return value.ValueKind == JsonValueKind.Object
-            && value.TryGetProperty("choices", out choices)
-            && choices.ValueKind == JsonValueKind.Array;
-    }
 }

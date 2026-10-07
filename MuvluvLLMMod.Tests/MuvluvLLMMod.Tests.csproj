@@ -19,6 +19,7 @@
     <Compile Include="..\MuvluvLLMMod\PluginLifecycleGate.cs" Link="Source\PluginLifecycleGate.cs" />
     <Compile Include="..\MuvluvLLMMod\RetainedDelegate.cs" Link="Source\RetainedDelegate.cs" />
     <Compile Include="..\MuvluvLLMMod\TranslationPriorityBacklog.cs" Link="Source\TranslationPriorityBacklog.cs" />
+    <Compile Include="..\MuvluvLLMMod\OpenAiResponse.cs" Link="Source\OpenAiResponse.cs" />
     <Compile Include="..\MuvluvLLMMod\OpenAiChatClient.cs" Link="Source\OpenAiChatClient.cs" />
     <Compile Include="..\MuvluvLLMMod\TranslationRetryPolicy.cs" Link="Source\TranslationRetryPolicy.cs" />
     <Compile Include="..\MuvluvLLMMod\RequestRateLimiter.cs" Link="Source\RequestRateLimiter.cs" />
