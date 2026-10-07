@@ -247,9 +247,58 @@ public sealed class OpenAiChatClientTests
         Assert.Equal(2, attempts);
     }
 
+    [Fact]
+    public async Task Wrapped_gateway_envelope_is_accepted_on_the_per_string_route()
+    {
+        using var http = new HttpClient(new DelegateHandler(_ =>
+            Task.FromResult(WrappedResponse("技能 __MLM_FMT_0__"))));
+        var client = new OpenAiChatClient(
+            http,
+            new OpenAiChatSettings("https://example.test/v1/chat/completions", "model", string.Empty, 30, 1),
+            new RequestRateLimiter(1000));
+
+        Assert.Equal("技能 {0}", await client.TranslateAsync("スキル {0}", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Wrapped_gateway_envelope_carries_a_scene_batch_response()
+    {
+        const long sceneId = 40000101;
+        var batch = SceneTranslationBatch.TryCreate(
+            sceneId,
+            new[] { new SceneDialogueLine("おはよう", "伊隅みちる") })!;
+        var payload = JsonSerializer.Serialize(new
+        {
+            version = 1,
+            sceneId,
+            translations = new[] { new { id = "t0000", text = "早上好" } },
+        });
+        using var http = new HttpClient(new DelegateHandler(_ => Task.FromResult(WrappedResponse(payload))));
+        var client = new OpenAiChatClient(
+            http,
+            new OpenAiChatSettings("https://example.test/v1/chat/completions", "model", string.Empty, 30, 1),
+            new RequestRateLimiter(1000));
+
+        var content = await client.SendSceneAsync(batch, CancellationToken.None);
+
+        Assert.NotNull(content);
+        Assert.True(batch.TryParseResponse(content, out var translations));
+        Assert.Equal("早上好", translations["おはよう"]);
+    }
+
     private static HttpResponseMessage JsonResponse(string content)
     {
         var json = JsonSerializer.Serialize(new { choices = new[] { new { message = new { content } } } });
+        return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
+    }
+
+    private static HttpResponseMessage WrappedResponse(string content)
+    {
+        var json = JsonSerializer.Serialize(new
+        {
+            data = new { choices = new[] { new { message = new { content } } } },
+            success = true,
+        });
         return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
     }
 
