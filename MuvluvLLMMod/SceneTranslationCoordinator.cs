@@ -6,7 +6,7 @@ namespace MuvluvLLMMod;
 /// <summary>
 /// Bridges the pure-logic scene batch to the game's frame arrays.
 ///
-/// Evidence (docs/scene-frame-evidence.md): the game reads
+/// Single reader: the game reads
 /// <c>SceneFrameMaster.ConfigurationJson</c> exactly once, inside
 /// <c>ScenarioController+&lt;&gt;c__DisplayClass113_0.&lt;GenerateFrames&gt;b__0</c>, which runs
 /// <c>JsonConvert.DeserializeObject&lt;ScenarioConfiguration&gt;</c> and copies

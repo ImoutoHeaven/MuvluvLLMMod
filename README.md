@@ -46,9 +46,9 @@ screen pick them up at the next refresh. A line containing the player-name place
 `%usernameusernameuserna%` renders with the name substituted, so on first play it is served by the
 per-string path and the scene result applies from the next entry.
 
-Evidence for the seam is recorded in [`docs/scene-frame-evidence.md`](docs/scene-frame-evidence.md):
-the game reads `SceneFrameMaster.ConfigurationJson` exactly once, and the frame factory runs before
-`Refresh` publishes the frame view models.
+Evidence for the seam is single-reader: the game reads
+`SceneFrameMaster.ConfigurationJson` exactly once, and that frame factory runs before `Refresh`
+publishes the frame view models.
 
 Only dialogue `Text` is translated in the batch. Each line carries its `SpeakerName` as context
 (null for narration); speaker and team names themselves are translated once each by the per-string

@@ -34,7 +34,8 @@ public sealed class ReadmeSurfaceTests
         Assert.Contains("Scene translation", readme, StringComparison.Ordinal);
         Assert.Contains("per line within a checked structure", readme, StringComparison.Ordinal);
         Assert.Contains("stays on the per-string path", readme, StringComparison.Ordinal);
-        Assert.Contains("docs/scene-frame-evidence.md", readme, StringComparison.Ordinal);
+        Assert.Contains("SceneFrameMaster.ConfigurationJson` exactly once", readme, StringComparison.Ordinal);
+        Assert.Contains("frame factory runs before `Refresh`", readme, StringComparison.Ordinal);
 
         Assert.Contains("kana-free incoming text is not queued", readme, StringComparison.Ordinal);
         Assert.Contains("Kana is necessary but not sufficient", readme, StringComparison.Ordinal);

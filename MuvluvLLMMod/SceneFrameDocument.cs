@@ -9,7 +9,7 @@ namespace MuvluvLLMMod;
 /// Reads and rewrites the dialogue text inside a <c>SceneFrameMaster.ConfigurationJson</c> frame
 /// document.
 ///
-/// Evidence (see docs/scene-frame-evidence.md): the game reads this string exactly once, in
+/// Single reader: the game reads this string exactly once, in
 /// <c>ScenarioController+&lt;&gt;c__DisplayClass113_0.&lt;GenerateFrames&gt;b__0</c>, which runs
 /// <c>JsonConvert.DeserializeObject&lt;ScenarioConfiguration&gt;</c> and copies
 /// <c>ScenarioConfiguration.Phrase</c> onto each frame view model. Rewriting the document before

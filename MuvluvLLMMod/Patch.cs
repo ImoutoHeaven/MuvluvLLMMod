@@ -62,7 +62,7 @@ public static class Patch
     public static void SetIsPlayingScenario() => isPlayingScenario = true;
 
     /// <summary>
-    /// Scene-level seam. Evidence (docs/scene-frame-evidence.md): the game reads
+    /// Scene-level seam. Single reader: the game reads
     /// <c>SceneFrameMaster.ConfigurationJson</c> exactly once, in
     /// <c>ScenarioController+&lt;&gt;c__DisplayClass113_0.&lt;GenerateFrames&gt;b__0</c>, and
     /// <c>GenerateFrames</c> runs before <c>ScenarioController.Refresh</c>. Rewriting the frame
