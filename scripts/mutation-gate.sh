@@ -5,7 +5,7 @@ set -euo pipefail
 # every mutant is made in a separate throwaway copy under /tmp and is deleted on exit.
 SOURCE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PROJECT="MuvluvLLMMod.IntegrationTests/MuvluvLLMMod.IntegrationTests.csproj"
-EXPECTED_BASELINE=47
+EXPECTED_BASELINE=53
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/muvluv-fr4.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 ROOT="$WORK/base"

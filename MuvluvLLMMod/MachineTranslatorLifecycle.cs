@@ -164,6 +164,38 @@ public sealed class MachineTranslatorLifecycle
         }
     }
 
+    public bool HasActiveTranslator
+    {
+        get
+        {
+            lock (gate)
+                return !shutdown && terminalException == null && current != null;
+        }
+    }
+
+    public bool IsReserved(string template)
+    {
+        if (string.IsNullOrEmpty(template))
+            return false;
+        lock (gate)
+            return !shutdown && terminalException == null && current?.IsReserved(template) == true;
+    }
+
+    public int SubmitScene(
+        long sceneId,
+        IReadOnlyList<SceneDialogueLine> sceneLines,
+        IReadOnlyList<int> targetIndices)
+    {
+        MachineTranslator? active;
+        lock (gate)
+        {
+            if (shutdown || terminalException != null)
+                return 0;
+            active = current;
+        }
+        return active?.SubmitScene(sceneId, sceneLines, targetIndices) ?? 0;
+    }
+
     public bool EnqueuePriority(string template)
     {
         lock (gate)

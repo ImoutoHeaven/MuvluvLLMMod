@@ -560,8 +560,8 @@ public sealed class MachineTranslatorLifecycleTests : IDisposable
         Assert.False(lifecycle.EnqueuePriority("残留優先世代する", 21));
         Assert.False(lifecycle.EnqueueNormal("残留通常する"));
         Assert.False(lifecycle.EnqueueNormal("残留通常世代する", 22));
-        Assert.Equal(0, PrivateCollectionCount(workQueue, "priorityQueue"));
-        Assert.Equal(0, PrivateCollectionCount(workQueue, "normalQueue"));
+        Assert.Equal(0, workQueue.QueuedCount);
+        Assert.Equal(0, workQueue.RetainedSnapshot.ScheduledCount);
         Assert.Empty(priorityBacklog.DrainWork());
         Assert.Equal(0, RetryStateCount(retryPolicy));
     }

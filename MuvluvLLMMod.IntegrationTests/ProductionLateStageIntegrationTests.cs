@@ -243,7 +243,8 @@ public sealed class ZzzProductionLateStageIntegrationTests
             "QuittingResource",
             "PersistenceResource",
             "MachineStartupResource",
-            "ActivationResource"
+            "ActivationResource",
+            "SceneRetries"
         };
         foreach (var propertyName in detachedProperties)
         {

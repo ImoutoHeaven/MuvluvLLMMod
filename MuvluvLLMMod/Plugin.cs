@@ -53,8 +53,7 @@ public sealed class Plugin : BasePlugin
         public PluginLifecycleGate.PluginGenerationResource? PersistenceResource { get; set; }
         public PluginLifecycleGate.PluginGenerationResource? MachineStartupResource { get; set; }
         public PluginLifecycleGate.PluginGenerationResource? ActivationResource { get; set; }
-        public OpenAiChatClient? SceneClient { get; set; }
-        public RequestRateLimiter? SceneLimiter { get; set; }
+        public SceneRetryRegistry? SceneRetries { get; set; }
 
         public void Detach()
         {
@@ -76,8 +75,7 @@ public sealed class Plugin : BasePlugin
             PersistenceResource = null;
             MachineStartupResource = null;
             ActivationResource = null;
-            SceneClient = null;
-            SceneLimiter = null;
+            SceneRetries = null;
         }
     }
 
@@ -103,7 +101,9 @@ public sealed class Plugin : BasePlugin
 
     internal static TranslationCache? CurrentCache => RunningResources?.Cache;
     internal static TranslationResolver? CurrentResolver => RunningResources?.Resolver;
-    internal static OpenAiChatClient? CurrentSceneClient => RunningResources?.SceneClient;
+    internal static SceneRetryRegistry? CurrentSceneRetries => RunningResources?.SceneRetries;
+    internal static Func<string, Action<string>, SceneRetryRegistry>? CreateSceneRetryRegistry { get; set; }
+    internal static TimeSpan? TerminalFlushBudgetOverride { get; set; }
     internal static PluginLifecycleGate.PluginGeneration? CurrentGeneration =>
         lifecycleGate.CurrentGeneration;
     internal static object? CurrentGenerationOwner =>
@@ -176,15 +176,29 @@ public sealed class Plugin : BasePlugin
             using (var stage = RequireLoadStage(generation))
             {
                 TranslationCache? cache = null;
+                SceneRetryRegistry? sceneRetries = null;
                 using var cacheResource = stage.RegisterResource(
                     "translation cache",
-                    () => cache?.FreezeMutations());
+                    () =>
+                    {
+                        cache?.FreezeMutations();
+                        sceneRetries?.Freeze();
+                    });
                 resources.CacheResource = cacheResource;
 
+                var cacheRoot = ResolvePluginPath(MuvluvLLMMod.Config.CacheDirectory.Value);
                 cache = new TranslationCache(
-                    ResolvePluginPath(MuvluvLLMMod.Config.CacheDirectory.Value),
+                    cacheRoot,
                     message => SafeWarn("Translation cache " + message));
                 cache.Load();
+                sceneRetries = CreateSceneRetryRegistry != null
+                    ? CreateSceneRetryRegistry(
+                        Path.Combine(cacheRoot, "scene-retries.v1.json"),
+                        message => SafeWarn("Scene retry " + message))
+                    : new SceneRetryRegistry(
+                        filePath: Path.Combine(cacheRoot, "scene-retries.v1.json"),
+                        diagnostic: message => SafeWarn("Scene retry " + message));
+                sceneRetries.Load();
                 var resolver = new TranslationResolver(
                     cache,
                     (template, pendingGeneration) => EnqueuePriority(
@@ -198,11 +212,13 @@ public sealed class Plugin : BasePlugin
                     (template, pendingGeneration) => CancelTranslation(
                         generation,
                         template,
-                        pendingGeneration));
+                        pendingGeneration),
+                    template => IsReserved(generation, template));
                 if (!cacheResource.Commit(
                         () =>
                         {
                             resources.Cache = cache;
+                            resources.SceneRetries = sceneRetries;
                             resources.Resolver = resolver;
                         }))
                 {
@@ -322,21 +338,6 @@ public sealed class Plugin : BasePlugin
                 }
                 if (!machineStartupResource.Commit())
                     throw CanceledGeneration(generation, "machine worker startup");
-
-                // A scene request is one larger call per scene rather than one per line, so it gets
-                // its own pacing so a scene burst cannot starve the per-string queue.
-                resources.SceneLimiter = new RequestRateLimiter(
-                    Math.Max(1, Math.Min(settings.RequestsPerSecond, 2)));
-                resources.SceneClient = new OpenAiChatClient(
-                    LlmHttpClient,
-                    new OpenAiChatSettings(
-                        settings.Endpoint,
-                        settings.Model,
-                        settings.ApiKey,
-                        SceneTimeoutSeconds(settings.TimeoutSeconds),
-                        settings.RetryCount),
-                    resources.SceneLimiter,
-                    message => SafeWarn("[LLM][Scene] " + message));
             }
 
             if (!lifecycleGate.TryPublishRunning(generation))
@@ -433,7 +434,11 @@ public sealed class Plugin : BasePlugin
         RunCleanupResource(
             "freeze cache mutations",
             resources?.CacheResource,
-            () => resources?.Cache?.FreezeMutations(),
+            () =>
+            {
+                resources?.Cache?.FreezeMutations();
+                resources?.SceneRetries?.Freeze();
+            },
             ref succeeded);
         RunCleanupResource(
             "shutdown machine translator",
@@ -449,13 +454,26 @@ public sealed class Plugin : BasePlugin
             "flush cache",
             () =>
             {
-                if (resources?.Cache == null || resources.Cache.FlushTerminal())
-                    return;
-                SafeError(
-                    $"[LLM] Terminal cache flush failed within the {TranslationBudget.DefaultTerminalFlushBudget.TotalSeconds:F0}s "
-                    + $"shutdown budget ({TranslationCache.TerminalFlushMaxAttempts} paced attempts); "
-                    + "dirty cache data may be recoverable from the state journal");
-                throw new InvalidOperationException("terminal cache flush failed");
+                var flushBudget = TerminalFlushBudgetOverride ?? TranslationBudget.DefaultTerminalFlushBudget;
+                var flushDeadline = DateTime.UtcNow + flushBudget;
+                if (resources?.Cache != null
+                    && !resources.Cache.FlushTerminal(Remaining(flushDeadline)))
+                {
+                    SafeError(
+                        $"[LLM] Terminal cache flush failed within the {flushBudget.TotalSeconds:F0}s "
+                        + $"shutdown budget ({TranslationCache.TerminalFlushMaxAttempts} paced attempts); "
+                        + "dirty cache data may be recoverable from the state journal");
+                    throw new InvalidOperationException("terminal cache flush failed");
+                }
+
+                if (resources?.SceneRetries != null
+                    && !resources.SceneRetries.FlushTerminal(Remaining(flushDeadline)))
+                {
+                    SafeError(
+                        $"[LLM] Terminal scene-retry flush failed within the {flushBudget.TotalSeconds:F0}s "
+                        + "shutdown budget");
+                    throw new InvalidOperationException("terminal scene retry flush failed");
+                }
             },
             ref succeeded);
         RunCleanupResource(
@@ -673,8 +691,49 @@ public sealed class Plugin : BasePlugin
             TimeSpan.FromSeconds(machineSettings.TranslatePeriodSeconds),
             priorityBacklog,
             message => SafeInfo("[LLM] " + message),
-            retryPolicy: retryPolicy);
+            retryPolicy: retryPolicy,
+            sendScenePrompt: client.SendScenePromptAsync,
+            sceneRetries: resources.SceneRetries,
+            sceneRetryCount: machineSettings.RetryCount);
     }
+
+    internal static int SubmitScene(ScenePendingWork work)
+    {
+        var resources = RunningResources;
+        var lifecycle = resources?.MachineLifecycle;
+        if (resources == null || lifecycle == null)
+            return 0;
+
+        var submitted = lifecycle.SubmitScene(
+            work.SceneId,
+            work.SceneLines,
+            work.TargetIndices);
+        if (submitted == 0
+            && !lifecycle.HasActiveTranslator
+            && MuvluvLLMMod.Config.LlmEnable.Value
+            && resources.Cache != null)
+        {
+            _ = resources.SceneRetries?.Mark(work.SceneId);
+            foreach (var index in work.TargetIndices)
+            {
+                if (index < 0 || index >= work.SceneLines.Count)
+                    continue;
+                var text = work.SceneLines[index].Text;
+                if (!TextTemplate.IsTranslationCandidate(text))
+                    continue;
+                var template = TextTemplate.Normalize(text).Template;
+                if (!resources.Cache.TryGetGenerated(template, out _))
+                    _ = resources.Cache.ObserveNormal(text, template);
+            }
+        }
+
+        return submitted;
+    }
+
+    private static bool IsReserved(
+        PluginLifecycleGate.PluginGeneration generation,
+        string template) =>
+        GetRunningResources(generation)?.MachineLifecycle?.IsReserved(template) == true;
 
     private static void EnqueuePriority(
         PluginLifecycleGate.PluginGeneration generation,
@@ -731,12 +790,11 @@ public sealed class Plugin : BasePlugin
         Math.Max(1, MuvluvLLMMod.Config.LlmMaxInFlight.Value),
         Math.Max(0.1f, MuvluvLLMMod.Config.LlmTranslatePeriodSeconds.Value));
 
-    /// <summary>
-    /// A scene is one larger request, so its ceiling is longer than a single line's while staying
-    /// bounded and derived from the configured timeout.
-    /// </summary>
-    private static int SceneTimeoutSeconds(int configuredTimeoutSeconds) =>
-        Math.Clamp(configuredTimeoutSeconds * 4, 30, 300);
+    private static TimeSpan Remaining(DateTime deadline)
+    {
+        var remaining = deadline - DateTime.UtcNow;
+        return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+    }
 
     private static string ResolvePluginPath(string path) =>
         Path.IsPathRooted(path) ? path : Path.Combine(Paths.PluginPath, path);

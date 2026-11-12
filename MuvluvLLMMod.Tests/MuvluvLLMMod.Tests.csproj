@@ -37,6 +37,7 @@
     <Compile Include="..\MuvluvLLMMod\ConfigChangePolicy.cs" Link="Source\ConfigChangePolicy.cs" />
     <Compile Include="..\MuvluvLLMMod\PatchVerificationPolicy.cs" Link="Source\PatchVerificationPolicy.cs" />
     <Compile Include="..\MuvluvLLMMod\PatchPreflightPolicy.cs" Link="Source\PatchPreflightPolicy.cs" />
+    <Compile Include="..\MuvluvLLMMod\SceneTranslationPrimitives.cs" Link="Source\SceneTranslationPrimitives.cs" />
     <Compile Include="..\MuvluvLLMMod\SceneTranslationBatch.cs" Link="Source\SceneTranslationBatch.cs" />
     <Compile Include="..\MuvluvLLMMod\SceneFrameDocument.cs" Link="Source\SceneFrameDocument.cs" />
     <Compile Include="..\MuvluvLLMMod\Translation.cs" Link="Source\Translation.cs" />

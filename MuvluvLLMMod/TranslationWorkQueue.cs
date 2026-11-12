@@ -2,7 +2,25 @@ namespace MuvluvLLMMod;
 
 public sealed class TranslationWorkQueue
 {
-    public readonly record struct Work(string Template, bool Priority, long Generation, long PendingGeneration);
+    public const int ForegroundBurstLimit = 4;
+
+    public readonly record struct Work(
+        string Template,
+        bool Priority,
+        long Generation,
+        long PendingGeneration,
+        TranslationPriority Level = TranslationPriority.Foreground)
+    {
+        public Work(string template, bool priority, long generation, long pendingGeneration)
+            : this(
+                template,
+                priority,
+                generation,
+                pendingGeneration,
+                priority ? TranslationPriority.Urgent : TranslationPriority.Foreground)
+        {
+        }
+    }
 
     public readonly record struct BudgetSnapshot(
         int ScheduledCount,
@@ -14,13 +32,18 @@ public sealed class TranslationWorkQueue
         int CanceledCount,
         long CanceledUtf8Bytes,
         int CanceledPendingCount,
-        long CanceledPendingUtf8Bytes);
+        long CanceledPendingUtf8Bytes,
+        int ReservedCount = 0,
+        long ReservedUtf8Bytes = 0);
 
     private readonly object gate = new();
-    private readonly Queue<Work> priorityQueue = new();
-    private readonly Queue<Work> normalQueue = new();
-    private readonly HashSet<string> queuedPriority = new(StringComparer.Ordinal);
-    private readonly HashSet<string> queuedNormal = new(StringComparer.Ordinal);
+    private readonly AsyncPulse workPulse = new();
+    private readonly Queue<Work> urgentQueue = new();
+    private readonly Queue<Work> sceneFallbackQueue = new();
+    private readonly Queue<Work> foregroundQueue = new();
+    private readonly Queue<Work> backgroundQueue = new();
+    private readonly Dictionary<string, TranslationPriority> queuedLevels = new(StringComparer.Ordinal);
+    private readonly HashSet<string> reservations = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Work> scheduled = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> canceledThrough = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> canceledPendingThrough = new(StringComparer.Ordinal);
@@ -28,13 +51,17 @@ public sealed class TranslationWorkQueue
     private readonly HashSet<string> completed = new(StringComparer.Ordinal);
     private readonly LinkedList<string> completedLru = new();
     private readonly Dictionary<string, LinkedListNode<string>> completedNodes = new(StringComparer.Ordinal);
-    private readonly SemaphoreSlim signal = new(0);
+    private int foregroundDequeuesSinceBackground;
+    private int sceneFallbackDequeuesSinceForeground;
+    private long reservedUtf8Bytes;
     private long scheduledUtf8Bytes;
     private long deferredUtf8Bytes;
     private long canceledUtf8Bytes;
     private long canceledPendingUtf8Bytes;
     private long completedUtf8Bytes;
     private long nextGeneration;
+
+    public event Action? StateChanged;
 
     public BudgetSnapshot RetainedSnapshot
     {
@@ -52,78 +79,253 @@ public sealed class TranslationWorkQueue
                     canceledThrough.Count,
                     canceledUtf8Bytes,
                     canceledPendingThrough.Count,
-                    canceledPendingUtf8Bytes);
+                    canceledPendingUtf8Bytes,
+                    reservations.Count,
+                    reservedUtf8Bytes);
             }
         }
     }
 
-    public bool Enqueue(string template) => Enqueue(template, 0);
-
-    public bool Enqueue(string template, long pendingGeneration)
+    public int QueuedCount
     {
-        if (!TextTemplate.IsTranslationCandidate(template)) return false;
-        lock (gate)
+        get
         {
-            if (IsPendingCanceledUnsafe(template, pendingGeneration)
-                || completed.Contains(template)
-                || scheduled.ContainsKey(template)
-                || !CanScheduleUnsafe(template))
-                return false;
-            RemoveCanceledPendingUnsafe(template);
-            var generation = ++nextGeneration;
-            var work = new Work(template, false, generation, pendingGeneration);
-            scheduled[template] = work;
-            scheduledUtf8Bytes += Utf8Bytes(template);
-            normalQueue.Enqueue(work);
-            queuedNormal.Add(template);
+            lock (gate)
+                return queuedLevels.Count;
         }
-        signal.Release();
-        return true;
     }
 
-    public bool EnqueuePriority(string template) => EnqueuePriority(template, 0);
-
-    public bool EnqueuePriority(string template, long pendingGeneration)
+    public bool HasQueuedWork
     {
-        if (!TextTemplate.IsTranslationCandidate(template)) return false;
-        var added = false;
+        get
+        {
+            lock (gate)
+                return HasQueuedWorkUnsafe;
+        }
+    }
+
+    public bool HasUrgentWork
+    {
+        get
+        {
+            lock (gate)
+                return urgentQueue.Count > 0;
+        }
+    }
+
+    private bool HasQueuedWorkUnsafe =>
+        urgentQueue.Count > 0
+        || sceneFallbackQueue.Count > 0
+        || foregroundQueue.Count > 0
+        || backgroundQueue.Count > 0;
+
+    public bool IsReserved(string template)
+    {
+        if (string.IsNullOrEmpty(template))
+            return false;
+        lock (gate)
+            return reservations.Contains(template);
+    }
+
+    public bool TryReserve(string template, Func<bool> isAlreadyCached) =>
+        TryReserve(template, isAlreadyCached, out _);
+
+    public bool TryReserve(
+        string template,
+        Func<bool> isAlreadyCached,
+        out TranslationReservationStatus status)
+    {
+        ArgumentNullException.ThrowIfNull(isAlreadyCached);
+        if (!TextTemplate.IsTranslationCandidate(template))
+        {
+            status = TranslationReservationStatus.AlreadyCached;
+            return false;
+        }
+
+        var changed = false;
         lock (gate)
         {
-            if (IsPendingCanceledUnsafe(template, pendingGeneration)
-                || completed.Contains(template))
-                return false;
-            if (scheduled.TryGetValue(template, out var scheduledWork))
+            if (isAlreadyCached())
             {
-                if (pendingGeneration < scheduledWork.PendingGeneration) return false;
-                if (!queuedNormal.Remove(template))
+                status = TranslationReservationStatus.AlreadyCached;
+                return false;
+            }
+
+            if (reservations.Contains(template))
+            {
+                status = TranslationReservationStatus.AlreadyReserved;
+                return false;
+            }
+
+            if (!CanReserveUnsafe(template))
+            {
+                status = TranslationReservationStatus.BudgetExceeded;
+                return false;
+            }
+
+            if (scheduled.ContainsKey(template))
+            {
+                if (!queuedLevels.Remove(template, out var queuedLevel))
                 {
-                    if (pendingGeneration > scheduledWork.PendingGeneration
-                        && (!deferredPriority.TryGetValue(template, out var deferredWork)
-                            || pendingGeneration > deferredWork.PendingGeneration))
-                    {
-                        if (!TrySetDeferredUnsafe(
-                                new Work(template, true, ++nextGeneration, pendingGeneration)))
-                            return false;
-                    }
+                    status = TranslationReservationStatus.AlreadyInFlight;
                     return false;
                 }
-                RemoveQueuedNormal(template);
-                scheduledWork = new Work(template, true, ++nextGeneration, pendingGeneration);
-                scheduled[template] = scheduledWork;
+
+                RemoveQueued(GetQueueUnsafe(queuedLevel), template);
+                RemoveScheduledUnsafe(template);
+                RemoveDeferredUnsafe(template);
+                AddReservationUnsafe(template);
+                status = TranslationReservationStatus.ReservedFromPending;
+                changed = true;
             }
             else
             {
-                if (!CanScheduleUnsafe(template)) return false;
-                added = true;
+                RemoveDeferredUnsafe(template);
+                AddReservationUnsafe(template);
+                status = TranslationReservationStatus.Reserved;
+                changed = true;
+            }
+        }
+
+        if (changed)
+            NotifyStateChanged();
+        return true;
+    }
+
+    public void ReleaseReservation(string template)
+    {
+        if (string.IsNullOrEmpty(template))
+            return;
+
+        bool removed;
+        lock (gate)
+        {
+            removed = reservations.Remove(template);
+            if (removed)
+            {
+                reservedUtf8Bytes -= Utf8Bytes(template);
+                if (reservedUtf8Bytes < 0)
+                    reservedUtf8Bytes = 0;
+            }
+        }
+        if (removed)
+            NotifyStateChanged();
+    }
+
+    public void CompleteCached(string template)
+    {
+        if (!TextTemplate.IsTranslationCandidate(template))
+            return;
+
+        var changed = false;
+        lock (gate)
+        {
+            AddCompletedUnsafe(template);
+            if (RemoveDeferredUnsafe(template).HasValue)
+                changed = true;
+            if (queuedLevels.Remove(template, out var queuedLevel))
+            {
+                RemoveQueued(GetQueueUnsafe(queuedLevel), template);
+                RemoveScheduledUnsafe(template);
+                changed = true;
+            }
+        }
+
+        if (changed)
+            NotifyStateChanged();
+    }
+
+    public bool Enqueue(string template) => Enqueue(template, 0, TranslationPriority.Foreground);
+
+    public bool Enqueue(string template, long pendingGeneration) =>
+        Enqueue(template, pendingGeneration, TranslationPriority.Foreground);
+
+    public bool EnqueueBackground(string template, long pendingGeneration = 0) =>
+        Enqueue(template, pendingGeneration, TranslationPriority.Background);
+
+    public bool EnqueueSceneFallback(string template, long pendingGeneration = 0) =>
+        Enqueue(template, pendingGeneration, TranslationPriority.SceneFallback);
+
+    public bool EnqueuePriority(string template) =>
+        Enqueue(template, 0, TranslationPriority.Urgent);
+
+    public bool EnqueuePriority(string template, long pendingGeneration) =>
+        Enqueue(template, pendingGeneration, TranslationPriority.Urgent);
+
+    public bool Enqueue(
+        string template,
+        long pendingGeneration,
+        TranslationPriority priority)
+    {
+        if (!TextTemplate.IsTranslationCandidate(template))
+            return false;
+
+        lock (gate)
+        {
+            if (reservations.Contains(template)
+                || IsPendingCanceledUnsafe(template, pendingGeneration)
+                || completed.Contains(template))
+                return false;
+
+            var isUrgentOrScene = priority >= TranslationPriority.SceneFallback;
+            if (scheduled.TryGetValue(template, out var scheduledWork))
+            {
+                if (pendingGeneration < scheduledWork.PendingGeneration)
+                    return false;
+
+                if (!queuedLevels.TryGetValue(template, out var currentLevel))
+                {
+                    if (priority == TranslationPriority.Urgent
+                        && pendingGeneration > scheduledWork.PendingGeneration
+                        && (!deferredPriority.TryGetValue(template, out var deferredWork)
+                            || pendingGeneration > deferredWork.PendingGeneration))
+                    {
+                        _ = TrySetDeferredUnsafe(
+                            new Work(
+                                template,
+                                true,
+                                ++nextGeneration,
+                                pendingGeneration,
+                                TranslationPriority.Urgent));
+                    }
+                    return false;
+                }
+
+                if (priority <= currentLevel && pendingGeneration == scheduledWork.PendingGeneration)
+                    return false;
+
+                var targetLevel = priority > currentLevel ? priority : currentLevel;
+                RemoveQueued(GetQueueUnsafe(currentLevel), template);
+                scheduledWork = new Work(
+                    template,
+                    targetLevel >= TranslationPriority.SceneFallback,
+                    ++nextGeneration,
+                    pendingGeneration,
+                    targetLevel);
+                scheduled[template] = scheduledWork;
+                queuedLevels[template] = targetLevel;
+                GetQueueUnsafe(targetLevel).Enqueue(scheduledWork);
+            }
+            else
+            {
+                if (!CanScheduleUnsafe(template))
+                    return false;
+
                 RemoveCanceledPendingUnsafe(template);
-                scheduledWork = new Work(template, true, ++nextGeneration, pendingGeneration);
+                scheduledWork = new Work(
+                    template,
+                    isUrgentOrScene,
+                    ++nextGeneration,
+                    pendingGeneration,
+                    priority);
                 scheduled[template] = scheduledWork;
                 scheduledUtf8Bytes += Utf8Bytes(template);
+                queuedLevels[template] = priority;
+                GetQueueUnsafe(priority).Enqueue(scheduledWork);
             }
-            priorityQueue.Enqueue(scheduledWork);
-            queuedPriority.Add(template);
         }
-        if (added) signal.Release();
+
+        NotifyStateChanged();
         return true;
     }
 
@@ -142,24 +344,31 @@ public sealed class TranslationWorkQueue
         return false;
     }
 
-    private bool TryDequeue(out Work work)
+    public bool TryDequeueWork(out Work work)
     {
+        bool dequeued;
         lock (gate)
+            dequeued = TryDequeueUnsafe(out work);
+        if (dequeued)
+            StateChanged?.Invoke();
+        return dequeued;
+    }
+
+    private bool TryDequeue(out Work work) => TryDequeueWork(out work);
+
+    public async Task WaitForWorkAsync(CancellationToken token)
+    {
+        while (true)
         {
-            if (priorityQueue.Count > 0)
+            Task waitTask;
+            lock (gate)
             {
-                work = priorityQueue.Dequeue();
-                queuedPriority.Remove(work.Template);
-                return true;
+                if (HasQueuedWorkUnsafe)
+                    return;
+                waitTask = workPulse.WaitAsync();
             }
-            if (normalQueue.Count > 0)
-            {
-                work = normalQueue.Dequeue();
-                queuedNormal.Remove(work.Template);
-                return true;
-            }
-            work = default;
-            return false;
+
+            await waitTask.WaitAsync(token).ConfigureAwait(false);
         }
     }
 
@@ -167,8 +376,24 @@ public sealed class TranslationWorkQueue
     {
         while (true)
         {
-            await signal.WaitAsync(token).ConfigureAwait(false);
-            if (TryDequeue(out Work work)) return work;
+            Task? waitTask = null;
+            Work work;
+            var dequeued = false;
+            lock (gate)
+            {
+                if (TryDequeueUnsafe(out work))
+                    dequeued = true;
+                else
+                    waitTask = workPulse.WaitAsync();
+            }
+
+            if (dequeued)
+            {
+                StateChanged?.Invoke();
+                return work;
+            }
+
+            await waitTask!.WaitAsync(token).ConfigureAwait(false);
         }
     }
 
@@ -176,31 +401,34 @@ public sealed class TranslationWorkQueue
 
     public Work[] DrainPriorityWork()
     {
+        Work[] work;
         lock (gate)
         {
-            var work = priorityQueue
+            work = urgentQueue
                 .Concat(deferredPriority.Values)
                 .OrderBy(item => item.Generation)
                 .ToArray();
-            priorityQueue.Clear();
+            urgentQueue.Clear();
             foreach (var item in work)
             {
-                queuedPriority.Remove(item.Template);
+                queuedLevels.Remove(item.Template);
                 if (scheduled.TryGetValue(item.Template, out var scheduledWork)
                     && scheduledWork.Generation == item.Generation)
                     RemoveScheduledUnsafe(item.Template);
             }
             foreach (var template in deferredPriority.Keys.ToArray())
                 RemoveDeferredUnsafe(template);
-            return work;
         }
+
+        if (work.Length > 0)
+            NotifyStateChanged();
+        return work;
     }
 
     public bool Cancel(string template) => Cancel(template, long.MaxValue);
 
     public bool Cancel(string template, long pendingGeneration)
     {
-        var enqueueDeferred = false;
         lock (gate)
         {
             RecordPendingCancellationUnsafe(template, pendingGeneration);
@@ -211,48 +439,55 @@ public sealed class TranslationWorkQueue
                     RemoveDeferredUnsafe(template);
                 return false;
             }
-            if (scheduledWork.PendingGeneration > pendingGeneration) return false;
+            if (scheduledWork.PendingGeneration > pendingGeneration)
+                return false;
 
-            var wasQueued = queuedPriority.Contains(template) || queuedNormal.Contains(template);
+            var wasQueued = queuedLevels.Remove(template, out var queuedLevel);
             RemoveScheduledUnsafe(template);
             if (!wasQueued)
                 SetCanceledThroughUnsafe(template, scheduledWork.Generation);
+            else
+                RemoveQueued(GetQueueUnsafe(queuedLevel), template);
+
             if (deferredPriority.TryGetValue(template, out var queuedDeferredWork)
                 && queuedDeferredWork.PendingGeneration <= pendingGeneration)
+            {
                 RemoveDeferredUnsafe(template);
+            }
             else if (queuedDeferredWork.PendingGeneration > pendingGeneration)
             {
                 RemoveDeferredUnsafe(template);
                 _ = TrySetDeferredUnsafe(queuedDeferredWork);
             }
-            queuedPriority.Remove(template);
-            queuedNormal.Remove(template);
-            RemoveQueued(priorityQueue, template);
-            RemoveQueued(normalQueue, template);
-            if (enqueueDeferred) signal.Release();
         }
+
+        NotifyStateChanged();
         return true;
     }
 
     public bool IsCanceled(Work work)
     {
-        lock (gate) return canceledThrough.TryGetValue(work.Template, out var generation)
-            && generation >= work.Generation;
+        lock (gate)
+            return canceledThrough.TryGetValue(work.Template, out var generation)
+                && generation >= work.Generation;
     }
 
     public bool TryIfNotCanceled(Work work, Func<bool> action)
     {
-        lock (gate) return !IsCanceledUnsafe(work) && action();
+        lock (gate)
+            return !IsCanceledUnsafe(work) && action();
     }
 
     public void Finish(string template, bool succeeded)
     {
         lock (gate)
         {
-            if (succeeded) AddCompletedUnsafe(template);
+            if (succeeded)
+                AddCompletedUnsafe(template);
             RemoveScheduledUnsafe(template);
             RemoveCanceledUnsafe(template);
         }
+        NotifyStateChanged();
     }
 
     public void Finish(Work work, bool succeeded)
@@ -260,7 +495,8 @@ public sealed class TranslationWorkQueue
         var enqueueDeferred = false;
         lock (gate)
         {
-            if (succeeded && !IsCanceledUnsafe(work)) AddCompletedUnsafe(work.Template);
+            if (succeeded && !IsCanceledUnsafe(work))
+                AddCompletedUnsafe(work.Template);
             if (succeeded
                 && canceledPendingThrough.TryGetValue(work.Template, out var cutoff)
                 && work.PendingGeneration > cutoff)
@@ -281,22 +517,107 @@ public sealed class TranslationWorkQueue
                 RecordPendingCancellationUnsafe(work.Template, work.PendingGeneration - 1);
             RemoveCanceledUnsafe(work.Template);
         }
-        if (enqueueDeferred) signal.Release();
+
+        if (enqueueDeferred)
+            NotifyStateChanged();
+        else
+            StateChanged?.Invoke();
     }
 
     public Work? FinishAndTakeDeferred(Work work)
     {
+        Work? deferred;
         lock (gate)
         {
             if (scheduled.TryGetValue(work.Template, out var scheduledWork)
                 && scheduledWork.Generation == work.Generation)
                 RemoveScheduledUnsafe(work.Template);
-            var deferred = RemoveDeferredUnsafe(work.Template);
+            deferred = RemoveDeferredUnsafe(work.Template);
             if (work.PendingGeneration > 0)
                 RecordPendingCancellationUnsafe(work.Template, work.PendingGeneration - 1);
             RemoveCanceledUnsafe(work.Template);
-            return deferred;
         }
+        StateChanged?.Invoke();
+        return deferred;
+    }
+
+    private bool TryDequeueUnsafe(out Work work)
+    {
+        if (urgentQueue.Count > 0)
+        {
+            work = urgentQueue.Dequeue();
+            queuedLevels.Remove(work.Template);
+            return true;
+        }
+
+        var hasBackground = backgroundQueue.Count > 0;
+        if (!hasBackground || foregroundDequeuesSinceBackground < ForegroundBurstLimit)
+        {
+            var hasSceneFallback = sceneFallbackQueue.Count > 0;
+            var hasForeground = foregroundQueue.Count > 0;
+            if (hasSceneFallback
+                && (!hasForeground || sceneFallbackDequeuesSinceForeground < ForegroundBurstLimit))
+            {
+                work = sceneFallbackQueue.Dequeue();
+                queuedLevels.Remove(work.Template);
+                sceneFallbackDequeuesSinceForeground++;
+                foregroundDequeuesSinceBackground++;
+                return true;
+            }
+
+            if (hasForeground)
+            {
+                work = foregroundQueue.Dequeue();
+                queuedLevels.Remove(work.Template);
+                sceneFallbackDequeuesSinceForeground = 0;
+                foregroundDequeuesSinceBackground++;
+                return true;
+            }
+
+            if (hasSceneFallback)
+            {
+                work = sceneFallbackQueue.Dequeue();
+                queuedLevels.Remove(work.Template);
+                foregroundDequeuesSinceBackground++;
+                return true;
+            }
+        }
+
+        if (hasBackground)
+        {
+            work = backgroundQueue.Dequeue();
+            queuedLevels.Remove(work.Template);
+            foregroundDequeuesSinceBackground = 0;
+            return true;
+        }
+
+        work = default;
+        return false;
+    }
+
+    private Queue<Work> GetQueueUnsafe(TranslationPriority priority) =>
+        priority switch
+        {
+            TranslationPriority.Urgent => urgentQueue,
+            TranslationPriority.SceneFallback => sceneFallbackQueue,
+            TranslationPriority.Foreground => foregroundQueue,
+            _ => backgroundQueue,
+        };
+
+    private void NotifyStateChanged()
+    {
+        workPulse.PulseAll();
+        StateChanged?.Invoke();
+    }
+
+    private bool CanReserveUnsafe(string template) =>
+        reservations.Count < TranslationBudget.MaxWorkItems
+        && reservedUtf8Bytes + Utf8Bytes(template) <= TranslationBudget.MaxWorkItemUtf8Bytes;
+
+    private void AddReservationUnsafe(string template)
+    {
+        if (reservations.Add(template))
+            reservedUtf8Bytes += Utf8Bytes(template);
     }
 
     private bool CanScheduleUnsafe(string template)
@@ -309,9 +630,7 @@ public sealed class TranslationWorkQueue
             && cancellationCapacity;
     }
 
-    private void RemoveQueuedNormal(string template) => RemoveQueued(normalQueue, template);
-
-    private bool TrySetDeferredUnsafe(Work work, bool enqueueToQueue = false)
+    private bool TrySetDeferredUnsafe(Work work)
     {
         if (!deferredPriority.ContainsKey(work.Template))
         {
@@ -321,49 +640,51 @@ public sealed class TranslationWorkQueue
             deferredUtf8Bytes += Utf8Bytes(work.Template);
         }
         deferredPriority[work.Template] = work;
-        if (enqueueToQueue)
-        {
-            scheduled[work.Template] = work;
-            scheduledUtf8Bytes += Utf8Bytes(work.Template);
-            queuedPriority.Add(work.Template);
-            priorityQueue.Enqueue(work);
-        }
         return true;
     }
 
     private Work? RemoveDeferredUnsafe(string template)
     {
-        if (!deferredPriority.Remove(template, out var work)) return null;
+        if (!deferredPriority.Remove(template, out var work))
+            return null;
         deferredUtf8Bytes -= Utf8Bytes(template);
-        if (deferredUtf8Bytes < 0) deferredUtf8Bytes = 0;
+        if (deferredUtf8Bytes < 0)
+            deferredUtf8Bytes = 0;
         return work;
     }
 
     private void EnqueueDeferredPriorityUnsafe(Work work)
     {
+        if (reservations.Contains(work.Template))
+            return;
         RemoveCanceledPendingUnsafe(work.Template);
-        if (!CanScheduleUnsafe(work.Template)) return;
+        if (!CanScheduleUnsafe(work.Template))
+            return;
         scheduled[work.Template] = work;
         scheduledUtf8Bytes += Utf8Bytes(work.Template);
-        queuedPriority.Add(work.Template);
-        priorityQueue.Enqueue(work);
-        var ordered = priorityQueue.OrderBy(item => item.Generation).ToArray();
-        priorityQueue.Clear();
-        foreach (var item in ordered) priorityQueue.Enqueue(item);
+        queuedLevels[work.Template] = TranslationPriority.Urgent;
+        urgentQueue.Enqueue(work);
+        var ordered = urgentQueue.OrderBy(item => item.Generation).ToArray();
+        urgentQueue.Clear();
+        foreach (var item in ordered)
+            urgentQueue.Enqueue(item);
     }
 
     private void RemoveScheduledUnsafe(string template)
     {
-        if (!scheduled.Remove(template)) return;
+        if (!scheduled.Remove(template))
+            return;
         scheduledUtf8Bytes -= Utf8Bytes(template);
-        if (scheduledUtf8Bytes < 0) scheduledUtf8Bytes = 0;
+        if (scheduledUtf8Bytes < 0)
+            scheduledUtf8Bytes = 0;
     }
 
     private void SetCanceledThroughUnsafe(string template, long generation)
     {
         if (canceledThrough.TryGetValue(template, out var existing))
         {
-            if (generation > existing) canceledThrough[template] = generation;
+            if (generation > existing)
+                canceledThrough[template] = generation;
             return;
         }
         if (canceledThrough.Count >= TranslationBudget.MaxCancellationEntries
@@ -375,9 +696,11 @@ public sealed class TranslationWorkQueue
 
     private void RemoveCanceledUnsafe(string template)
     {
-        if (!canceledThrough.Remove(template)) return;
+        if (!canceledThrough.Remove(template))
+            return;
         canceledUtf8Bytes -= Utf8Bytes(template);
-        if (canceledUtf8Bytes < 0) canceledUtf8Bytes = 0;
+        if (canceledUtf8Bytes < 0)
+            canceledUtf8Bytes = 0;
     }
 
     private void AddCompletedUnsafe(string template)
@@ -392,11 +715,13 @@ public sealed class TranslationWorkQueue
             return;
         }
         var bytes = Utf8Bytes(template);
-        if (bytes > TranslationBudget.MaxWorkItemUtf8Bytes) return;
+        if (bytes > TranslationBudget.MaxWorkItemUtf8Bytes)
+            return;
         while (completed.Count >= TranslationBudget.MaxWorkItems
             || completedUtf8Bytes + bytes > TranslationBudget.MaxWorkItemUtf8Bytes)
         {
-            if (completedLru.First == null) return;
+            if (completedLru.First == null)
+                return;
             var oldest = completedLru.First.Value;
             completedLru.RemoveFirst();
             completedNodes.Remove(oldest);
@@ -411,11 +736,14 @@ public sealed class TranslationWorkQueue
 
     private void RecordPendingCancellationUnsafe(string template, long pendingGeneration)
     {
-        if (pendingGeneration <= 0 || pendingGeneration == long.MaxValue
-            || !TextTemplate.IsTranslationCandidate(template)) return;
+        if (pendingGeneration <= 0
+            || pendingGeneration == long.MaxValue
+            || !TextTemplate.IsTranslationCandidate(template))
+            return;
         if (canceledPendingThrough.TryGetValue(template, out var cutoff))
         {
-            if (pendingGeneration > cutoff) canceledPendingThrough[template] = pendingGeneration;
+            if (pendingGeneration > cutoff)
+                canceledPendingThrough[template] = pendingGeneration;
             return;
         }
         var bytes = Utf8Bytes(template);
@@ -428,13 +756,16 @@ public sealed class TranslationWorkQueue
 
     private void RemoveCanceledPendingUnsafe(string template)
     {
-        if (!canceledPendingThrough.Remove(template)) return;
+        if (!canceledPendingThrough.Remove(template))
+            return;
         canceledPendingUtf8Bytes -= Utf8Bytes(template);
-        if (canceledPendingUtf8Bytes < 0) canceledPendingUtf8Bytes = 0;
+        if (canceledPendingUtf8Bytes < 0)
+            canceledPendingUtf8Bytes = 0;
     }
 
     private bool IsCanceledUnsafe(Work work) =>
-        canceledThrough.TryGetValue(work.Template, out var generation) && generation >= work.Generation;
+        canceledThrough.TryGetValue(work.Template, out var generation)
+        && generation >= work.Generation;
 
     private bool IsPendingCanceledUnsafe(string template, long pendingGeneration) =>
         pendingGeneration > 0
@@ -447,7 +778,8 @@ public sealed class TranslationWorkQueue
         for (var index = 0; index < count; index++)
         {
             var current = queue.Dequeue();
-            if (!string.Equals(current.Template, template, StringComparison.Ordinal)) queue.Enqueue(current);
+            if (!string.Equals(current.Template, template, StringComparison.Ordinal))
+                queue.Enqueue(current);
         }
     }
 

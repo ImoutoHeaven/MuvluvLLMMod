@@ -391,7 +391,13 @@ namespace UnityEngine
 
         public static T[] FindObjectsByType<T>(FindObjectsInactive inactive, FindObjectsSortMode sortMode)
             where T : Object =>
-            objects.OfType<T>().Where(item => !item.destroyed).ToArray();
+            objects
+                .OfType<T>()
+                .Where(item => !item.destroyed
+                    && (inactive == FindObjectsInactive.Include
+                        || item is not MonoBehaviour behaviour
+                        || behaviour.gameObjectActive))
+                .ToArray();
 
         public static void Destroy(Object? value)
         {
@@ -413,6 +419,7 @@ namespace UnityEngine
     public class MonoBehaviour : Object
     {
         public bool enabled { get; set; } = true;
+        public bool gameObjectActive { get; set; } = true;
     }
 
     public static class Time

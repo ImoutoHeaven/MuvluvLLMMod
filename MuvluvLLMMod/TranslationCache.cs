@@ -34,6 +34,8 @@ public sealed class TranslationCache
     private readonly TimeSpan persistenceRetryDelay;
 
     private Dictionary<string, string> generated = new(StringComparer.Ordinal);
+    private readonly HashSet<string> sceneAuthoritative = new(StringComparer.Ordinal);
+    private readonly HashSet<string> sentenceGenerated = new(StringComparer.Ordinal);
     private readonly LinkedList<string> generatedLru = new();
     private readonly Dictionary<string, LinkedListNode<string>> generatedNodes = new(StringComparer.Ordinal);
     private long generatedUtf8Bytes;
@@ -183,6 +185,33 @@ public sealed class TranslationCache
     public PendingObservation ObserveNormalGeneration(string original, string normalizedTemplate) =>
         ObserveGeneration(original, normalizedTemplate, false);
 
+    public bool IsSceneAuthoritative(string normalizedTemplate)
+    {
+        lock (gate)
+            return generated.ContainsKey(normalizedTemplate)
+                && sceneAuthoritative.Contains(normalizedTemplate);
+    }
+
+    public bool IsSentenceGenerated(string normalizedTemplate)
+    {
+        lock (gate)
+            return generated.ContainsKey(normalizedTemplate)
+                && sentenceGenerated.Contains(normalizedTemplate);
+    }
+
+    public bool UnmarkPromotedPending(string normalizedTemplate)
+    {
+        lock (gate)
+        {
+            if (!acceptingMutations || !runtimePromotedPending.Remove(normalizedTemplate))
+                return false;
+            runtimePromotedPendingUtf8Bytes = Math.Max(
+                0,
+                runtimePromotedPendingUtf8Bytes - Utf8Bytes(normalizedTemplate));
+            return true;
+        }
+    }
+
     public bool StoreGenerated(string normalizedTemplate, string translatedTemplate)
     {
         if (!IsValidGeneratedPair(normalizedTemplate, translatedTemplate))
@@ -193,6 +222,8 @@ public sealed class TranslationCache
             if (!CanAcceptDurableMutationUnsafe()
                 || !TryStoreGeneratedUnsafe(normalizedTemplate, translatedTemplate))
                 return false;
+            sceneAuthoritative.Add(normalizedTemplate);
+            sentenceGenerated.Remove(normalizedTemplate);
             RemovePendingUnsafe(normalizedTemplate);
             runtimePromotedPending.Remove(normalizedTemplate);
             MarkDirtyUnsafe();
@@ -200,18 +231,62 @@ public sealed class TranslationCache
         }
     }
 
-    public bool StoreGeneratedIfPending(string normalizedTemplate, long pendingGeneration, string translatedTemplate)
+    public bool TryStoreSentenceGenerated(
+        string normalizedTemplate,
+        string translatedTemplate,
+        out bool persistedNew)
     {
+        persistedNew = false;
         if (!IsValidGeneratedPair(normalizedTemplate, translatedTemplate))
             return false;
 
         lock (gate)
         {
-            if (!CanAcceptDurableMutationUnsafe()
-                || !pendingGenerations.TryGetValue(normalizedTemplate, out var currentGeneration)
+            if (!CanAcceptDurableMutationUnsafe())
+                return false;
+            if (generated.ContainsKey(normalizedTemplate))
+                return true;
+            if (!TryStoreGeneratedUnsafe(normalizedTemplate, translatedTemplate))
+                return false;
+            sentenceGenerated.Add(normalizedTemplate);
+            RemovePendingUnsafe(normalizedTemplate);
+            runtimePromotedPending.Remove(normalizedTemplate);
+            MarkDirtyUnsafe();
+            persistedNew = true;
+            return true;
+        }
+    }
+
+    public bool StoreGeneratedIfPending(
+        string normalizedTemplate,
+        long pendingGeneration,
+        string translatedTemplate) =>
+        StoreGeneratedIfPending(normalizedTemplate, pendingGeneration, translatedTemplate, out _);
+
+    public bool StoreGeneratedIfPending(
+        string normalizedTemplate,
+        long pendingGeneration,
+        string translatedTemplate,
+        out bool supersededByScene)
+    {
+        supersededByScene = false;
+        if (!IsValidGeneratedPair(normalizedTemplate, translatedTemplate))
+            return false;
+
+        lock (gate)
+        {
+            if (!CanAcceptDurableMutationUnsafe())
+                return false;
+            if (sceneAuthoritative.Contains(normalizedTemplate))
+            {
+                supersededByScene = true;
+                return false;
+            }
+            if (!pendingGenerations.TryGetValue(normalizedTemplate, out var currentGeneration)
                 || currentGeneration != pendingGeneration
                 || !TryStoreGeneratedUnsafe(normalizedTemplate, translatedTemplate))
                 return false;
+            sentenceGenerated.Add(normalizedTemplate);
             RemovePendingUnsafe(normalizedTemplate);
             runtimePromotedPending.Remove(normalizedTemplate);
             MarkDirtyUnsafe();
@@ -404,6 +479,8 @@ public sealed class TranslationCache
             }
 
             generated.Clear();
+            sceneAuthoritative.Clear();
+            sentenceGenerated.Clear();
             generatedLru.Clear();
             generatedNodes.Clear();
             generatedUtf8Bytes = 0;
@@ -968,6 +1045,8 @@ public sealed class TranslationCache
     {
         if (!generated.Remove(normalizedTemplate, out var translated))
             return false;
+        sceneAuthoritative.Remove(normalizedTemplate);
+        sentenceGenerated.Remove(normalizedTemplate);
         if (generatedNodes.Remove(normalizedTemplate, out var node))
             generatedLru.Remove(node);
         generatedUtf8Bytes -= Utf8Bytes(normalizedTemplate) + Utf8Bytes(translated);

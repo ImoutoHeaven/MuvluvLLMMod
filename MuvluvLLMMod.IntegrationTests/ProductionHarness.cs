@@ -17,6 +17,8 @@ internal static class ProductionHarness
         UnityEngine.Object.ResetObjects();
         TMP_Text.ResetCounters();
         Keyboard.current = null;
+        Plugin.CreateSceneRetryRegistry = null;
+        Plugin.TerminalFlushBudgetOverride = null;
 
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -37,6 +39,8 @@ internal static class ProductionHarness
         UnityEngine.Object.ResetObjects();
         TMP_Text.ResetCounters();
         Keyboard.current = null;
+        Plugin.CreateSceneRetryRegistry = null;
+        Plugin.TerminalFlushBudgetOverride = null;
         Paths.PluginPath = Path.Combine(
             Path.GetTempPath(),
             "MuvluvLLMMod.integration." + Guid.NewGuid().ToString("N"));

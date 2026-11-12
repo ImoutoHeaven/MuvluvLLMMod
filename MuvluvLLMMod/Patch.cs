@@ -89,52 +89,7 @@ public static class Patch
         }
 
         if (pending is { } work)
-            EnqueueSceneRequest(work);
-    }
-
-    /// <summary>
-    /// Sends one whole-scene request and stores every accepted line as a generated template, the
-    /// entry the per-string path resolves. Lines the response did not validate stay on the
-    /// per-string path, and a failed request leaves every line there.
-    /// </summary>
-    private static void EnqueueSceneRequest(ScenePendingWork work)
-    {
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var batch = SceneTranslationBatch.TryCreate(work.SceneId, work.Lines);
-                if (batch is null)
-                    return;
-
-                var client = Plugin.CurrentSceneClient;
-                if (client is null)
-                    return;
-
-                var response = await client.SendSceneAsync(batch).ConfigureAwait(false);
-                if (!batch.TryParseResponse(response, out var translations))
-                {
-                    Logger.Warn(
-                        $"[LLM][Scene] response rejected scene={work.SceneId} targets={batch.TargetCount}");
-                    return;
-                }
-
-                var cache = Plugin.CurrentCache;
-                var stored = 0;
-                foreach (var pair in translations)
-                {
-                    if (cache?.StoreGenerated(pair.Key, pair.Value) == true)
-                        stored++;
-                }
-
-                Logger.Info(
-                    $"[LLM][Scene] translated scene={work.SceneId} targets={batch.TargetCount} accepted={translations.Count} stored={stored}");
-            }
-            catch (Exception exception)
-            {
-                Logger.Warn("[LLM][Scene] request failed: " + exception.GetType().Name);
-            }
-        });
+            Plugin.SubmitScene(work);
     }
 
     [HarmonyPrefix]
@@ -170,10 +125,24 @@ public static class Patch
         {
             if (Config.Translation.Value)
             {
-                value = Translation.ResolveAny(original, enqueue: true);
-                enqueueObservation = Translation.LastEnqueueObservation;
-                if (!string.Equals(value, original, StringComparison.Ordinal))
-                    tmpProvenance.Record(assignment, value, original);
+                if (origin == TmpTextAssignmentOrigin.PluginRefresh
+                    && tmpProvenance.TryGetRecordedSource(assignment, original, out var recordedSource))
+                {
+                    var upgraded = Core.Resolver.LookupKnownSource(recordedSource, enabled: true);
+                    if (!string.Equals(upgraded, recordedSource, StringComparison.Ordinal)
+                        && !string.Equals(upgraded, original, StringComparison.Ordinal))
+                    {
+                        value = upgraded;
+                        tmpProvenance.Record(assignment, value, recordedSource);
+                    }
+                }
+                else
+                {
+                    value = Translation.ResolveAny(original, enqueue: true);
+                    enqueueObservation = Translation.LastEnqueueObservation;
+                    if (!string.Equals(value, original, StringComparison.Ordinal))
+                        tmpProvenance.Record(assignment, value, original);
+                }
             }
             else
             {
@@ -205,7 +174,7 @@ public static class Patch
             return;
 
         var texts = UnityEngine.Object.FindObjectsByType<TMP_Text>(
-            FindObjectsInactive.Include,
+            FindObjectsInactive.Exclude,
             FindObjectsSortMode.None);
 
         foreach (var text in texts)

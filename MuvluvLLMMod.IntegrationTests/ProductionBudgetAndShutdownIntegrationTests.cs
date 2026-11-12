@@ -553,6 +553,115 @@ public sealed class ProductionBudgetAndShutdownIntegrationTests
     }
 
     [Fact]
+    public async Task Blocked_scene_retry_terminal_flush_in_real_plugin_cleanup_quarantines_without_hanging()
+    {
+        var writerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseWriter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var plugin = ProductionHarness.PreparePluginForLoad();
+        Plugin.CreateSceneRetryRegistry = (path, diagnostic) => new SceneRetryRegistry(
+            filePath: path,
+            diagnostic: diagnostic,
+            writeAtomic: (_, _) =>
+            {
+                writerEntered.TrySetResult();
+                releaseWriter.Task.GetAwaiter().GetResult();
+                return true;
+            });
+        Plugin.TerminalFlushBudgetOverride = TimeSpan.FromMilliseconds(80);
+
+        try
+        {
+            plugin.Load();
+            Config.LlmEnable.Value = true;
+            // Reload transitions asynchronously; wait or exercise no-active-translator SubmitScene,
+            // which marks SceneRetries and immediately starts the coalesced writer.
+            _ = Plugin.SubmitScene(new ScenePendingWork(
+                40000901,
+                new[] { new SceneDialogueLine("終了確認台詞です", "純夏") },
+                new[] { 0 }));
+            Assert.True(Plugin.CurrentSceneRetries!.Mark(40000902));
+            await writerEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            var unloadTask = Task.Run(() => plugin.Unload());
+            Assert.False(await unloadTask.WaitAsync(TimeSpan.FromSeconds(3)));
+            Assert.Equal(PluginLifecycleState.Failed, Plugin.CurrentGenerationState);
+            Assert.Empty(HarmonyLib.Harmony.SnapshotApplications());
+        }
+        finally
+        {
+            releaseWriter.TrySetResult();
+            _ = Plugin.CurrentSceneRetries?.FlushTerminal(TimeSpan.FromSeconds(1));
+            Plugin.CreateSceneRetryRegistry = null;
+            Plugin.TerminalFlushBudgetOverride = null;
+            var gateField = typeof(Plugin).GetField(
+                "lifecycleGate",
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            var stateField = typeof(PluginLifecycleGate).GetField(
+                "state",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            stateField?.SetValue(gateField?.GetValue(null), PluginLifecycleState.NotLoaded);
+            try { Directory.Delete(BepInEx.Paths.PluginPath, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Submit_scene_without_active_translator_persists_retry_marker_immediately()
+    {
+        var plugin = ProductionHarness.PreparePluginForLoad();
+        var writtenSignal = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Plugin.CreateSceneRetryRegistry = (path, diagnostic) => new SceneRetryRegistry(
+            filePath: path,
+            diagnostic: diagnostic,
+            writeAtomic: (_, json) =>
+            {
+                writtenSignal.TrySetResult(json);
+                return true;
+            });
+
+        try
+        {
+            plugin.Load();
+            // Detach config event temporarily or test before reload completes: set LlmEnable on
+            // the bound entry while MachineLifecycle has no active translator yet.
+            var reloadTask = Plugin.CurrentGenerationOwner;
+            Assert.NotNull(reloadTask);
+            Config.LlmEnable.Value = true;
+            // Shut down only the current machine or call SubmitScene on a fresh disabled-load
+            // machine lifecycle before transition finishes:
+            if (!Plugin.CurrentSceneRetries!.Contains(40000999))
+            {
+                // Force no-active-translator state deterministically, then call Plugin.SubmitScene.
+                var resourcesType = Plugin.CurrentGenerationOwner!.GetType();
+                var mlProp = resourcesType.GetProperty("MachineLifecycle")!;
+                var idleLifecycle = new MachineTranslatorLifecycle();
+                Assert.True(idleLifecycle.Initialize(false, 1, null));
+                var originalLifecycle = mlProp.GetValue(Plugin.CurrentGenerationOwner);
+                mlProp.SetValue(Plugin.CurrentGenerationOwner, idleLifecycle);
+                try
+                {
+                    Assert.Equal(0, Plugin.SubmitScene(new ScenePendingWork(
+                        40000999,
+                        new[] { new SceneDialogueLine("未起動時の台詞です", "純夏") },
+                        new[] { 0 })));
+                    var persistedJson = await writtenSignal.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                    Assert.Contains("40000999", persistedJson, StringComparison.Ordinal);
+                }
+                finally
+                {
+                    mlProp.SetValue(Plugin.CurrentGenerationOwner, originalLifecycle);
+                    idleLifecycle.Shutdown();
+                }
+            }
+        }
+        finally
+        {
+            _ = plugin.Unload();
+            Plugin.CreateSceneRetryRegistry = null;
+            try { Directory.Delete(BepInEx.Paths.PluginPath, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Timed_out_reload_is_terminal_and_retains_the_old_worker_for_cleanup()
     {
         var root = Path.Combine(Path.GetTempPath(), "MuvluvLLMMod.reload-fault." + Guid.NewGuid().ToString("N"));

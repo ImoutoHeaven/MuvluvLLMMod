@@ -6,6 +6,7 @@ public sealed class TranslationResolver
     private readonly Action<string, long> enqueuePriority;
     private readonly Action<string, long> enqueueNormal;
     private readonly Action<string, long>? cancel;
+    private readonly Func<string, bool>? isReserved;
 
     public TranslationResolver(
         TranslationCache cache,
@@ -35,12 +36,14 @@ public sealed class TranslationResolver
         TranslationCache cache,
         Action<string, long> enqueuePriority,
         Action<string, long> enqueueNormal,
-        Action<string, long>? cancel = null)
+        Action<string, long>? cancel = null,
+        Func<string, bool>? isReserved = null)
     {
         this.cache = cache;
         this.enqueuePriority = enqueuePriority;
         this.enqueueNormal = enqueueNormal;
         this.cancel = cancel;
+        this.isReserved = isReserved;
     }
 
     public string Resolve(string original, string? curated = null, bool enabled = true, bool priority = true)
@@ -94,7 +97,10 @@ public sealed class TranslationResolver
             cache.RemoveGenerated(normalized.Template);
         }
 
-        if (!enqueue || !TextTemplate.IsTranslationCandidate(source)) return original;
+        if (!enqueue
+            || !TextTemplate.IsTranslationCandidate(source)
+            || isReserved?.Invoke(normalized.Template) == true)
+            return original;
         if (priority)
         {
             var observation = cache.ObservePriorityGeneration(source, normalized.Template);
@@ -129,7 +135,9 @@ public sealed class TranslationResolver
 
     public void ObserveNormal(string template)
     {
-        if (!TextTemplate.IsTranslationCandidate(template)) return;
+        if (!TextTemplate.IsTranslationCandidate(template)
+            || isReserved?.Invoke(template) == true)
+            return;
         var observation = cache.ObserveNormalGeneration(template, template);
         if (observation.ShouldEnqueue) enqueueNormal(template, observation.Generation);
     }

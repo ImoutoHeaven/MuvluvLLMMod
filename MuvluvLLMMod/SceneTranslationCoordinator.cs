@@ -4,7 +4,7 @@ using Il2CppInterop.Runtime.InteropTypes.Arrays;
 namespace MuvluvLLMMod;
 
 /// <summary>
-/// Bridges the pure-logic scene batch to the game's frame arrays.
+/// Bridges the bounded chunked scene batch protocol to the game's frame arrays.
 ///
 /// Single reader: the game reads
 /// <c>SceneFrameMaster.ConfigurationJson</c> exactly once, inside
@@ -15,25 +15,48 @@ namespace MuvluvLLMMod;
 /// so a prefix on <c>GenerateFrames</c> is the single seam that reaches every consumer with no
 /// second pass.
 ///
-/// Translations already in the cache are applied immediately; the remaining lines are returned for
-/// one scene request. Accepted scene results are stored in the same generated-template cache the
-/// per-string path uses, so the next entry applies them here and the rendered text resolves them
-/// in the meantime. A line whose cached translation exists is never requested again.
+/// Only authoritative cached scene translations rewrite frame documents when display is enabled;
+/// unresolved or sentence-fallback lines keep their Japanese frame document intact even while LLM
+/// production is disabled so later scene passes can still collect and upgrade them, while the
+/// render layer displays any cached fallback in the meantime.
 /// </summary>
 internal static class SceneTranslationCoordinator
 {
-    /// <summary>
-    /// Applies the currently known translations to every frame document in the array, and returns
-    /// every dialogue line that still needs translating, in story order with its speaker. Returns null
-    /// when scene translation is disabled or nothing remains to translate.
-    /// </summary>
-    internal static ScenePendingWork? Prepare(Il2CppReferenceArray<SceneFrameMaster>? masters, long sceneId)
+    internal static ScenePendingWork? Prepare(Il2CppReferenceArray<SceneFrameMaster>? masters, long sceneId) =>
+        Prepare(
+            masters,
+            sceneId,
+            Config.SceneTranslation.Value,
+            Config.Translation.Value,
+            Config.LlmEnable.Value,
+            Plugin.CurrentCache,
+            Plugin.CurrentResolver,
+            Plugin.CurrentSceneRetries);
+
+    internal static ScenePendingWork? Prepare(
+        Il2CppReferenceArray<SceneFrameMaster>? masters,
+        long sceneId,
+        bool sceneTranslationEnabled,
+        bool displayEnabled,
+        bool llmEnabled,
+        TranslationCache? cache,
+        TranslationResolver? resolver,
+        SceneRetryRegistry? sceneRetries)
     {
-        if (!Config.Translation.Value || !Config.SceneTranslation.Value || masters is null)
+        if (!sceneTranslationEnabled || masters is null || sceneId <= 0)
             return null;
 
-        var pending = new List<SceneDialogueLine>();
+        if (!displayEnabled && !llmEnabled)
+            return null;
+
+        if (cache is null || resolver is null)
+            return null;
+
+        var retryPriority = sceneRetries?.Contains(sceneId) == true;
+        var sceneLines = new List<SceneDialogueLine>();
+        var targetIndices = new List<int>();
         var applied = 0;
+
         foreach (var master in masters)
         {
             if (master is null)
@@ -44,26 +67,47 @@ internal static class SceneTranslationCoordinator
             if (lines.Count == 0)
                 continue;
 
-            var known = new Dictionary<string, string>(StringComparer.Ordinal);
+            var known = displayEnabled
+                ? new Dictionary<string, string>(StringComparer.Ordinal)
+                : null;
             foreach (var line in lines)
             {
-                // Frame objects are cached by the game, so a re-entered scene can carry a document
-                // this seam already rewrote; a translation that still contains kana is not new work.
-                // ponytail: relies on the bounded reverse index, like the per-string path; once its
-                // entry is evicted such a line is requested again. Keep rewrite provenance per
-                // frame if that shows up in logs.
-                if (Plugin.CurrentCache?.IsKnownTranslatedValue(line.Text) == true)
-                    continue;
+                var sourceText = line.Text;
+                var alreadyTranslatedFrame = false;
+                if (cache.IsKnownTranslatedValue(line.Text))
+                {
+                    if (!cache.TryGetSourceForTranslatedValue(line.Text, out var recoveredSource))
+                        continue;
+                    sourceText = recoveredSource;
+                    alreadyTranslatedFrame = true;
+                }
 
-                var translated = Plugin.CurrentResolver?.Lookup(line.Text);
-                if (!string.IsNullOrEmpty(translated)
-                    && !string.Equals(translated, line.Text, StringComparison.Ordinal))
-                    known[line.Text] = translated;
-                else
-                    pending.Add(line);
+                var template = TextTemplate.Normalize(sourceText).Template;
+                var translated = resolver.LookupKnownSource(sourceText);
+                var hasCached = !string.IsNullOrEmpty(translated)
+                    && !string.Equals(translated, sourceText, StringComparison.Ordinal);
+                var isAuthoritative = hasCached
+                    && !cache.IsSentenceGenerated(template)
+                    && (!retryPriority || cache.IsSceneAuthoritative(template));
+
+                var lineIndex = sceneLines.Count;
+                sceneLines.Add(new SceneDialogueLine(sourceText, line.Speaker));
+                if (isAuthoritative)
+                {
+                    if (known is not null
+                        && (!alreadyTranslatedFrame
+                            || !string.Equals(translated, line.Text, StringComparison.Ordinal)))
+                    {
+                        known[line.Text] = translated!;
+                    }
+                }
+                else if (llmEnabled)
+                {
+                    targetIndices.Add(lineIndex);
+                }
             }
 
-            if (known.Count == 0)
+            if (known is null || known.Count == 0)
                 continue;
 
             var rewritten = SceneFrameDocument.TryRewrite(json, known);
@@ -74,14 +118,17 @@ internal static class SceneTranslationCoordinator
             applied++;
         }
 
-        if (applied > 0)
+        if (applied > 0 && Plugin.Log is not null)
             Logger.Info($"[LLM][Scene] applied cached translations scene={sceneId} frames={applied}");
 
-        return pending.Count == 0
-            ? null
-            : new ScenePendingWork(sceneId, pending);
+        return llmEnabled && targetIndices.Count > 0
+            ? new ScenePendingWork(sceneId, sceneLines, targetIndices)
+            : null;
     }
 }
 
-/// <summary>Dialogue awaiting a scene request, in story order.</summary>
-internal readonly record struct ScenePendingWork(long SceneId, IReadOnlyList<SceneDialogueLine> Lines);
+/// <summary>Scene dialogue lines and unresolved target indices awaiting chunked scene requests.</summary>
+internal readonly record struct ScenePendingWork(
+    long SceneId,
+    IReadOnlyList<SceneDialogueLine> SceneLines,
+    IReadOnlyList<int> TargetIndices);

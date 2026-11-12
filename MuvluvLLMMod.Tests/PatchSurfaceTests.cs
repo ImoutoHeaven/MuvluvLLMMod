@@ -58,15 +58,22 @@ public sealed class PatchSurfaceTests
     public void Scene_path_stores_accepted_lines_as_generated_templates()
     {
         var patch = ReadProductionSource("Patch.cs");
+        var machine = ReadProductionSource("MachineTranslator.cs");
+        var coordinator = ReadProductionSource("SceneTranslationPrimitives.cs");
 
         // The per-string path and the scene seam look translations up by source template, which
         // only the generated store answers; the reverse index alone never reaches the screen.
-        Assert.Contains("StoreGenerated(pair.Key, pair.Value)", patch, StringComparison.Ordinal);
+        Assert.Contains("Plugin.SubmitScene(work)", patch, StringComparison.Ordinal);
+        Assert.Contains(
+            "FindObjectsInactive.Exclude",
+            patch,
+            StringComparison.Ordinal);
+        Assert.Contains("StoreGenerated(pair.Key, pair.Value)", machine, StringComparison.Ordinal);
         Assert.DoesNotContain("RememberResolution", patch, StringComparison.Ordinal);
 
-        // A rejected or failed batch must leave the frames untouched and fall back to per-string.
-        Assert.Contains("batch.TryParseResponse", patch, StringComparison.Ordinal);
-        Assert.Contains("response rejected", patch, StringComparison.Ordinal);
+        // Rejected batches retry and fall back per chunk without mutating frame documents.
+        Assert.Contains("batch.TryParseResponse", coordinator, StringComparison.Ordinal);
+        Assert.Contains("response rejected", machine, StringComparison.Ordinal);
     }
 
     [Fact]

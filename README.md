@@ -37,14 +37,17 @@ Prefix, so builder output and other data sources are covered once they reach tha
 
 ## Scene translation
 
-Scenario dialogue has a second route. A scene's frame documents are rewritten before the game
-consumes them, so one request covers the whole scene and the model sees every line in order with its
-speaker name. That is what keeps a speaker's tone, honorifics, and terminology consistent within a
-scene. Accepted lines are stored in the same generated-template cache as per-string results: every
-later entry of the scene applies them to the frame documents with no request, and lines still on
-screen pick them up at the next refresh. A line containing the player-name placeholder
-`%usernameusernameuserna%` renders with the name substituted, so on first play it is served by the
-per-string path and the scene result applies from the next entry.
+Scenario dialogue has a second route. Authoritative cached scene translations rewrite a scene's
+frame documents before the game consumes them, while unresolved lines are split in story order into
+bounded chunks of up to 24 normalized templates, each carrying surrounding scene dialogue and
+speaker names as read-only context. Chunks dispatch concurrently in story order within
+`RequestsPerSecond` and `MaxInFlight` while holding template reservations so displayed lines do not
+trigger duplicate per-string requests. Accepted lines are stored as authoritative generated
+templates: later scene entries apply them to the frame documents with no request, and active
+`TMP_Text` instances on screen pick them up or upgrade earlier per-string fallbacks at the next
+refresh. A line containing the player-name placeholder `%usernameusernameuserna%` renders with the
+name substituted, so on first play it is served by the urgent per-string path and the scene result
+applies from the next entry.
 
 Evidence for the seam is single-reader: the game reads
 `SceneFrameMaster.ConfigurationJson` exactly once, and that frame factory runs before `Refresh`
@@ -52,14 +55,17 @@ publishes the frame view models.
 
 Only dialogue `Text` is translated in the batch. Each line carries its `SpeakerName` as context
 (null for narration); speaker and team names themselves are translated once each by the per-string
-path.
+path, with unreserved scenario text prioritized ahead of scene chunks and preempting the latest
+in-flight chunk when slots stay full.
 
 Validation of a scene response is per line within a checked structure. The response must echo the
 protocol version and scene id and carry exactly one entry per target, in order, with matching ids;
-otherwise the whole response is discarded. Each entry is then accepted only when it restores to the
-exact protected token sequence with matching placeholders and markup, and is not the source itself.
-Protected tokens include `%name%` placeholders, so the player-name placeholder always survives.
-A line that fails is dropped and stays on the per-string path, while the rest of the scene is kept.
+structural or empty rejections retry with the rejection reason before falling back to the
+per-string queue and recording the scene in `scene-retries.v1.json` for a later scene-level pass.
+Each entry is accepted only when it restores to the exact protected token sequence with matching
+placeholders and markup, and is not the source itself. Protected tokens include `%name%`
+placeholders, so the player-name placeholder always survives. A line that fails stays on the per-string path, while the rest of the chunk is kept, and late per-string completions do not
+overwrite authoritative scene translations.
 
 The scene route shares the bounded text, request, and cache budgets with the rest of the plugin; a
 scene payload has its own ceiling because one scene is larger than one line. `__MLM_FMT_n__` tokens,
@@ -84,7 +90,7 @@ Drop `MuvluvLLMMod.dll` into `<GameDir>/BepInEx/plugins/`. Launch once to genera
 | Key | Default | Meaning |
 |---|---|---|
 | `Enable` | `true` | Whether this plugin's known translations are displayed. Toggled at runtime with **F2**; it does not stop translation production. |
-| `SceneTranslation` | `true` | Sends a whole scene's dialogue as one request so terminology and tone stay consistent across it. Turning this off falls back to per-string translation. |
+| `SceneTranslation` | `true` | Translates scenario dialogue in bounded story-order chunks with surrounding scene context so terminology and tone stay consistent across the scene. Turning this off falls back to per-string translation. |
 
 ### `[Translation.Debug]`
 
@@ -100,8 +106,8 @@ Drop `MuvluvLLMMod.dll` into `<GameDir>/BepInEx/plugins/`. Launch once to genera
 | `Endpoint` | `http://127.0.0.1:11434/v1/chat/completions` | OpenAI-compatible chat completions URL |
 | `Model` | `qwen2.5:7b` | Model name |
 | `ApiKey` | *(empty)* | Sent as `Authorization: Bearer` when set |
-| `TimeoutSeconds` | `30` | Per-request timeout |
-| `RetryCount` | `3` | Total attempts per request |
+| `TimeoutSeconds` | `30` | Per-string request timeout in seconds; scene chunk requests use `3x` this value (clamped to `1..180` seconds) |
+| `RetryCount` | `3` | Total attempts per per-string request (`1..8`); scene chunks attempt `max(4, RetryCount + 1)` up to `8` |
 | `RequestsPerSecond` | `2` | Outbound rate limit |
 | `MaxInFlight` | `5` | Concurrent request ceiling |
 | `TranslatePeriodSeconds` | `5` | Retry-scan period for failed items |

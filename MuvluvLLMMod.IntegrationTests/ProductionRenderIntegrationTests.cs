@@ -179,6 +179,157 @@ public sealed class ProductionRenderIntegrationTests
         }
     }
 
+    [Fact]
+    public void Periodic_refresh_scans_only_active_tmp_objects()
+    {
+        using var fixture = ProductionHarness.LoadPlugin();
+        var cache = Plugin.CurrentCache!;
+
+        var activeLabel = new TMP_Text();
+        var disabledComponentOnActiveObject = new TMP_Text { enabled = false, gameObjectActive = true };
+        var inactiveLabel = new TMP_Text { gameObjectActive = false };
+        activeLabel.text = "有効な表示です";
+        disabledComponentOnActiveObject.text = "無効コンポーネントです";
+        inactiveLabel.text = "非表示の項目です";
+
+        Assert.True(cache.StoreGenerated("有効な表示です", "有效显示"));
+        Assert.True(cache.StoreGenerated("無効コンポーネントです", "禁用组件仍属于活动对象"));
+        Assert.True(cache.StoreGenerated("非表示の項目です", "隐藏项目"));
+
+        Patch.RefreshAllTmpText();
+        Assert.Equal("有效显示", activeLabel.text);
+        Assert.Equal("禁用组件仍属于活动对象", disabledComponentOnActiveObject.text);
+        Assert.Equal("非表示の項目です", inactiveLabel.text);
+
+        inactiveLabel.gameObjectActive = true;
+        Patch.RefreshAllTmpText();
+        Assert.Equal("隐藏项目", inactiveLabel.text);
+    }
+
+    [Fact]
+    public void Sentence_fallback_is_not_baked_into_frame_documents_while_llm_is_off_so_reentry_upgrades_it()
+    {
+        using var fixture = ProductionHarness.LoadPlugin();
+        var cache = Plugin.CurrentCache!;
+        var resolver = Plugin.CurrentResolver!;
+        var retries = Plugin.CurrentSceneRetries!;
+
+        const string kanaFreeFallbackSource = "最初の台詞です";
+        const string kanaBearingFallbackSource = "ファリスの声です";
+        Assert.True(cache.ObservePriority(kanaFreeFallbackSource, kanaFreeFallbackSource));
+        Assert.True(cache.TryGetPendingGeneration(kanaFreeFallbackSource, out var gen1));
+        Assert.True(cache.StoreGeneratedIfPending(kanaFreeFallbackSource, gen1, "第一句逐句译文"));
+
+        Assert.True(cache.ObservePriority(kanaBearingFallbackSource, kanaBearingFallbackSource));
+        Assert.True(cache.TryGetPendingGeneration(kanaBearingFallbackSource, out var gen2));
+        Assert.True(cache.StoreGeneratedIfPending(kanaBearingFallbackSource, gen2, "ファリス的声音"));
+
+        var masters = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Assets.Api.Client.SceneFrameMaster>(
+            new Assets.Api.Client.SceneFrameMaster
+            {
+                ConfigurationJson = "{\"Phrase\":{\"Text\":\"最初の台詞です\",\"SpeakerName\":\"純夏\"}}"
+            },
+            new Assets.Api.Client.SceneFrameMaster
+            {
+                ConfigurationJson = "{\"Phrase\":{\"Text\":\"ファリスの声です\",\"SpeakerName\":\"ファリス\"}}"
+            });
+
+        // Re-entry while LLM is disabled must leave sentence fallbacks out of ConfigurationJson
+        // (the TMP render path still serves them), so re-enabling LLM on the same cached masters
+        // targets both lines for scene-level upgrade.
+        var whileOff = SceneTranslationCoordinator.Prepare(
+            masters,
+            40000201,
+            sceneTranslationEnabled: true,
+            displayEnabled: true,
+            llmEnabled: false,
+            cache,
+            resolver,
+            retries);
+        Assert.Null(whileOff);
+        Assert.Contains("最初の台詞です", masters[0].ConfigurationJson, StringComparison.Ordinal);
+        Assert.Contains("ファリスの声です", masters[1].ConfigurationJson, StringComparison.Ordinal);
+
+        var whileOn = SceneTranslationCoordinator.Prepare(
+            masters,
+            40000201,
+            sceneTranslationEnabled: true,
+            displayEnabled: true,
+            llmEnabled: true,
+            cache,
+            resolver,
+            retries);
+        Assert.NotNull(whileOn);
+        Assert.Equal(new[] { 0, 1 }, whileOn!.Value.TargetIndices);
+    }
+
+    [Fact]
+    public void Scene_translation_upgrades_displayed_sentence_fallback_and_preserves_f2_source_restore()
+    {
+        using var fixture = ProductionHarness.LoadPlugin();
+        var cache = Plugin.CurrentCache!;
+
+        const string source = "ファリスの声";
+        Assert.True(cache.ObservePriority(source, source));
+        Assert.True(cache.TryGetPendingGeneration(source, out var pendingGeneration));
+        Assert.True(cache.StoreGeneratedIfPending(source, pendingGeneration, "法里斯的声音"));
+
+        var label = new TMP_Text();
+        label.text = source;
+        Assert.Equal("法里斯的声音", label.text);
+
+        // Authoritative scene batch completes and overrides the earlier sentence fallback.
+        Assert.True(cache.StoreGenerated(source, "法莉丝的声音"));
+        Patch.RefreshAllTmpText();
+        Assert.Equal("法莉丝的声音", label.text);
+
+        // F2 display-off must still restore the original Japanese source, not the intermediate
+        // sentence translation.
+        Config.Translation.Value = false;
+        Patch.RefreshAllTmpText();
+        Assert.Equal(source, label.text);
+    }
+
+    [Fact]
+    public void Active_scene_reservation_holds_displayed_line_from_duplicate_per_string_enqueue()
+    {
+        using var fixture = ProductionHarness.LoadPlugin();
+        var cache = Plugin.CurrentCache!;
+
+        var machine = new MachineTranslator(
+            cache,
+            static (_, _) => Task.FromResult<string?>("逐句译文"),
+            maxInFlight: 2,
+            translatePeriod: TimeSpan.FromSeconds(10),
+            sendScenePrompt: async (_, onDispatched, ct) =>
+            {
+                onDispatched?.Invoke();
+                await Task.Delay(TimeSpan.FromSeconds(30), ct);
+                return new ScenePromptResponse(false, null);
+            });
+        machine.Start();
+        try
+        {
+            var resolver = new TranslationResolver(
+                cache,
+                (template, gen) => machine.EnqueuePriority(template, gen),
+                (template, gen) => machine.EnqueueNormal(template, gen),
+                (template, gen) => machine.Cancel(template, gen),
+                machine.IsReserved);
+
+            var lines = new[] { new SceneDialogueLine("予約された台詞です", "純夏") };
+            Assert.Equal(1, machine.SubmitScene(40000101, lines, new[] { 0 }));
+            Assert.True(machine.IsReserved("予約された台詞です"));
+
+            Assert.Equal("予約された台詞です", resolver.Resolve("予約された台詞です", priority: true));
+            Assert.Empty(cache.PendingSnapshot());
+        }
+        finally
+        {
+            machine.Stop();
+        }
+    }
+
     private static class FakeSkillDescriptionBuilder
     {
         public static string GetDescription() => "技能を説明する";

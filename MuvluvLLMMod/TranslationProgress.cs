@@ -14,6 +14,13 @@ public sealed class TranslationProgress
     public void Complete(string template)
     {
         Interlocked.Decrement(ref inFlight);
+        RecordTranslated(template);
+    }
+
+    public void FinishInFlight() => Interlocked.Decrement(ref inFlight);
+
+    public void RecordTranslated(string template)
+    {
         Interlocked.Increment(ref completed);
         lock (gate) RemoveFailedUnsafe(template);
     }

@@ -28,7 +28,13 @@ public sealed class RequestRateLimiter
         }
     }
 
-    public async Task<T> StartAsync<T>(Func<Task<T>> startRequest, CancellationToken token)
+    public Task<T> StartAsync<T>(Func<Task<T>> startRequest, CancellationToken token) =>
+        StartAsync(startRequest, null, token);
+
+    public async Task<T> StartAsync<T>(
+        Func<Task<T>> startRequest,
+        Action? onStarted,
+        CancellationToken token)
     {
         await startGate.WaitAsync(token).ConfigureAwait(false);
         Task<T> request;
@@ -36,6 +42,8 @@ public sealed class RequestRateLimiter
         {
             var delay = Reserve(DateTime.UtcNow);
             if (delay > TimeSpan.Zero) await Task.Delay(delay, token).ConfigureAwait(false);
+            onStarted?.Invoke();
+            token.ThrowIfCancellationRequested();
             request = startRequest();
         }
         finally

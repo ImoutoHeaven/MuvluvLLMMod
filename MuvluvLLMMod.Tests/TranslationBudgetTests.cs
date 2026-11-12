@@ -92,6 +92,53 @@ public sealed class TranslationBudgetTests : IDisposable
         Assert.InRange(queueSnapshot.CanceledCount, 0, TranslationBudget.MaxCancellationEntries);
         Assert.InRange(queueSnapshot.CanceledUtf8Bytes, 0, TranslationBudget.MaxCancellationUtf8Bytes);
 
+        // Reservation reclamation (ReservedFromPending) and direct reservation share the same
+        // count and UTF-8 byte ceiling; reclaiming queued work can never bypass MaxWorkItems.
+        var reservationQueue = new TranslationWorkQueue();
+        for (var round = 0; round < 3; round++)
+        {
+            for (var index = 0; index < 2000; index++)
+            {
+                var candidate = $"予約境界-{round}-{index}です";
+                _ = reservationQueue.Enqueue(candidate);
+                _ = reservationQueue.TryReserve(candidate, static () => false);
+            }
+        }
+        var reservationSnapshot = reservationQueue.RetainedSnapshot;
+        Assert.InRange(reservationSnapshot.ReservedCount, 0, TranslationBudget.MaxWorkItems);
+        Assert.InRange(reservationSnapshot.ReservedUtf8Bytes, 0, TranslationBudget.MaxWorkItemUtf8Bytes);
+
+        // Exercise the UTF-8 byte cap independently of MaxWorkItems: ~90 x 4000-kana templates
+        // (~12 KiB UTF-8 each) fill 1 MiB long before 4096 items, rejecting reclamation while
+        // leaving the queued item intact until a reservation is released.
+        var byteCapQueue = new TranslationWorkQueue();
+        string? firstReservedLarge = null;
+        var reservedLargeCount = 0;
+        for (var index = 0; index < 120; index++)
+        {
+            var largeTemplate = new string('あ', 4000) + index + "です";
+            if (!byteCapQueue.TryReserve(largeTemplate, static () => false, out var status))
+            {
+                Assert.Equal(TranslationReservationStatus.BudgetExceeded, status);
+                break;
+            }
+            firstReservedLarge ??= largeTemplate;
+            reservedLargeCount++;
+        }
+
+        Assert.InRange(reservedLargeCount, 1, 200);
+        var queuedOverflow = new string('い', 4000) + "です";
+        Assert.True(byteCapQueue.Enqueue(queuedOverflow));
+        Assert.False(byteCapQueue.TryReserve(queuedOverflow, static () => false, out var overflowStatus));
+        Assert.Equal(TranslationReservationStatus.BudgetExceeded, overflowStatus);
+        Assert.Equal(1, byteCapQueue.QueuedCount);
+
+        byteCapQueue.ReleaseReservation(firstReservedLarge!);
+        Assert.True(byteCapQueue.TryReserve(queuedOverflow, static () => false, out var reclaimedStatus));
+        Assert.Equal(TranslationReservationStatus.ReservedFromPending, reclaimedStatus);
+        Assert.Equal(0, byteCapQueue.QueuedCount);
+        Assert.InRange(byteCapQueue.RetainedSnapshot.ReservedUtf8Bytes, 0, TranslationBudget.MaxWorkItemUtf8Bytes);
+
         var backlog = new TranslationPriorityBacklog();
         var retry = new TranslationRetryPolicy(1);
         var progress = new TranslationProgress();

@@ -230,6 +230,38 @@ public sealed class TmpTranslationProvenance
     }
 
     /// <summary>
+    /// Reads the recorded source for a still-current plugin-owned translation during refresh so an
+    /// upgraded generated entry (such as a scene translation overriding an earlier per-string
+    /// fallback) can replace the displayed text without losing its original source provenance.
+    /// </summary>
+    public bool TryGetRecordedSource(
+        TmpTextAssignment assignment,
+        string currentText,
+        out string source)
+    {
+        source = string.Empty;
+        lock (gate)
+        {
+            if (!TryGetCurrentSlotUnsafe(assignment, out var slot))
+                return false;
+
+            var entry = slot.Entry;
+            if (entry == null || entry.Generation != assignment.Generation)
+                return false;
+
+            if (!string.Equals(entry.TranslatedValue, currentText, StringComparison.Ordinal))
+            {
+                ClearEntryUnsafe(slot);
+                return false;
+            }
+
+            TouchUnsafe(slot);
+            source = entry.Source;
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Decides whether the guarded refresh path may restore the current value. Any mismatch,
     /// failed reverse lookup, or lookup exception permanently discards the entry.
     /// </summary>
