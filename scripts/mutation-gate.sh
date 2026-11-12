@@ -5,7 +5,7 @@ set -euo pipefail
 # every mutant is made in a separate throwaway copy under /tmp and is deleted on exit.
 SOURCE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PROJECT="MuvluvLLMMod.IntegrationTests/MuvluvLLMMod.IntegrationTests.csproj"
-EXPECTED_BASELINE=53
+EXPECTED_BASELINE=61
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/muvluv-fr4.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 ROOT="$WORK/base"
@@ -161,8 +161,8 @@ gate_mutant() {
             ;;
         M2-extra-nonrender-hook)
             replace_once "$copy/MuvluvLLMMod/Patch.cs" \
-                $'[HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Leave))]\n    public static void SetIsNotPlayingScenario()' \
-                $'[HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Leave))]\n    [HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Refresh), new Type[] { })]\n    public static void SetIsNotPlayingScenario()'
+                $'[HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Leave))]\n    public static void SetIsNotPlayingScenario(ScenarioController __instance)' \
+                $'[HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Leave))]\n    [HarmonyPatch(typeof(ScenarioController), nameof(ScenarioController.Refresh), new Type[] { })]\n    public static void SetIsNotPlayingScenario(ScenarioController __instance)'
             ;;
         FR3-1-remove-epoch-overflow-guard)
             replace_once "$copy/MuvluvLLMMod/TranslationCache.cs" \

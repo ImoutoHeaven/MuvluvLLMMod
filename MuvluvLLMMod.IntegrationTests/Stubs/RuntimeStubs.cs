@@ -383,7 +383,9 @@ namespace UnityEngine
         }
 
         private bool destroyed;
+        internal bool IsDestroyed => destroyed;
         public int InstanceId { get; }
+        public IntPtr Pointer => new(InstanceId);
 
         public int GetInstanceID() => InstanceId;
 
@@ -420,6 +422,7 @@ namespace UnityEngine
     {
         public bool enabled { get; set; } = true;
         public bool gameObjectActive { get; set; } = true;
+        public bool isActiveAndEnabled => !IsDestroyed && enabled && gameObjectActive;
     }
 
     public static class Time
@@ -579,11 +582,91 @@ namespace TMPro
     }
 }
 
+public sealed class TextMeshProRuby : UnityEngine.MonoBehaviour
+{
+    private static readonly System.Text.RegularExpressions.Regex RubyMarkup =
+        new(@"<r=(?:""([^""]*)""|([^>]*))>(.*?)</r>", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    private string currentText = string.Empty;
+
+    public TMPro.TMP_Text? tmpText { get; set; }
+    public bool fixedLineHeight { get; set; } = true;
+
+    public string Text
+    {
+        get => currentText;
+        set
+        {
+            currentText = value ?? string.Empty;
+            Apply();
+        }
+    }
+
+    public void Apply()
+    {
+        if (tmpText == null)
+            return;
+
+        var expanded = RubyMarkup.Replace(
+            currentText,
+            static match =>
+            {
+                var ruby = match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value;
+                var body = match.Groups[3].Value;
+                return $"{body}<space=-1.000em><voffset=1em><size=50%>{ruby}</size></voffset>";
+            });
+        tmpText.text = fixedLineHeight ? $"<line-height=2.000em>{expanded}" : expanded;
+    }
+}
+
+namespace UniRx
+{
+    public sealed class ReactiveProperty<T>
+    {
+        private readonly List<Action<T?>> observers = new();
+        private T? currentValue;
+
+        public T? Value
+        {
+            get => currentValue;
+            set
+            {
+                currentValue = value;
+                foreach (var observer in observers.ToArray())
+                    observer(value);
+            }
+        }
+
+        public void Subscribe(Action<T?> observer) => observers.Add(observer);
+    }
+}
+
+namespace Il2CppSystem.Collections.Generic
+{
+    public sealed class List<T>
+    {
+        private readonly System.Collections.Generic.List<T> items = new();
+
+        public int Count => items.Count;
+        public T this[int index] => items[index];
+        public void Add(T item) => items.Add(item);
+        public void Clear() => items.Clear();
+    }
+}
+
 namespace Assets.GameUi.Service
 {
     /// <summary>Only the scene-download seam referenced by production code is modelled.</summary>
     public sealed class EpisodeService
     {
+    }
+}
+
+namespace Assets.GameUi.Services
+{
+    public class IScenarioService
+    {
+        public virtual string ReplaceUsernamePlaceholder(string text) => text;
     }
 }
 
@@ -595,28 +678,343 @@ namespace Assets.Api.Client
     /// </summary>
     public sealed class SceneFrameMaster
     {
-        public string ConfigurationJson { get; set; } = string.Empty;
+        private string configurationJson = string.Empty;
+
+        public long Id { get; set; }
+        public int Order { get; set; }
+        public Action? OnReadConfigurationJson { get; set; }
+        public Action? OnWriteConfigurationJson { get; set; }
+
+        public string ConfigurationJson
+        {
+            get
+            {
+                OnReadConfigurationJson?.Invoke();
+                return configurationJson;
+            }
+            set
+            {
+                OnWriteConfigurationJson?.Invoke();
+                configurationJson = value ?? string.Empty;
+            }
+        }
+    }
+}
+
+namespace Assets.GameUi.Scenario.Configuration
+{
+    public enum ScenarioTextSize
+    {
+        Medium = 0,
+    }
+
+    public sealed class ScenarioPhraseConfiguration
+    {
+        public string Text { get; set; } = string.Empty;
+        public string SpeakerName { get; set; } = string.Empty;
+        public string TeamName { get; set; } = string.Empty;
+        public string DisplayText { get; set; } = string.Empty;
+        public string DisplaySpeakerName { get; set; } = string.Empty;
+        public string DisplayTeamName { get; set; } = string.Empty;
+
+        public void ConvertStringToDisplay(Assets.GameUi.Services.IScenarioService scenarioService)
+        {
+            DisplayText = scenarioService.ReplaceUsernamePlaceholder(Text);
+            DisplaySpeakerName = scenarioService.ReplaceUsernamePlaceholder(SpeakerName);
+            DisplayTeamName = scenarioService.ReplaceUsernamePlaceholder(TeamName);
+        }
+    }
+}
+
+namespace Assets.GameUi.Scenario.Text
+{
+    public sealed class ScenarioTextComponent : UnityEngine.MonoBehaviour
+    {
+        public sealed class SentenceViewModel
+        {
+            public string Text { get; set; } = string.Empty;
+            public Assets.GameUi.Scenario.Configuration.ScenarioTextSize FontSize { get; set; }
+            public bool ContainsRuby { get; set; }
+            public bool AtEnd { get; set; }
+        }
+
+        public global::TextMeshProRuby? sentenceText { get; set; }
+        public int ApplySentenceCalls { get; private set; }
+        public SentenceViewModel? LastSentence { get; private set; }
+
+        public void ApplySentence(SentenceViewModel sentence)
+        {
+            ApplySentenceCalls++;
+            LastSentence = sentence;
+            if (sentenceText != null)
+                sentenceText.Text = sentence.Text;
+        }
+    }
+
+    public sealed class ScenarioTextTimer : UnityEngine.MonoBehaviour
+    {
+        private static readonly System.Text.RegularExpressions.Regex RubySegment =
+            new(@"<r=(?:""[^""]*""|[^>]*)>(.*?)</r>", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        public sealed class ScenarioTextTimerText
+        {
+            public ScenarioTextComponent.SentenceViewModel? Sentence { get; set; }
+        }
+
+        private string activeRawText = string.Empty;
+        private int visibleLength;
+        private int totalVisibleLength;
+
+        public UniRx.ReactiveProperty<ScenarioTextTimerText> Model { get; } = new();
+        public bool Disposed { get; private set; } = true;
+        public int ApplyCalls { get; private set; }
+        public Assets.GameUi.Scenario.ScenarioController.TextViewModel? LastModel { get; private set; }
+
+        public void Apply(Assets.GameUi.Scenario.ScenarioController.TextViewModel? model)
+        {
+            MuvluvLLMMod.Patch.ObserveScenarioTimerApply(this, model);
+            ApplyCalls++;
+            LastModel = model;
+            if (model?.Sentence == null)
+            {
+                Disposed = true;
+                activeRawText = string.Empty;
+                visibleLength = 0;
+                totalVisibleLength = 0;
+                Model.Value = new ScenarioTextTimerText
+                {
+                    Sentence = new ScenarioTextComponent.SentenceViewModel { Text = string.Empty, AtEnd = true }
+                };
+                return;
+            }
+
+            activeRawText = model.Sentence.Text ?? string.Empty;
+            totalVisibleLength = CountVisibleCharacters(activeRawText);
+            visibleLength = 0;
+            if (totalVisibleLength == 0)
+            {
+                Disposed = true;
+                Model.Value = new ScenarioTextTimerText
+                {
+                    Sentence = new ScenarioTextComponent.SentenceViewModel { Text = string.Empty, AtEnd = true }
+                };
+                return;
+            }
+
+            Disposed = false;
+        }
+
+        public bool StepTick(int characters = 1)
+        {
+            if (Disposed)
+                return false;
+
+            visibleLength = Math.Min(totalVisibleLength, visibleLength + Math.Max(1, characters));
+            var slice = SliceTaggedPrefix(activeRawText, visibleLength);
+            var atEnd = visibleLength >= totalVisibleLength;
+            if (atEnd)
+                Disposed = true;
+
+            Model.Value = new ScenarioTextTimerText
+            {
+                Sentence = new ScenarioTextComponent.SentenceViewModel
+                {
+                    Text = slice,
+                    ContainsRuby = slice.Contains("<r=", StringComparison.OrdinalIgnoreCase),
+                    AtEnd = atEnd,
+                }
+            };
+            return !atEnd;
+        }
+
+        public void Complete()
+        {
+            if (!Disposed)
+                StepTick(Math.Max(1, totalVisibleLength - visibleLength));
+        }
+
+        public void Dispose()
+        {
+            Disposed = true;
+            activeRawText = string.Empty;
+            visibleLength = 0;
+            totalVisibleLength = 0;
+        }
+
+        private static int CountVisibleCharacters(string text) =>
+            RubySegment.Replace(text, "$1").Length;
+
+        private static string SliceTaggedPrefix(string text, int maxVisible)
+        {
+            if (maxVisible <= 0 || string.IsNullOrEmpty(text))
+                return string.Empty;
+
+            var builder = new System.Text.StringBuilder(text.Length);
+            var remaining = maxVisible;
+            var cursor = 0;
+            foreach (System.Text.RegularExpressions.Match match in RubySegment.Matches(text))
+            {
+                if (remaining <= 0)
+                    break;
+
+                if (match.Index > cursor)
+                {
+                    var plainChunk = text.Substring(cursor, match.Index - cursor);
+                    var takePlain = Math.Min(remaining, plainChunk.Length);
+                    builder.Append(plainChunk, 0, takePlain);
+                    remaining -= takePlain;
+                    if (remaining <= 0)
+                        return builder.ToString();
+                }
+
+                var openEnd = text.IndexOf('>', match.Index);
+                var openTag = text.Substring(match.Index, openEnd - match.Index + 1);
+                var body = match.Groups[1].Value;
+                var takeBody = Math.Min(remaining, body.Length);
+                if (takeBody > 0)
+                {
+                    builder.Append(openTag);
+                    builder.Append(body, 0, takeBody);
+                    builder.Append("</r>");
+                    remaining -= takeBody;
+                }
+
+                cursor = match.Index + match.Length;
+            }
+
+            if (remaining > 0 && cursor < text.Length)
+            {
+                var tail = text.Substring(cursor);
+                builder.Append(tail, 0, Math.Min(remaining, tail.Length));
+            }
+
+            return builder.ToString();
+        }
     }
 }
 
 namespace Assets.GameUi.Scenario
 {
+    public sealed class ScenarioFrameProcessor
+    {
+        public sealed class FrameIdentifierViewModel
+        {
+            public long Current { get; set; }
+        }
+
+        public UniRx.ReactiveProperty<FrameIdentifierViewModel> FrameIdentifier { get; } = new();
+    }
+
+    public sealed class ScenarioComponent : UnityEngine.MonoBehaviour
+    {
+        private Assets.GameUi.Scenario.Text.ScenarioTextTimer? boundTimer;
+
+        public ScenarioController? Controller { get; set; }
+        public Assets.GameUi.Scenario.Text.ScenarioTextComponent? textView { get; set; }
+
+        public Assets.GameUi.Scenario.Text.ScenarioTextTimer? textTimer
+        {
+            get => boundTimer;
+            set
+            {
+                boundTimer = value;
+                value?.Model.Subscribe(OnTimerModelChanged);
+            }
+        }
+
+        public void ClearTextView()
+        {
+            if (textView?.sentenceText != null)
+                textView.sentenceText.Text = string.Empty;
+        }
+
+        public void HandoffFrameText(ScenarioController.ScenarioFrameViewModel frame, bool startEmptySentence = true)
+        {
+            if (frame.Text == null)
+            {
+                ClearTextView();
+                boundTimer?.Apply(null);
+                return;
+            }
+
+            if (startEmptySentence)
+                ClearTextView();
+
+            boundTimer?.Apply(frame.Text);
+        }
+
+        private void OnTimerModelChanged(Assets.GameUi.Scenario.Text.ScenarioTextTimer.ScenarioTextTimerText? timerText)
+        {
+            if (timerText?.Sentence == null)
+                return;
+
+            textView?.ApplySentence(timerText.Sentence);
+            if (timerText.Sentence.AtEnd)
+                Controller?.CompleteTexting(Controller.FrameIdentifier.Value?.Current);
+        }
+    }
+
     /// <summary>
-    /// The scene seam reads <c>sceneMasterId</c> and rewrites the frame documents handed to
-    /// <c>GenerateFrames</c>, so both are modelled here. <c>FunctionFlags</c> is nested in the real
-    /// type, which is why the seam signature names it as <c>ScenarioController.FunctionFlags</c>.
+    /// Models the scenario controller seams and frame/history view models exercised by the scene
+    /// translation and live scenario sync paths.
     /// </summary>
     public sealed class ScenarioController
     {
+        private static long nextPointer;
         [Flags]
         public enum FunctionFlags
         {
             None = 0,
         }
 
-        public long sceneMasterId;
+        public sealed class TextViewModel
+        {
+            private static long nextTextModelPointer;
 
-        public void Refresh() { }
+            public IntPtr Pointer { get; } = new(Interlocked.Increment(ref nextTextModelPointer));
+            public string Name { get; set; } = string.Empty;
+            public string Affiliation { get; set; } = string.Empty;
+            public Assets.GameUi.Scenario.Text.ScenarioTextComponent.SentenceViewModel? Sentence { get; set; }
+        }
+
+        public sealed class HistoryViewModel
+        {
+            public long FrameId { get; set; }
+            public string Name { get; set; } = string.Empty;
+            public string Affiliation { get; set; } = string.Empty;
+            public string Text { get; set; } = string.Empty;
+        }
+
+        public sealed class ScenarioFrameViewModel
+        {
+            public long Id { get; set; }
+            public Assets.Api.Client.SceneFrameMaster? FrameMaster { get; set; }
+            public Assets.GameUi.Scenario.Configuration.ScenarioPhraseConfiguration? PhraseConfiguration { get; set; }
+            public TextViewModel? Text { get; set; }
+        }
+
+        public IntPtr Pointer { get; } = new(Interlocked.Increment(ref nextPointer));
+        public long sceneMasterId;
+        public int CompletedTextCount { get; private set; }
+        public long? LastCompletedFrameId { get; private set; }
+        public ScenarioFrameProcessor frameProcessor { get; set; } = new();
+        public Il2CppSystem.Collections.Generic.List<HistoryViewModel> histories { get; set; } = new();
+        public Assets.GameUi.Services.IScenarioService? scenarioService { get; set; }
+        public Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<ScenarioFrameViewModel>? frames { get; set; }
+        public UniRx.ReactiveProperty<ScenarioFrameProcessor.FrameIdentifierViewModel> FrameIdentifier =>
+            frameProcessor.FrameIdentifier;
+
+        internal void CompleteTexting(long? frameId)
+        {
+            CompletedTextCount++;
+            LastCompletedFrameId = frameId;
+        }
+
+        public void Refresh()
+        {
+            MuvluvLLMMod.Patch.SetIsPlayingScenario(this);
+            histories.Clear();
+        }
 
         // The game declares three Refresh overloads; the seam is the parameterless one.
         public bool Refresh(long sceneMasterId, FunctionFlags disableFunctionFlags, bool a, bool b, bool c) => false;
@@ -626,20 +1024,90 @@ namespace Assets.GameUi.Scenario
             Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Assets.Api.Client.SceneFrameMaster> episodes,
             Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Assets.Api.Client.SceneFrameMaster> frames) { }
 
-        public void Leave() { }
+        public void Leave() => MuvluvLLMMod.Patch.SetIsNotPlayingScenario(this);
 
-        /// <summary>
-        /// Present so the scene seam's Harmony signature resolves. The stub returns nothing; the
-        /// tests exercise the rewrite through the coordinator directly.
-        /// </summary>
         public Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<ScenarioFrameViewModel> GenerateFrames(
             Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Assets.Api.Client.SceneFrameMaster> masters,
             FunctionFlags disableFunctionFlags,
-            bool enableDummyBranch = false) =>
-            new(0);
-    }
+            bool enableDummyBranch = false)
+        {
+            MuvluvLLMMod.Patch.TranslateSceneFrames(this, masters);
+            var generated = new List<ScenarioFrameViewModel>(masters.Length);
+            var index = 0;
+            foreach (var master in masters)
+            {
+                index++;
+                var frameId = master.Id != 0 ? master.Id : index;
+                var phraseText = ExtractPhraseProperty(master.ConfigurationJson, "Text") ?? string.Empty;
+                var speakerName = ExtractPhraseProperty(master.ConfigurationJson, "SpeakerName") ?? string.Empty;
+                var phrase = new Assets.GameUi.Scenario.Configuration.ScenarioPhraseConfiguration
+                {
+                    Text = phraseText,
+                    SpeakerName = speakerName,
+                    DisplayText = scenarioService != null ? scenarioService.ReplaceUsernamePlaceholder(phraseText) : phraseText,
+                    DisplaySpeakerName = scenarioService != null ? scenarioService.ReplaceUsernamePlaceholder(speakerName) : speakerName,
+                };
+                generated.Add(new ScenarioFrameViewModel
+                {
+                    Id = frameId,
+                    FrameMaster = master,
+                    PhraseConfiguration = phrase,
+                });
+            }
 
-    public sealed class ScenarioFrameViewModel
-    {
+            var ordered = generated
+                .OrderBy(item => item.FrameMaster?.Order ?? 0)
+                .ToArray();
+            return new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<ScenarioFrameViewModel>(ordered);
+        }
+
+        public ScenarioFrameViewModel GenerateFrame(ScenarioFrameProcessor.FrameIdentifierViewModel identifier)
+        {
+            frameProcessor.FrameIdentifier.Value = identifier;
+            var frame = frames!.First(item => item.Id == identifier.Current);
+            var phrase = frame.PhraseConfiguration!;
+            frame.Text = new TextViewModel
+            {
+                Name = phrase.DisplaySpeakerName,
+                Affiliation = phrase.DisplayTeamName,
+                Sentence = new Assets.GameUi.Scenario.Text.ScenarioTextComponent.SentenceViewModel
+                {
+                    Text = phrase.DisplayText,
+                    ContainsRuby = phrase.DisplayText.Contains("<r=", StringComparison.OrdinalIgnoreCase),
+                    AtEnd = false,
+                },
+            };
+            if (!string.IsNullOrEmpty(phrase.Text))
+            {
+                histories.Add(new HistoryViewModel
+                {
+                    FrameId = frame.Id,
+                    Name = phrase.DisplaySpeakerName,
+                    Affiliation = phrase.DisplayTeamName,
+                    Text = System.Text.RegularExpressions.Regex.Replace(
+                        phrase.DisplayText,
+                        "<r=.*?>(.*?)</r>",
+                        "$1",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase),
+                });
+            }
+            return frame;
+        }
+
+        private static string? ExtractPhraseProperty(string? json, string propertyName)
+        {
+            if (string.IsNullOrEmpty(json))
+                return null;
+            try
+            {
+                var root = System.Text.Json.Nodes.JsonNode.Parse(json) as System.Text.Json.Nodes.JsonObject;
+                var phrase = root?["Phrase"] as System.Text.Json.Nodes.JsonObject;
+                return phrase?[propertyName]?.GetValue<string>();
+            }
+            catch
+            {
+                return null;
+            }
+        }
     }
 }

@@ -114,4 +114,18 @@ public sealed class SceneFrameDocumentTests
         // The rewritten document must still expose the same source text for reverse lookup.
         Assert.Equal("<r=ダイブ>潜航</r>，开始！", SceneFrameDocument.CollectLines(rewritten).Single().Text);
     }
+
+    [Fact]
+    public void TryReadText_reads_authoritative_text_without_candidate_filtering()
+    {
+        Assert.True(SceneFrameDocument.TryReadText(Document("提供割合"), out var pureKanji));
+        Assert.Equal("提供割合", pureKanji);
+
+        Assert.True(SceneFrameDocument.TryReadText("""{"Background":{}}""", out var missingPhrase));
+        Assert.Null(missingPhrase);
+
+        Assert.False(SceneFrameDocument.TryReadText(null, out _));
+        Assert.False(SceneFrameDocument.TryReadText("{not json", out _));
+        Assert.False(SceneFrameDocument.TryReadText("[]", out _));
+    }
 }

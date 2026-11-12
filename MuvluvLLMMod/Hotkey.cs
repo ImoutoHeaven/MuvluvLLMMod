@@ -16,9 +16,11 @@ public sealed class Hotkey : MonoBehaviour
             return;
 
         var keyboard = Keyboard.current;
+        var toggled = false;
         if (keyboard != null && keyboard[Key.F2].wasPressedThisFrame)
         {
             Config.Translation.Value = !Config.Translation.Value;
+            toggled = true;
             var progress = Plugin.ProgressSnapshot;
             Logger.Info(
                 $"[LLM] display={(Config.Translation.Value ? "on" : "off")}; "
@@ -26,7 +28,7 @@ public sealed class Hotkey : MonoBehaviour
         }
 
         refreshElapsed += Time.deltaTime;
-        if (refreshElapsed < Math.Max(0.01f, Config.LlmRefreshPeriodSeconds.Value))
+        if (!toggled && refreshElapsed < Math.Max(0.01f, Config.LlmRefreshPeriodSeconds.Value))
             return;
 
         refreshElapsed = 0f;

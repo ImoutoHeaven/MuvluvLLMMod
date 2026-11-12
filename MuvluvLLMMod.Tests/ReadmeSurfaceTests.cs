@@ -44,7 +44,15 @@ public sealed class ReadmeSurfaceTests
             readme,
             StringComparison.OrdinalIgnoreCase);
         Assert.Contains(
-            "successfully provenance-recorded render-layer translations",
+            "provenance-recorded `TMP_Text` assignments",
+            readme,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "original candidate frame source",
+            readme,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "limited to active scenario dialogue and the observed `TMP_Text`",
             readme,
             StringComparison.Ordinal);
         Assert.Contains("Out-of-budget or otherwise invalid", readme, StringComparison.Ordinal);

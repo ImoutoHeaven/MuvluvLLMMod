@@ -183,12 +183,12 @@ public sealed class ZzzProductionLateStageIntegrationTests
             Assert.False(plugin.Unload());
             Assert.Equal(unpatchCallsBeforeLateCompletion, Harmony.UnpatchSelfCalls);
 
-            // PatchAll publishes the exact four production hooks only after the external boundary
+            // PatchAll publishes the exact five production hooks only after the external boundary
             // is released. The already-admitted stage must immediately unpatch its local Harmony
             // owner instead of committing it into the failed generation.
             Harmony.PatchAllRelease.TrySetResult(true);
             await Harmony.PatchAllPublished.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            Assert.Equal(4, Harmony.SnapshotApplications().Count);
+            Assert.Equal(5, Harmony.SnapshotApplications().Count);
             Harmony.PatchAllPostPublishRelease.TrySetResult(true);
             var loadException = await load.WaitAsync(TimeSpan.FromSeconds(3));
             Assert.NotNull(loadException);

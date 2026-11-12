@@ -57,6 +57,35 @@ public static class SceneFrameDocument
         return lines;
     }
 
+    /// <summary>
+    /// Reads the raw <c>Phrase.Text</c> from a valid frame document without candidate filtering.
+    /// Returns false only when the document is absent or not a JSON object.
+    /// </summary>
+    public static bool TryReadText(string? configurationJson, out string? text)
+    {
+        text = null;
+        if (string.IsNullOrEmpty(configurationJson))
+            return false;
+
+        JsonNode? root;
+        try
+        {
+            root = JsonNode.Parse(configurationJson);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+
+        if (root is not JsonObject document)
+            return false;
+
+        if (document[PhraseProperty] is JsonObject phrase)
+            text = ReadString(phrase[TextProperty]);
+
+        return true;
+    }
+
     // A non-string value is left untouched rather than coerced.
     private static string? ReadString(JsonNode? node)
     {

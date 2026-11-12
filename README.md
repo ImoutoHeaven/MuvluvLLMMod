@@ -44,10 +44,9 @@ speaker names as read-only context. Chunks dispatch concurrently in story order 
 `RequestsPerSecond` and `MaxInFlight` while holding template reservations so displayed lines do not
 trigger duplicate per-string requests. Accepted lines are stored as authoritative generated
 templates: later scene entries apply them to the frame documents with no request, and active
-`TMP_Text` instances on screen pick them up or upgrade earlier per-string fallbacks at the next
-refresh. A line containing the player-name placeholder `%usernameusernameuserna%` renders with the
-name substituted, so on first play it is served by the urgent per-string path and the scene result
-applies from the next entry.
+scenario frame view models, history entries, and the visible dialogue view pick them up or upgrade
+earlier per-string fallbacks at the next refresh, reapplying `%usernameusernameuserna%` player-name
+substitution through the scenario service.
 
 Evidence for the seam is single-reader: the game reads
 `SceneFrameMaster.ConfigurationJson` exactly once, and that frame factory runs before `Refresh`
@@ -121,28 +120,31 @@ needed for the first three, while a cache-directory change takes effect after re
 
 ## Hotkey and display fallback
 
-**F2** toggles whether this plugin's successfully provenance-recorded render-layer translations
-are displayed. The toggle is a display operation only: when `[LLM] Enable` is true, production
-continues while display is off so translations can be available when display is enabled again.
+**F2** toggles whether this plugin's translations are displayed across active scenario dialogue and
+provenance-recorded `TMP_Text` assignments. The toggle is a display operation only: when
+`[LLM] Enable` is true, production continues while display is off so translations can be available
+when display is enabled again.
 
-For an observed TMP assignment, display-off refresh can restore the source only when the object
-identity, assignment generation, lifecycle epoch, and cache reverse mapping all validate. An
-external setter starts a new assignment even when its value is identical. A plugin refresh uses a
-one-shot token only around the exact setter write it owns. Out-of-budget or otherwise invalid
-values remain the original text and are not provenance-recorded; ambiguity or failed validation is
-a no-op that leaves the current text unchanged. The toggle does not claim text rendered outside an
-observed TMP setter path or promise every game UI route.
+Active scenario dialogue switches frames, history entries, and the handed-off dialogue view between
+the original candidate frame source and the current translation. For every other observed `TMP_Text`
+assignment, display-off refresh restores the source only when the object identity, assignment
+generation, lifecycle epoch, and cache reverse mapping all validate. An external setter starts a new
+assignment even when its value is identical. A plugin refresh uses a one-shot token only around the
+exact setter write it owns. Out-of-budget or otherwise invalid values remain the original text and
+are not provenance-recorded; ambiguity or failed validation is a no-op that leaves the current text
+unchanged. The toggle covers only active scenario dialogue and observed `TMP_Text` setter paths,
+without promising every game UI route.
 
 ## Runtime verification gates
 
 The release behavior still needs game verification for:
 
 - font fallback and glyph coverage for generated Chinese;
-- whether every relevant UI path reaches the TMP setter; and
-- real pooled-object F2 toggles, layout, and refresh cost.
+- whether every relevant UI path reaches the scenario or `TMP_Text` seams; and
+- real pooled-object F2 toggles, scenario transitions, layout, and refresh cost.
 
-The documented F2 behavior is limited to the observed TMP display path; it is not a claim of complete
-in-game UI coverage.
+The documented F2 behavior is limited to active scenario dialogue and the observed `TMP_Text`
+display path; it is not a claim of complete in-game UI coverage.
 
 ## Status output
 
@@ -192,7 +194,7 @@ implementation). It includes `Patch.cs`, `Plugin.cs`, `Config.cs`, `Hotkey.cs`, 
 dependencies. It does not copy a parallel implementation. `Stubs/RuntimeStubs.cs` replaces only
 external boundaries:
 BepInEx configuration/logging/BasePlugin, Harmony discovery/ownership, Unity object/component
-lifetime and time/input, the TMP type, the application-quitting add/remove calls, and the two
+lifetime and time/input, the TMP type, the application-quitting add/remove calls, and the
 scenario target types. The fake `TMP_Text.text` setter calls the real `Patch.TranslateTmpSetter`
 Prefix; fake application and config events call the real `Plugin` registration/removal and
 `Config` generation-lease handler. The native delegate interleaving uses the real coordinator

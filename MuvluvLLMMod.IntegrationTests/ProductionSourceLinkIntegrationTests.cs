@@ -40,7 +40,7 @@ public sealed class ProductionSourceLinkIntegrationTests
         using var fixture = ProductionHarness.LoadPlugin();
         var applications = Harmony.SnapshotApplications();
 
-        Assert.Equal(4, applications.Count);
+        Assert.Equal(5, applications.Count);
         Assert.All(applications, application =>
             Assert.Equal(Plugin.PluginGuid, application.Owner));
         Assert.Contains(
@@ -60,6 +60,10 @@ public sealed class ProductionSourceLinkIntegrationTests
             applications,
             application => application.PatchMethod == "TranslateSceneFrames"
                 && application.Target == "ScenarioController.GenerateFrames");
+        Assert.Contains(
+            applications,
+            application => application.PatchMethod == "ObserveScenarioTimerApply"
+                && application.Target == "ScenarioTextTimer.Apply");
         Assert.DoesNotContain(
             applications,
             application => application.PatchMethod.Contains("Skill", StringComparison.OrdinalIgnoreCase)
