@@ -260,34 +260,14 @@ public sealed class OpenAiChatClient
         return null;
     }
 
-    private async Task<string> ReadContentBoundedAsync(HttpContent content, CancellationToken token)
+    private static async Task<string?> ReadResponseBoundedAsync(HttpContent content, CancellationToken token)
     {
-        if (content.Headers.ContentLength is > TranslationBudget.MaxResponseBodyBytes)
-            throw new ResponseTooLargeException();
-
         await using var stream = await content.ReadAsStreamAsync(token).ConfigureAwait(false);
-        var buffer = ArrayPool<byte>.Shared.Rent(Math.Min(8192, TranslationBudget.MaxResponseBodyBytes));
-        try
-        {
-            using var result = new MemoryStream();
-            while (true)
-            {
-                var read = await stream.ReadAsync(
-                    buffer.AsMemory(0, Math.Min(buffer.Length, TranslationBudget.MaxResponseBodyBytes)),
-                    token).ConfigureAwait(false);
-                if (read == 0)
-                    break;
-                if (result.Length + read > TranslationBudget.MaxResponseBodyBytes)
-                    throw new ResponseTooLargeException();
-                result.Write(buffer, 0, read);
-            }
-
-            return Encoding.UTF8.GetString(result.GetBuffer(), 0, checked((int)result.Length));
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
+        return await OpenAiResponse.ReadAsync(
+            stream,
+            TranslationBudget.MaxResponseBodyBytes,
+            static () => new ResponseTooLargeException(),
+            token).ConfigureAwait(false);
     }
 
     private async Task<string?> SendAsync(Uri endpoint, string text, CancellationToken token) =>
@@ -325,8 +305,7 @@ public sealed class OpenAiChatClient
             onDispatched,
             token).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode) throw new HttpRequestException("LLM endpoint returned a non-success status.");
-        var json = await ReadContentBoundedAsync(response.Content, token).ConfigureAwait(false);
-        return OpenAiResponse.Read(json);
+        return await ReadResponseBoundedAsync(response.Content, token).ConfigureAwait(false);
     }
 
 }

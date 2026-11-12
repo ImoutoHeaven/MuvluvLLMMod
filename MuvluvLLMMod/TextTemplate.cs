@@ -155,19 +155,17 @@ public static class TextTemplate
     public static bool TryRestoreLlm(string response, LlmProtectedText protectedText, out string restored)
     {
         restored = string.Empty;
-        if (!TranslationBudget.IsTextWithinBudget(response)
-            || !TranslationBudget.IsTextWithinBudget(protectedText.Prompt)
+        if (string.IsNullOrEmpty(response)
+            || string.IsNullOrEmpty(protectedText.Prompt)
             // Masked so a %name% match cannot span two tokens, as in "%__MLM_FMT_1__%".
             || FormatToken.IsMatch(ProtectedToken.Replace(response, "\u0001"))) return false;
+        var matches = ProtectedToken.Matches(response);
         if (!protectedText.Tokens.SequenceEqual(
-                ProtectedToken.Matches(response).Select(match => match.Value),
+                matches.Select(match => match.Value),
                 StringComparer.Ordinal)) return false;
 
-        restored = response;
-        for (var index = 0; index < protectedText.Tokens.Length; index++)
-        {
-            restored = restored.Replace(protectedText.Tokens[index], protectedText.Originals[index], StringComparison.Ordinal);
-        }
+        var matchIndex = 0;
+        restored = ProtectedToken.Replace(response, _ => protectedText.Originals[matchIndex++]);
         return TranslationBudget.IsTextWithinBudget(restored);
     }
 

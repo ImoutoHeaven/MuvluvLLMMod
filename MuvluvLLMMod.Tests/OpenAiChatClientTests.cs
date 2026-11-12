@@ -319,6 +319,137 @@ public sealed class OpenAiChatClientTests
         Assert.Equal("早上好", translations["おはよう"]);
     }
 
+    [Fact]
+    public async Task Reasoning_heavy_sse_stream_exceeding_response_budget_still_completes()
+    {
+        const long sceneId = 50000601;
+        var batch = SceneTranslationBatch.TryCreate(
+            sceneId,
+            new[] { new SceneDialogueLine("おはよう\nございます", "純夏") })!;
+        var payload = JsonSerializer.Serialize(new
+        {
+            version = 1,
+            sceneId,
+            translations = new[] { new { id = "t0000", text = "早上__MLM_FMT_0__好" } },
+        });
+
+        var sse = new StringBuilder();
+        var reasoningChunk = "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"thinking token padding for reasoning model stream\"}}]}\r\n\r\n";
+        while (sse.Length <= TranslationBudget.MaxResponseBodyBytes * 2)
+            sse.Append(reasoningChunk);
+        sse.Append("data: ")
+            .Append(JsonSerializer.Serialize(new { choices = new[] { new { index = 0, delta = new { content = payload }, finish_reason = "stop" } } }))
+            .Append("\r\n\r\ndata: [DONE]\r\n\r\n");
+
+        var rawSse = sse.ToString();
+        using var http = new HttpClient(new DelegateHandler(_ => Task.FromResult(
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(rawSse, Encoding.UTF8, "text/event-stream"),
+            })));
+        var diagnostics = new List<string>();
+        var client = new OpenAiChatClient(
+            http,
+            new OpenAiChatSettings("https://example.test/v1/chat/completions", "deepseek-flash", string.Empty, 30, 1),
+            new RequestRateLimiter(1000),
+            diagnostics.Add);
+
+        var response = await client.SendScenePromptAsync(batch.Prompt, onDispatched: null, CancellationToken.None);
+
+        Assert.False(response.TransportFailed);
+        Assert.Null(response.FailureReason);
+        Assert.Empty(diagnostics);
+        Assert.True(batch.TryParseResponse(response.Content, out var translations));
+        Assert.Equal("早上\n好", translations["おはよう\nございます"]);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Large_single_sse_event_or_json_reasoning_envelope_succeeds_without_discard(bool sse)
+    {
+        const long sceneId = 50000602;
+        var batch = SceneTranslationBatch.TryCreate(
+            sceneId,
+            new[] { new SceneDialogueLine("おはようございます", "純夏") })!;
+        var payload = JsonSerializer.Serialize(new
+        {
+            version = 1,
+            sceneId,
+            translations = new[] { new { id = "t0000", text = "早上好" } },
+        });
+        var largeReasoning = new string('思', TranslationBudget.MaxResponseBodyBytes);
+
+        using var http = new HttpClient(new DelegateHandler(_ =>
+        {
+            if (sse)
+            {
+                var body = "data: "
+                    + JsonSerializer.Serialize(new { choices = new[] { new { index = 0, delta = new { reasoning = largeReasoning } } } })
+                    + "\r\n\r\ndata: "
+                    + JsonSerializer.Serialize(new { choices = new[] { new { index = 0, delta = new { content = payload }, finish_reason = "stop" } } })
+                    + "\r\n\r\ndata: [DONE]\r\n\r\n";
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(body, Encoding.UTF8, "text/event-stream"),
+                });
+            }
+
+            var jsonBody = JsonSerializer.Serialize(new
+            {
+                choices = new[]
+                {
+                    new
+                    {
+                        finish_reason = "stop",
+                        message = new { role = "assistant", reasoning = largeReasoning, content = payload },
+                    },
+                },
+            });
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(jsonBody, Encoding.UTF8, "application/json"),
+            });
+        }));
+        var diagnostics = new List<string>();
+        var client = new OpenAiChatClient(
+            http,
+            new OpenAiChatSettings("https://example.test/v1/chat/completions", "deepseek-flash", string.Empty, 30, 1),
+            new RequestRateLimiter(1000),
+            diagnostics.Add);
+
+        var response = await client.SendScenePromptAsync(batch.Prompt, onDispatched: null, CancellationToken.None);
+
+        Assert.False(response.TransportFailed);
+        Assert.Null(response.FailureReason);
+        Assert.Empty(diagnostics);
+        Assert.True(batch.TryParseResponse(response.Content, out var translations));
+        Assert.Equal("早上好", translations["おはようございます"]);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    public async Task Short_read_stream_splits_multibyte_utf8_crlf_and_multiline_sse_cleanly(int maxReadBytes)
+    {
+        var sse = "\uFEFF: keepalive\r\n\r\n"
+            + "event: message\r\n"
+            + "data: {\"choices\":[\r\n"
+            + "data: {\"index\":0,\"delta\":{\"content\":\"早上𠮟\"}}]}\r\n\r\n"
+            + "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"__MLM_FMT_0__好\"},\"finish_reason\":\"stop\"}]}\r\n\r\n"
+            + "data: [DONE]\r\n\r\n";
+        var rawBytes = Encoding.UTF8.GetBytes(sse);
+
+        using var stream = new ShortReadMemoryStream(rawBytes, maxReadBytes);
+        var result = await OpenAiResponse.ReadAsync(
+            stream,
+            TranslationBudget.MaxResponseBodyBytes,
+            static () => new InvalidOperationException("unexpected budget failure"),
+            CancellationToken.None);
+
+        Assert.Equal("早上𠮟__MLM_FMT_0__好", result);
+    }
+
     private static HttpResponseMessage JsonResponse(string content)
     {
         var json = JsonSerializer.Serialize(new { choices = new[] { new { message = new { content } } } });
@@ -420,6 +551,47 @@ public sealed class OpenAiChatClientTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             return Task.FromResult(Read(buffer, offset, count));
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class ShortReadMemoryStream : Stream
+    {
+        private readonly byte[] bytes;
+        private readonly int maxReadBytes;
+        private int position;
+
+        public ShortReadMemoryStream(byte[] bytes, int maxReadBytes)
+        {
+            this.bytes = bytes;
+            this.maxReadBytes = maxReadBytes;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => bytes.Length;
+        public override long Position
+        {
+            get => position;
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var count = Math.Min(Math.Min(buffer.Length, maxReadBytes), bytes.Length - position);
+            if (count <= 0)
+                return ValueTask.FromResult(0);
+            bytes.AsMemory(position, count).CopyTo(buffer);
+            position += count;
+            return ValueTask.FromResult(count);
         }
 
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();

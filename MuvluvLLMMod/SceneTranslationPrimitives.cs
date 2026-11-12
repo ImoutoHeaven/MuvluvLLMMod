@@ -878,7 +878,11 @@ public sealed class SceneAttemptCoordinator : IDisposable
             attempts = attempt;
             var preempted = false;
             var isFinalAttempt = attempt == boundedMaxAttempts;
-            var previousFailure = attempt == 1 || fallbackReason == "preempted-by-urgent"
+            var previousFailure = attempt == 1
+                || fallbackReason is "preempted-by-urgent"
+                    or "request-exception"
+                    or "response-over-budget"
+                    or "invalid-completion-envelope"
                 ? null
                 : fallbackReason;
             var requestPrompt = SceneTranslationBatch.BuildRetryPrompt(
@@ -923,6 +927,15 @@ public sealed class SceneAttemptCoordinator : IDisposable
                     {
                         fallbackReason = response.FailureReason ?? "request-exception";
                         if (isFinalAttempt)
+                            onTerminalFailure?.Invoke(fallbackReason);
+                        return false;
+                    }
+
+                    if (!string.IsNullOrEmpty(response.FailureReason))
+                    {
+                        fallbackReason = response.FailureReason!;
+                        onRejected?.Invoke(attempt, fallbackReason);
+                        if (isFinalAttempt || fallbackReason == "prompt-over-budget")
                             onTerminalFailure?.Invoke(fallbackReason);
                         return false;
                     }
@@ -997,6 +1010,9 @@ public sealed class SceneAttemptCoordinator : IDisposable
             {
                 return (true, "ok", attempts, unresolvedTemplates);
             }
+
+            if (fallbackReason == "prompt-over-budget")
+                break;
 
             if (attempt < boundedMaxAttempts && isActive() && !shutdownToken.IsCancellationRequested)
             {

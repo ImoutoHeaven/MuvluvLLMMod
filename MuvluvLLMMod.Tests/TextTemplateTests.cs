@@ -228,4 +228,20 @@ public sealed class TextTemplateTests
         _ = boundary;
         Assert.Equal(expected, TextTemplate.IsTranslationCandidate(char.ConvertFromUtf32(codePoint)));
     }
+
+    [Fact]
+    public void Protected_llm_text_restores_when_token_expansion_exceeds_text_budget_but_restored_fits()
+    {
+        var lines = Enumerable.Range(0, 154).Select(index => $"項目{{{index}}}のあいうえお説明文");
+        var source = string.Join("\n", lines);
+        Assert.True(TranslationBudget.IsTextWithinBudget(source));
+
+        var protectedText = TextTemplate.ProtectForLlm(source);
+        Assert.True(protectedText.Prompt.Length > TranslationBudget.MaxTextUtf16CodeUnits);
+
+        var translatedPrompt = protectedText.Prompt.Replace("のあいうえお説明文", "的说明", StringComparison.Ordinal);
+        Assert.True(TextTemplate.TryRestoreLlm(translatedPrompt, protectedText, out var restored));
+        Assert.True(TextTemplate.HasSamePlaceholders(source, restored));
+        Assert.True(TextTemplate.HasSameMarkup(source, restored));
+    }
 }

@@ -356,4 +356,16 @@ public sealed class SceneTranslationBatchTests
                 Directory.Delete(root, true);
         }
     }
+
+    [Fact]
+    public void TryParseResponse_accepts_pretty_printed_json_exceeding_scene_prompt_budget()
+    {
+        var batch = Create("こんにちは");
+        var padding = new string(' ', TranslationBudget.MaxSceneUtf8Bytes + 1024);
+        var body = "{\n" + padding + "\"version\": 1,\n\"sceneId\": " + SceneId
+            + ",\n\"translations\": [\n  { \"id\": \"t0000\", \"text\": \"你好\" }\n]\n}";
+
+        Assert.False(TranslationBudget.IsSceneWithinBudget(body));
+        Assert.Equal("你好", Accepted(batch, body)["こんにちは"]);
+    }
 }

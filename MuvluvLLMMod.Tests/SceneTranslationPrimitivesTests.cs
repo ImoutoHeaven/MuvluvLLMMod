@@ -1213,6 +1213,105 @@ public sealed class SceneTranslationPrimitivesTests
         Assert.Null(await translateTask);
     }
 
+    [Fact]
+    public async Task Non_transport_failure_reasons_are_preserved_without_false_empty_response_or_upstream_abort()
+    {
+        var gate = new RequestInFlightGate();
+        var queue = new TranslationWorkQueue();
+        using var coordinator = new SceneAttemptCoordinator(gate, queue);
+
+        var lines = new[]
+        {
+            new SceneDialogueLine("あいうです", "A"),
+            new SceneDialogueLine("かきくです", "B"),
+        };
+        var plans = SceneTranslationBatch.CreateBatches(50000601, lines, maxTargetsPerBatch: 1);
+        foreach (var line in lines)
+            Assert.True(queue.TryReserve(line.Text, static () => false));
+        using var scope = new TranslationReservationScope(queue, lines.Select(line => line.Text));
+
+        var rejections = new List<(int Chunk, int Attempt, string Reason)>();
+        var fallbacks = new List<(int Chunk, string Reason, int Attempts)>();
+        var chunk1Prompts = new List<string>();
+        var committed = new Dictionary<string, string>(StringComparer.Ordinal);
+        var sync = new object();
+
+        var succeeded = await coordinator.ExecuteScenePlansAsync(
+            plans,
+            scope,
+            maximumAttempts: 2,
+            maximumInFlight: static () => 1,
+            urgentPreemptGracePeriod: TimeSpan.FromSeconds(5),
+            isActive: static () => true,
+            sendPromptAsync: (chunkIndex, _, _, prompt, onFirstDispatchReady, _) =>
+            {
+                onFirstDispatchReady();
+                if (chunkIndex == 1)
+                {
+                    lock (sync)
+                        chunk1Prompts.Add(prompt);
+                    return Task.FromResult(new ScenePromptResponse(false, null, "response-over-budget"));
+                }
+
+                return Task.FromResult(new ScenePromptResponse(
+                    false,
+                    "{\"version\":1,\"sceneId\":50000601,\"translations\":[{\"id\":\"t0000\",\"text\":\"第二句译文\"}]}"));
+            },
+            tryCommitTranslations: (_, _, _, chunkTranslations) =>
+            {
+                lock (sync)
+                {
+                    foreach (var pair in chunkTranslations)
+                        committed[pair.Key] = pair.Value;
+                }
+                return chunkTranslations.Keys.ToArray();
+            },
+            onRetryScheduled: static (_, _, _, _, _) => 0,
+            onChunkFallback: (chunkIndex, _, _, reason, attempts) =>
+            {
+                lock (sync)
+                    fallbacks.Add((chunkIndex, reason, attempts));
+            },
+            onRejected: (chunkIndex, _, attempt, reason) =>
+            {
+                lock (sync)
+                    rejections.Add((chunkIndex, attempt, reason));
+            });
+
+        Assert.False(succeeded);
+        lock (sync)
+        {
+            Assert.Equal(
+                new[] { (1, 1, "response-over-budget"), (1, 2, "response-over-budget") },
+                rejections);
+            Assert.Single(fallbacks, item => item == (1, "response-over-budget", 2));
+            Assert.Equal(2, chunk1Prompts.Count);
+            Assert.Equal(chunk1Prompts[0], chunk1Prompts[1]);
+            Assert.Equal("第二句译文", committed["かきくです"]);
+        }
+
+        // Deterministic prompt-over-budget stops after 1 attempt instead of burning retries.
+        var promptBudgetAttempts = 0;
+        var promptBudgetResult = await coordinator.ExecuteBatchWithRetriesAsync(
+            plans[0].Batch,
+            maximumAttempts: 4,
+            maximumInFlight: static () => 1,
+            urgentPreemptGracePeriod: TimeSpan.FromSeconds(5),
+            isActive: static () => true,
+            sendPromptAsync: (_, _, onDispatched, _) =>
+            {
+                onDispatched();
+                promptBudgetAttempts++;
+                return Task.FromResult(new ScenePromptResponse(false, null, "prompt-over-budget"));
+            },
+            tryCommitTranslations: static (_, _) => Array.Empty<string>(),
+            onRetryScheduled: static (_, _, _) => 0);
+
+        Assert.False(promptBudgetResult.Succeeded);
+        Assert.Equal("prompt-over-budget", promptBudgetResult.FallbackReason);
+        Assert.Equal(1, promptBudgetAttempts);
+    }
+
     private sealed class StalledBodyHandler : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(

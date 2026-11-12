@@ -215,7 +215,33 @@ public sealed class OpenAiBudgetTests
         using var http = new HttpClient(new DelegateHandler(_ =>
         {
             Interlocked.Increment(ref calls);
-            var content = new string('译', TranslationBudget.MaxResponseBodyBytes);
+            var garbage = new string('x', TranslationBudget.MaxResponseBodyBytes * 2);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(garbage, Encoding.UTF8, "text/plain")
+            });
+        }));
+        var client = new OpenAiChatClient(
+            http,
+            new OpenAiChatSettings("https://example.test/v1/chat/completions", "model", string.Empty, 30, 1),
+            new RequestRateLimiter(1000),
+            diagnostics.Add);
+
+        Assert.Null(await client.TranslateAsync("スキル", CancellationToken.None));
+        Assert.Equal(1, calls);
+        Assert.Single(diagnostics);
+        Assert.Contains("exceeded the bounded response budget", diagnostics[0], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Oversized_translated_text_in_recognized_envelope_is_rejected_by_entry_budget()
+    {
+        var calls = 0;
+        var diagnostics = new List<string>();
+        using var http = new HttpClient(new DelegateHandler(_ =>
+        {
+            Interlocked.Increment(ref calls);
+            var content = new string('译', TranslationBudget.MaxTextUtf16CodeUnits + 1);
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new StringContent(

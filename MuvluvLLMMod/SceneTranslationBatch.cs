@@ -229,12 +229,6 @@ public sealed class SceneTranslationBatch
             return false;
         }
 
-        if (!TranslationBudget.IsSceneWithinBudget(response))
-        {
-            rejectionReason = "response-over-budget";
-            return false;
-        }
-
         SceneResponsePayload? document;
         try
         {
